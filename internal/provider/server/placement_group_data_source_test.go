@@ -128,8 +128,7 @@ func TestPlacementGroupDataSourcePreserveConfiguredValues(t *testing.T) {
 		ID:     types.StringValue(placementGroupTestUUID.String()),
 		Name:   types.StringValue("  cluster-a  "),
 		Policy: types.StringValue("affinity"),
-		Region: types.StringValue("  vn-central  "),
-	}}
+	}, Region: types.StringValue("  vn-central  ")}
 	policy := serversdk.PlacementGroupPolicyAffinity
 	preserveConfiguredPlacementGroupValues(&serversdk.PlacementGroupSchema{
 		Id:      placementGroupTestUUID,
@@ -228,8 +227,7 @@ func TestPlacementGroupDataSourceReadReportsEveryBlankFilter(t *testing.T) {
 		ID:     types.StringValue("   "),
 		Name:   types.StringValue("   "),
 		Policy: types.StringValue("   "),
-		Region: types.StringValue("   "),
-	}}), &response)
+	}, Region: types.StringValue("   ")}), &response)
 
 	errs := response.Diagnostics.Errors()
 	if len(errs) != 4 {
@@ -371,8 +369,7 @@ func TestPlacementGroupDataSourceReadTrimsCriteriaAndPreservesConfiguredValues(t
 		ID:     types.StringValue(configuredID),
 		Name:   types.StringValue("  cluster-a  "),
 		Policy: types.StringValue("  affinity  "),
-		Region: types.StringValue("  vn-central  "),
-	}}), &response)
+	}, Region: types.StringValue("  vn-central  ")}), &response)
 	if response.Diagnostics.HasError() {
 		t.Fatalf("read diagnostics: %v", response.Diagnostics)
 	}

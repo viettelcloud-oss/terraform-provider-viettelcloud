@@ -16,14 +16,14 @@ Manage a Viettel Cloud subnet.
 resource "viettelcloud_vpc" "example" {
   name        = "my-vpc"
   cidr        = "10.0.0.0/16"
-  region      = "vn-central-1"
+  region      = { name = "vn-central-1" }
   description = "Example VPC"
 }
 
 resource "viettelcloud_subnet" "example" {
   name        = "my-subnet"
   cidr        = "10.0.1.0/24"
-  vpc_id      = viettelcloud_vpc.example.id
+  vpc         = { id = viettelcloud_vpc.example.id }
   description = "Example subnet"
 }
 ```
@@ -35,7 +35,7 @@ resource "viettelcloud_subnet" "example" {
 
 - `cidr` (String) IPv4 network CIDR inside the VPC, e.g. 10.0.1.0/24.
 - `name` (String) Name of the subnet.
-- `vpc_id` (String) VPC ID (UUID) where the subnet is created.
+- `vpc` (Attributes) VPC where the subnet is created. (see [below for nested schema](#nestedatt--vpc))
 
 ### Optional
 
@@ -49,3 +49,10 @@ resource "viettelcloud_subnet" "example" {
 - `region` (String) Region name inherited from the VPC.
 - `updated_at` (String) Timestamp when the subnet was last updated (RFC3339).
 - `vpc_name` (String) Name of the VPC containing the subnet.
+
+<a id="nestedatt--vpc"></a>
+### Nested Schema for `vpc`
+
+Required:
+
+- `id` (String) VPC ID (UUID).

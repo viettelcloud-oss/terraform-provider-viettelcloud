@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
@@ -15,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -24,6 +24,7 @@ import (
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -61,11 +62,12 @@ func (r *ElasticIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"region": schema.StringAttribute{
+			"region": schema.SingleNestedAttribute{
 				Required:    true,
-				Description: "Project region name where the Elastic IP is created.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+				Description: "Project region where the Elastic IP is created.",
+				Attributes:  reference.Attributes(reference.Name, "Region name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
 			},
 			"description": schema.StringAttribute{
@@ -351,20 +353,12 @@ func buildElasticIPCreateBody(
 	resolveRegion projectlookup.RegionResolveFunc,
 ) (networksdk.ElasticIPCreateSchema, diag.Diagnostics) {
 	var body networksdk.ElasticIPCreateSchema
-	var diags diag.Diagnostics
-	if plan.Region.IsNull() || plan.Region.IsUnknown() || strings.TrimSpace(plan.Region.ValueString()) == "" {
-		diags.AddError("Missing region", "region must be configured and known.")
+	regionID, diags := resolveRegionReference(ctx, plan.Region, resolveRegion)
+	if diags.HasError() {
 		return body, diags
 	}
 
-	name := plan.Region.ValueString()
-	region, err := resolveRegion(ctx, projectlookup.RegionFilter{Name: &name})
-	if err != nil {
-		diags.AddError("Unable to resolve region", "region: "+err.Error())
-		return body, diags
-	}
-
-	body.RegionId = region.Region.Id
+	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
 		value := plan.Description.ValueString()
 		body.Description = &value

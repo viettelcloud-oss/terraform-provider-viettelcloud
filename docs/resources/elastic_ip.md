@@ -15,7 +15,7 @@ Manage a Viettel Cloud Elastic IP.
 ```terraform
 resource "viettelcloud_elastic_ip" "example" {
   description = "Managed by Terraform"
-  region      = "vn-central-1"
+  region      = { name = "vn-central-1" }
   enable_ipv4 = true
   enable_ipv6 = false
 }
@@ -26,7 +26,7 @@ resource "viettelcloud_elastic_ip" "example" {
 
 ### Required
 
-- `region` (String) Project region name where the Elastic IP is created.
+- `region` (Attributes) Project region where the Elastic IP is created. (see [below for nested schema](#nestedatt--region))
 
 ### Optional
 
@@ -42,3 +42,10 @@ resource "viettelcloud_elastic_ip" "example" {
 - `ipv6_address` (String) The assigned IPv6 address.
 - `status` (String) Current Elastic IP status.
 - `updated_at` (String) Timestamp when the Elastic IP was last updated (RFC3339).
+
+<a id="nestedatt--region"></a>
+### Nested Schema for `region`
+
+Required:
+
+- `name` (String) Region name.

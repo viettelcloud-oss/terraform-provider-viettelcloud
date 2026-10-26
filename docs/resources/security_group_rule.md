@@ -22,24 +22,24 @@ variable "security_group_id" {
 
 # Allow inbound SSH from anywhere.
 resource "viettelcloud_security_group_rule" "ingress_ssh" {
-  security_group_id = var.security_group_id
-  direction         = "ingress"
-  protocol          = "tcp"
-  port_range_min    = 22
-  port_range_max    = 22
-  remote_ip_prefix  = "0.0.0.0/0"
-  description       = "Allow inbound SSH"
+  security_group   = { id = var.security_group_id }
+  direction        = "ingress"
+  protocol         = "tcp"
+  port_range_min   = 22
+  port_range_max   = 22
+  remote_ip_prefix = "0.0.0.0/0"
+  description      = "Allow inbound SSH"
 }
 
 # Allow outbound HTTPS to anywhere.
 resource "viettelcloud_security_group_rule" "egress_https" {
-  security_group_id = var.security_group_id
-  direction         = "egress"
-  protocol          = "tcp"
-  port_range_min    = 443
-  port_range_max    = 443
-  remote_ip_prefix  = "0.0.0.0/0"
-  description       = "Allow outbound HTTPS"
+  security_group   = { id = var.security_group_id }
+  direction        = "egress"
+  protocol         = "tcp"
+  port_range_min   = 443
+  port_range_max   = 443
+  remote_ip_prefix = "0.0.0.0/0"
+  description      = "Allow outbound HTTPS"
 }
 ```
 
@@ -50,7 +50,7 @@ resource "viettelcloud_security_group_rule" "egress_https" {
 
 - `direction` (String) Direction of the rule: ingress or egress.
 - `protocol` (String) Protocol filter. Supported values: ah, any, dccp, egp, esp, gre, hopopt, icmp, igmp, ip, ipip, ipv6-encap, ipv6-frag, ipv6-icmp, ipv6-nonxt, ipv6-opts, ipv6-route, ospf, pgm, rsvp, sctp, tcp, udp, udplite, vrrp.
-- `security_group_id` (String) Security group ID (UUID) owning the rule.
+- `security_group` (Attributes) Security group owning the rule. (see [below for nested schema](#nestedatt--security_group))
 
 ### Optional
 
@@ -67,3 +67,10 @@ resource "viettelcloud_security_group_rule" "egress_https" {
 - `region` (String) Region name inherited from the security group.
 - `security_group_name` (String) Name of the security group owning the rule.
 - `updated_at` (String) Timestamp when the rule was last updated (RFC3339).
+
+<a id="nestedatt--security_group"></a>
+### Nested Schema for `security_group`
+
+Required:
+
+- `id` (String) Security group ID (UUID).

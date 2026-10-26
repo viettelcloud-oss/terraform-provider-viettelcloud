@@ -74,7 +74,7 @@ run "createPlacementGroup_allAttributesConfigured_completeStateReturned" {
       viettelcloud_placement_group.pg.name == "tf-test-pg-before" &&
       viettelcloud_placement_group.pg.description == "Placement Group before update" &&
       viettelcloud_placement_group.pg.policy == "affinity" &&
-      viettelcloud_placement_group.pg.region == "vn-central-1" &&
+      viettelcloud_placement_group.pg.region.name == "vn-central-1" &&
       length(viettelcloud_placement_group.pg.region_id) > 0 &&
       length(viettelcloud_placement_group.pg.project) > 0 &&
       viettelcloud_placement_group.pg.server_count != null &&
@@ -186,7 +186,7 @@ run "setUntrimmedName_existingPlacementGroup_configuredValuePreserved" {
     condition = (
       viettelcloud_placement_group.pg.id == run.createPlacementGroup_allAttributesConfigured_completeStateReturned.placement_group_id &&
       viettelcloud_placement_group.pg.name == "  tf-test-pg-after  " &&
-      viettelcloud_placement_group.pg.region == "vn-central-1"
+      viettelcloud_placement_group.pg.region.name == "vn-central-1"
     )
     error_message = "The configured name representation was not preserved in place."
   }
@@ -213,7 +213,7 @@ run "planAgain_untrimmedName_stateStable" {
     condition = (
       viettelcloud_placement_group.pg.id == run.createPlacementGroup_allAttributesConfigured_completeStateReturned.placement_group_id &&
       viettelcloud_placement_group.pg.name == "  tf-test-pg-after  " &&
-      viettelcloud_placement_group.pg.region == "vn-central-1"
+      viettelcloud_placement_group.pg.region.name == "vn-central-1"
     )
     error_message = "The untrimmed Placement Group name caused drift or plan flapping."
   }
@@ -275,7 +275,7 @@ run "changePolicy_existingPlacementGroup_placementGroupReplaced" {
       viettelcloud_placement_group.pg.id != run.createPlacementGroup_allAttributesConfigured_completeStateReturned.placement_group_id &&
       viettelcloud_placement_group.pg.policy == "anti-affinity" &&
       viettelcloud_placement_group.pg.name == "tf-test-pg-after" &&
-      viettelcloud_placement_group.pg.region == "vn-central-1"
+      viettelcloud_placement_group.pg.region.name == "vn-central-1"
     )
     error_message = "Placement Group was not replaced after changing its policy."
   }
@@ -310,7 +310,7 @@ run "createPlacementGroup_untrimmedRegion_configuredRegionPreserved" {
     condition = (
       length(viettelcloud_placement_group.pg.id) > 0 &&
       viettelcloud_placement_group.pg.name == "tf-test-pg-region" &&
-      viettelcloud_placement_group.pg.region == "  vn-central-1  " &&
+      viettelcloud_placement_group.pg.region.name == "  vn-central-1  " &&
       length(viettelcloud_placement_group.pg.region_id) > 0
     )
     error_message = "The configured region representation was not preserved on create."
@@ -337,7 +337,7 @@ run "planAgain_untrimmedRegion_stateStable" {
   assert {
     condition = (
       viettelcloud_placement_group.pg.id == run.createPlacementGroup_untrimmedRegion_configuredRegionPreserved.placement_group_id &&
-      viettelcloud_placement_group.pg.region == "  vn-central-1  " &&
+      viettelcloud_placement_group.pg.region.name == "  vn-central-1  " &&
       viettelcloud_placement_group.pg.region_id == run.createPlacementGroup_untrimmedRegion_configuredRegionPreserved.placement_group_region_id
     )
     error_message = "The untrimmed Placement Group region caused drift or planned a replacement."

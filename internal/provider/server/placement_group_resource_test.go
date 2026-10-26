@@ -22,6 +22,7 @@ import (
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 func placementGroupSchema(t *testing.T) resourceschema.Schema {
@@ -35,12 +36,17 @@ func placementGroupSchema(t *testing.T) resourceschema.Schema {
 	return response.Schema
 }
 
+// placementGroupRegion returns a region reference, null for a null name.
+func placementGroupRegion(name types.String) types.Object {
+	return reference.Value(reference.Name, name)
+}
+
 func TestPlacementGroupModelsMatchSchema(t *testing.T) {
 	t.Parallel()
 
 	schema := placementGroupSchema(t)
 	plan := tfsdk.Plan{Schema: schema}
-	if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -49,11 +55,17 @@ func TestPlacementGroupSchemaMutability(t *testing.T) {
 	t.Parallel()
 
 	schema := placementGroupSchema(t)
-	for _, name := range []string{"policy", "region"} {
-		attribute, ok := schema.Attributes[name].(resourceschema.StringAttribute)
-		if !ok || !attribute.Required || attribute.Computed || len(attribute.PlanModifiers) != 1 {
-			t.Fatalf("%s must be required, computed-false, and replace-only, got %#v", name, schema.Attributes[name])
-		}
+	policy, ok := schema.Attributes["policy"].(resourceschema.StringAttribute)
+	if !ok || !policy.Required || policy.Computed || len(policy.PlanModifiers) != 1 {
+		t.Fatalf("policy must be required, computed-false, and replace-only, got %#v", schema.Attributes["policy"])
+	}
+	region, ok := schema.Attributes["region"].(resourceschema.SingleNestedAttribute)
+	if !ok || !region.Required || region.Computed || len(region.PlanModifiers) != 1 || len(region.Attributes) != 1 {
+		t.Fatalf("region must be a required, computed-false, and replace-only reference, got %#v", schema.Attributes["region"])
+	}
+	regionName, ok := region.Attributes[reference.Name].(resourceschema.StringAttribute)
+	if !ok || !regionName.Required || regionName.Computed || len(regionName.PlanModifiers) != 0 {
+		t.Fatalf("region.name must be a required criterion, got %#v", region.Attributes[reference.Name])
 	}
 	description, ok := schema.Attributes["description"].(resourceschema.StringAttribute)
 	if !ok || !description.Optional || !description.Computed || len(description.PlanModifiers) != 0 {
@@ -73,7 +85,44 @@ func TestPlacementGroupReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	schema := placementGroupSchema(t)
-	for _, name := range []string{"policy", "region"} {
+	state := tfsdk.State{Schema: schema}
+	if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
+		Policy: types.StringValue("affinity"),
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
+		t.Fatalf("set modifier state: %v", diags)
+	}
+	plan := tfsdk.Plan{Schema: schema}
+	if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
+		Policy: types.StringValue("affinity"),
+	}, Region: placementGroupRegion(types.StringValue("vn-north"))}); diags.HasError() {
+		t.Fatalf("set modifier plan: %v", diags)
+	}
+	region := schema.Attributes["region"].(resourceschema.SingleNestedAttribute)
+	for _, test := range []struct {
+		name    string
+		plan    types.Object
+		replace bool
+	}{
+		{"same name", placementGroupRegion(types.StringValue("vn-central")), false},
+		{"changed name", placementGroupRegion(types.StringValue("vn-north")), true},
+		{"unknown name", placementGroupRegion(types.StringUnknown()), true},
+		{"unknown reference", types.ObjectUnknown(reference.AttributeTypes(reference.Name)), true},
+	} {
+		request := planmodifier.ObjectRequest{
+			State:      state,
+			Plan:       plan,
+			Config:     tfsdk.Config(plan),
+			StateValue: placementGroupRegion(types.StringValue("vn-central")),
+			PlanValue:  test.plan,
+		}
+		var response planmodifier.ObjectResponse
+		region.PlanModifiers[0].PlanModifyObject(context.Background(), request, &response)
+		if response.RequiresReplace != test.replace {
+			t.Errorf("region %s: replace=%t, want %t", test.name, response.RequiresReplace, test.replace)
+		}
+	}
+
+	for _, name := range []string{"policy"} {
 		attribute, ok := schema.Attributes[name].(resourceschema.StringAttribute)
 		if !ok {
 			t.Fatalf("%s is not a string attribute", name)
@@ -85,15 +134,13 @@ func TestPlacementGroupReplacementAttributes(t *testing.T) {
 		state := tfsdk.State{Schema: schema}
 		if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 			Policy: types.StringValue("affinity"),
-			Region: types.StringValue("vn-central"),
-		}}); diags.HasError() {
+		}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
 			t.Fatalf("set modifier state: %v", diags)
 		}
 		plan := tfsdk.Plan{Schema: schema}
 		if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 			Policy: types.StringValue("anti-affinity"),
-			Region: types.StringValue("vn-north"),
-		}}); diags.HasError() {
+		}, Region: placementGroupRegion(types.StringValue("vn-north"))}); diags.HasError() {
 			t.Fatalf("set modifier plan: %v", diags)
 		}
 		request := planmodifier.StringRequest{
@@ -117,8 +164,7 @@ func TestBuildPlacementGroupCreateBodyResolvesRegionName(t *testing.T) {
 		Name:        types.StringValue("  cluster-a  "),
 		Description: types.StringValue("primary cluster"),
 		Policy:      types.StringValue("affinity"),
-		Region:      types.StringValue("vn-central"),
-	}}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		if filter.Name == nil || *filter.Name != "vn-central" {
 			t.Fatalf("unexpected region filter %#v", filter.Name)
 		}
@@ -145,23 +191,34 @@ func TestBuildPlacementGroupCreateBodyRejectsInvalidInputs(t *testing.T) {
 	}{
 		{
 			name:  "null name",
-			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Policy: types.StringValue("affinity"), Region: types.StringValue("vn-central")}},
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringValue("vn-central"))},
 		},
 		{
 			name:  "unknown policy",
-			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringUnknown(), Region: types.StringValue("vn-central")}},
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringUnknown()}, Region: placementGroupRegion(types.StringValue("vn-central"))},
 		},
 		{
 			name:  "blank region",
-			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringValue("affinity"), Region: types.StringValue("   ")}},
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringValue("   "))},
+		},
+		{
+			name:  "null region",
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringNull())},
+		},
+		{
+			name:  "unknown region",
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringUnknown())},
+		},
+		{
+			name:  "unknown region name",
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a"), Policy: types.StringValue("affinity")}, Region: reference.Of(map[string]types.String{reference.Name: types.StringUnknown()})},
 		},
 		{
 			name: "invalid policy",
 			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 				Name:   types.StringValue("cluster-a"),
 				Policy: types.StringValue("closest"),
-				Region: types.StringValue("vn-central"),
-			}},
+			}, Region: placementGroupRegion(types.StringValue("vn-central"))},
 		},
 	}
 
@@ -187,8 +244,7 @@ func TestBuildPlacementGroupCreateBodyRejectsRegionResolverError(t *testing.T) {
 	_, diags := buildPlacementGroupCreateBody(context.Background(), PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		Name:   types.StringValue("cluster-a"),
 		Policy: types.StringValue("affinity"),
-		Region: types.StringValue("vn-central"),
-	}}, func(context.Context, projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}, func(context.Context, projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		return projectsdk.ProjectRegionSchema{}, expected
 	})
 	if !diags.HasError() || !strings.Contains(diags[0].Detail(), expected.Error()) {
@@ -340,7 +396,7 @@ func TestPopulatePlacementGroupModelMapsAllFields(t *testing.T) {
 		state.Name.ValueString() != "cluster-a" ||
 		state.Description.ValueString() != "primary cluster" ||
 		state.Policy.ValueString() != "affinity" ||
-		state.Region.ValueString() != "vn-central" ||
+		reference.Get(state.Region, reference.Name).ValueString() != "vn-central" ||
 		state.RegionID.ValueString() != placementGroupTestRegion.String() ||
 		state.Project.ValueString() != "integration" ||
 		state.ServerCount.ValueInt64() != 3 ||
@@ -365,12 +421,11 @@ func TestPopulatePlacementGroupResourceStatePreservesConfiguredNameAndRegion(t *
 		Project: placementGroupTestProject,
 	}
 	state := PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
-		Name:   types.StringValue("  cluster-a  "),
-		Region: types.StringValue("  vn-central  "),
-	}}
+		Name: types.StringValue("  cluster-a  "),
+	}, Region: placementGroupRegion(types.StringValue("  vn-central  "))}
 	populatePlacementGroupResourceState(pg, &state)
-	if state.Name.ValueString() != "  cluster-a  " || state.Region.ValueString() != "  vn-central  " {
-		t.Fatalf("expected configured representation to be preserved, got name=%q region=%q", state.Name.ValueString(), state.Region.ValueString())
+	if state.Name.ValueString() != "  cluster-a  " || reference.Get(state.Region, reference.Name).ValueString() != "  vn-central  " {
+		t.Fatalf("expected configured representation to be preserved, got name=%q region=%q", state.Name.ValueString(), reference.Get(state.Region, reference.Name).ValueString())
 	}
 }
 
@@ -389,12 +444,11 @@ func TestPopulatePlacementGroupResourceStateUsesChangedBackend(t *testing.T) {
 		Project: placementGroupTestProject,
 	}
 	state := PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
-		Name:   types.StringValue("old-name"),
-		Region: types.StringValue("vn-central"),
-	}}
+		Name: types.StringValue("old-name"),
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}
 	populatePlacementGroupResourceState(pg, &state)
-	if state.Name.ValueString() != "new-backend-name" || state.Region.ValueString() != "vn-north" {
-		t.Fatalf("expected backend values to replace configuration, got name=%q region=%q", state.Name.ValueString(), state.Region.ValueString())
+	if state.Name.ValueString() != "new-backend-name" || reference.Get(state.Region, reference.Name).ValueString() != "vn-north" {
+		t.Fatalf("expected backend values to replace configuration, got name=%q region=%q", state.Name.ValueString(), reference.Get(state.Region, reference.Name).ValueString())
 	}
 }
 
@@ -411,8 +465,8 @@ func TestPopulatePlacementGroupResourceStateFillsNullStateAfterImport(t *testing
 	}}
 	populatePlacementGroupResourceState(pg, &state)
 
-	if state.Name.ValueString() != "cluster-a" || state.Region.ValueString() != "vn-central" {
-		t.Fatalf("expected the backend name and region, got name=%q region=%q", state.Name.ValueString(), state.Region.ValueString())
+	if state.Name.ValueString() != "cluster-a" || !state.Region.Equal(placementGroupRegion(types.StringValue("vn-central"))) {
+		t.Fatalf("expected the backend name and region reference, got name=%q region=%s", state.Name.ValueString(), state.Region)
 	}
 	if state.Policy.ValueString() != string(serversdk.PlacementGroupPolicyAntiAffinity) {
 		t.Fatalf("expected policy %q, got %q", serversdk.PlacementGroupPolicyAntiAffinity, state.Policy.ValueString())
@@ -594,9 +648,8 @@ func TestPlacementGroupResourceLifecycleUsesPublicSDK(t *testing.T) {
 		Name:        types.StringValue("cluster-a"),
 		Description: types.StringValue("before"),
 		Policy:      types.StringValue("affinity"),
-		Region:      types.StringValue("vn-central"),
 		RegionID:    types.StringValue(placementGroupTestRegion.String()),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
 	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schema}}
@@ -660,7 +713,7 @@ func TestPlacementGroupResourceReadRemovesMissingAndDeleteAcceptsNotFound(t *tes
 	state := tfsdk.State{Schema: schema}
 	if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		ID: types.StringValue(placementGroupTestUUID.String()),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("set initial state: %v", diags)
 	}
 
@@ -716,7 +769,7 @@ func TestPlacementGroupResourceReadAndDeleteReportAPIErrors(t *testing.T) {
 			state := tfsdk.State{Schema: schema}
 			if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 				ID: types.StringValue(placementGroupTestUUID.String()),
-			}}); diags.HasError() {
+			}, Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 				t.Fatalf("set state: %v", diags)
 			}
 
@@ -745,7 +798,7 @@ func TestPlacementGroupResourceReadRejectsInvalidStateID(t *testing.T) {
 	state := tfsdk.State{Schema: schema}
 	if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		ID: types.StringValue("not-a-uuid"),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("set invalid state: %v", diags)
 	}
 
@@ -765,13 +818,13 @@ func TestPlacementGroupResourceUpdateRejectsInvalidStateID(t *testing.T) {
 	if diags := state.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		ID:   types.StringValue("not-a-uuid"),
 		Name: types.StringValue("cluster-a"),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("set invalid state: %v", diags)
 	}
 	plan := tfsdk.Plan{Schema: schema}
 	if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		Name: types.StringValue("cluster-b"),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 
@@ -815,20 +868,18 @@ func TestPlacementGroupResourceUpdateRejectsAnotherPlacementGroup(t *testing.T) 
 		ID:          types.StringValue(placementGroupTestUUID.String()),
 		Name:        types.StringValue("cluster-a"),
 		Policy:      types.StringValue("affinity"),
-		Region:      types.StringValue("vn-central"),
 		RegionID:    types.StringValue(placementGroupTestRegion.String()),
 		Description: types.StringValue("before"),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 	plan := tfsdk.Plan{Schema: schema}
 	if diags := plan.Set(context.Background(), &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		Name:        types.StringValue("cluster-b"),
 		Policy:      types.StringValue("affinity"),
-		Region:      types.StringValue("vn-central"),
 		RegionID:    types.StringValue(placementGroupTestRegion.String()),
 		Description: types.StringValue("after"),
-	}}); diags.HasError() {
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 
@@ -871,9 +922,8 @@ func TestPlacementGroupResourceUpdateWithoutChangesCallsGetPlacementGroup(t *tes
 		Name:        types.StringValue("cluster-a"),
 		Description: types.StringValue("primary"),
 		Policy:      types.StringValue("affinity"),
-		Region:      types.StringValue("vn-central"),
 		RegionID:    types.StringValue(placementGroupTestRegion.String()),
-	}}
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}
 	state := tfsdk.State{Schema: schema}
 	if diags := state.Set(context.Background(), &model); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
@@ -898,7 +948,7 @@ func TestPlacementGroupResourceImportState(t *testing.T) {
 
 	schema := placementGroupSchema(t)
 	response := resource.ImportStateResponse{State: tfsdk.State{Schema: schema}}
-	if diags := response.State.Set(context.Background(), &PlacementGroupResourceModel{}); diags.HasError() {
+	if diags := response.State.Set(context.Background(), &PlacementGroupResourceModel{Region: placementGroupRegion(types.StringNull())}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 

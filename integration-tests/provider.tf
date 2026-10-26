@@ -1,11 +1,10 @@
+# Terraform 1.16 supports import blocks in modules used by the test runs.
 terraform {
-  # 1.12 introduced the `parallel` and `state_key` run attributes the server
-  # resource test uses to run its lifecycle chains concurrently.
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }

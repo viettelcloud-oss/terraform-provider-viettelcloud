@@ -7,6 +7,10 @@ import (
 	"strings"
 	"time"
 
+	blockstorageselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/selector"
+	serverselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/selector"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/selector"
+
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -15,8 +19,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
@@ -32,6 +37,7 @@ import (
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/lookup"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
@@ -123,13 +129,20 @@ type bootVolumeUpdatePlan struct {
 	resizeSize int
 }
 
-// dataVolumeUpdatePlan carries only resizes because the backend has no attach
-// or detach volume operation yet. Add desired and removed sets here when it
-// does, the way privateIPUpdatePlan already reconciles private_ips.
-// resizeIDs and resizeSizes are index-aligned and always appended together.
 type dataVolumeUpdatePlan struct {
-	resizeIDs   []core.UUID
-	resizeSizes []int
+	resizeIDs      []core.UUID
+	resizeSizes    []int
+	desiredIDs     map[core.UUID]struct{}
+	removedIDs     map[core.UUID]struct{}
+	deletedIDs     []core.UUID
+	existingIDs    []core.UUID
+	newBodies      []blockstoragesdk.VolumeCreateSchema
+	newIndexes     []int
+	planned        []DataVolumeInputModel
+	updates        []dataVolumePropertyUpdate
+	cleanupConfigs map[core.UUID]DataVolumeInputModel
+	detachConfigs  []DataVolumeInputModel
+	recordCreated  func(DataVolumeInputModel) diag.Diagnostics
 }
 
 type attachmentUpdatePlan struct {
@@ -158,6 +171,16 @@ type (
 	subnetResolveFunc func(context.Context, string) (networksdk.SubnetSchema, error)
 )
 
+type dataVolumeStatePlanModifier struct{}
+
+type bootIOPSStatePlanModifier struct{}
+
+type dataVolumePropertyUpdate struct {
+	id           core.UUID
+	iops         *int
+	volumeTypeID core.UUID
+}
+
 func NewServerResource() resource.Resource {
 	return &ServerResource{}
 }
@@ -167,6 +190,25 @@ func (r *ServerResource) Metadata(_ context.Context, req resource.MetadataReques
 }
 
 func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	imageSelector := serverselector.ImageAttribute()
+	imageSelector.Description += " Required for image and local_disk boot types. Selecting a different image rebuilds the server in place."
+	bootVolumeType := blockstorageselector.VolumeTypeAttribute()
+	bootVolumeType.Description += " Required for image and custom_image boot types. Selecting a different volume type replaces the server."
+
+	dataVolumeType := blockstorageselector.VolumeTypeAttribute()
+	dataVolumeType.Computed = true
+	dataVolumeType.Description += " Required for kind new. Selecting a different type updates the volume in place. The backend supplies the type for kind existing."
+	for name, attribute := range dataVolumeType.Attributes {
+		switch attribute := attribute.(type) {
+		case schema.StringAttribute:
+			attribute.Computed = true
+			dataVolumeType.Attributes[name] = attribute
+		case schema.BoolAttribute:
+			attribute.Computed = true
+			dataVolumeType.Attributes[name] = attribute
+		}
+	}
+
 	resp.Schema = schema.Schema{
 		Description: "Manage a Viettel Cloud server.",
 		Attributes: map[string]schema.Attribute{
@@ -194,30 +236,29 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 						Required: true, Description: "Boot source type.",
 						PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 					},
-					"image": schema.StringAttribute{
+					"image": imageSelector,
+					"custom_image": schema.SingleNestedAttribute{
 						Optional:    true,
-						Description: "Exact image name. Required for image and local_disk boot types.",
+						Description: "Custom image to boot from. Required for the custom_image boot type.",
+						Attributes:  reference.Attributes(reference.ID, "Custom image ID (UUID)."),
 					},
-					"custom_image_id": schema.StringAttribute{Optional: true, Description: "Custom image ID (UUID)."},
-					"volume_id": schema.StringAttribute{
-						Optional: true, Description: "Existing boot volume ID (UUID).",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-					},
-					"volume_type": schema.StringAttribute{
+					"volume": schema.SingleNestedAttribute{
 						Optional:      true,
-						Description:   "Exact volume type name. Required for image and custom_image boot types.",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+						Description:   "Existing boot volume. Required for the volume boot type.",
+						Attributes:    reference.Attributes(reference.ID, "Volume ID (UUID)."),
+						PlanModifiers: []planmodifier.Object{objectplanmodifier.RequiresReplace()},
 					},
+					"volume_type": bootVolumeType,
 					"volume_size": schema.Int64Attribute{
 						Optional: true, Description: "Server-created boot volume size in GB. Updates can only increase it.",
 					},
 					"iops": schema.Int64Attribute{
 						Optional: true, Computed: true,
-						Description: "Requested boot volume IOPS. The backend allocates a value when it is omitted.",
-						// The backend allocates IOPS from the volume type when the
-						// attribute is omitted, so an omitted value must keep the
+						Description: "Requested boot volume IOPS. The backend allocates a value when it is omitted. Size updates can change unconfigured IOPS.",
+						// The backend allocates IOPS from the volume type and size when
+						// the attribute is omitted, so an omitted value must keep the
 						// allocated state instead of planning a replacement.
-						PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown(), int64planmodifier.RequiresReplaceIfConfigured()},
+						PlanModifiers: []planmodifier.Int64{bootIOPSStatePlanModifier{}, int64planmodifier.RequiresReplaceIfConfigured()},
 					},
 					"delete_on_termination": schema.BoolAttribute{
 						Optional: true,
@@ -242,21 +283,23 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"ram":   schema.Int64Attribute{Optional: true, Description: "Custom flavor RAM in GiB."},
 				},
 			},
-			"zone": schema.StringAttribute{
+			"zone": schema.SingleNestedAttribute{
 				Optional:    true,
 				Computed:    true,
-				Description: "Exact project zone name.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+				Description: "Project zone that hosts the server.",
+				Attributes:  reference.PreservedAttributes(reference.Name, "Exact zone name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
-			"key_pair_id": schema.StringAttribute{
+			"key_pair": schema.SingleNestedAttribute{
 				Optional:    true,
 				Computed:    true,
-				Description: "Key pair ID (UUID) associated with the server.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+				Description: "Key pair associated with the server.",
+				Attributes:  reference.PreservedAttributes(reference.ID, "Key pair ID (UUID)."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+					objectplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"key_pair_name": schema.StringAttribute{
@@ -266,13 +309,14 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"placement_group_id": schema.StringAttribute{
+			"placement_group": schema.SingleNestedAttribute{
 				Optional:    true,
 				Computed:    true,
-				Description: "Placement group ID (UUID) associated with the server.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+				Description: "Placement group associated with the server.",
+				Attributes:  reference.PreservedAttributes(reference.ID, "Placement group ID (UUID)."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+					objectplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"placement_group_name": schema.StringAttribute{
@@ -283,50 +327,17 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				},
 			},
 			"data_volumes": schema.ListNestedAttribute{
-				Optional:    true,
-				Description: "Data volumes created and attached with the server.",
-				// Attribute modifiers handle changes within each volume.
-				// The list modifier handles count changes because an added or
-				// removed element may leave the remaining attributes unchanged.
-				PlanModifiers: []planmodifier.List{
-					listplanmodifier.RequiresReplaceIf(
-						dataVolumeCountChanged,
-						"Replaces the server when the number of data volumes changes.",
-						"Replaces the server when the number of data volumes changes.",
-					),
-				},
+				Optional: true, Computed: true,
+				Description:   "Data volume attachments. kind new creates a volume, and kind existing attaches a volume by ID. Omission preserves attachments. An empty list detaches all data volumes.",
+				PlanModifiers: []planmodifier.List{dataVolumeStatePlanModifier{}},
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
-					// The ID identifies which backend volume an element owns, so
-					// a resize extends the volume the practitioner configured
-					// rather than whichever attachment the server happens to
-					// report at that position.
-					"id": schema.StringAttribute{
-						Computed: true, Description: "Attached data volume ID (UUID).",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
-					},
-					"volume_type": schema.StringAttribute{
-						Required: true, Description: "Exact volume type name.",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-					},
-					"volume_size": schema.Int64Attribute{
-						Required: true, Description: "Server-created data volume size in GB. Updates can only increase it.",
-					},
-					"iops": schema.Int64Attribute{
-						Optional: true, Computed: true,
-						Description: "Requested volume IOPS. The backend allocates a value when it is omitted.",
-						// Same contract as boot.iops: the backend allocates
-						// IOPS from the volume type when the attribute is
-						// omitted, so an omitted value keeps the allocated
-						// state instead of planning a replacement.
-						PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown(), int64planmodifier.RequiresReplaceIfConfigured()},
-					},
-					"delete_on_termination": schema.BoolAttribute{
-						Optional: true,
-						Computed: true,
-						Description: "Delete this data volume after deleting the server. Defaults to true. Removing it " +
-							"from configuration preserves the last applied value instead of restoring the default.",
-						PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
-					},
+					"kind":                  schema.StringAttribute{Optional: true, Computed: true, Default: stringdefault.StaticString("new"), Description: "Attachment kind: new or existing. Defaults to new for compatibility with earlier configurations."},
+					"attached":              schema.BoolAttribute{Computed: true, Description: "Whether the volume currently attaches to this server. A failed operation can leave a new volume allocated but detached."},
+					"id":                    schema.StringAttribute{Optional: true, Computed: true, Description: "Volume ID (UUID). Required for kind existing. For kind new, omit it on create. Set a prior volume ID to identify it during updates."},
+					"volume_type":           dataVolumeType,
+					"volume_size":           schema.Int64Attribute{Optional: true, Computed: true, Description: "Volume size in GB. Required for kind new. Updates can only increase it. For kind existing, the backend supplies this value."},
+					"iops":                  schema.Int64Attribute{Optional: true, Computed: true, Description: "Requested IOPS for kind new. Updates keep the volume ID. The backend supplies the effective value when omitted. Size or type updates can change unconfigured IOPS. Omit it for kind existing."},
+					"delete_on_termination": schema.BoolAttribute{Optional: true, Computed: true, Description: "Delete the volume with the server. Defaults to true for kind new and false for kind existing. Removing a new attachment also deletes its volume when true. Removing an existing attachment only detaches it. Omitting this flag preserves its last value."},
 				}},
 			},
 			"private_ips": schema.ListNestedAttribute{
@@ -336,23 +347,37 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				PlanModifiers: []planmodifier.List{
 					preservePrivateIPState(),
 				},
+				// Every input is also Computed, because Terraform plans an omitted
+				// list as null instead of its prior value when that value holds a
+				// non-Computed attribute. preservePrivateIPState plans configured
+				// inputs as written.
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
 					"kind": schema.StringAttribute{
-						Required:    true,
-						Description: "Attachment kind: subnet or ip.",
+						Optional:    true,
+						Computed:    true,
+						Description: "Attachment kind: subnet or ip. Required for every attachment.",
 					},
 					"id": schema.StringAttribute{
 						Optional:    true,
 						Computed:    true,
 						Description: "Private IP ID. Required when kind is ip; computed when kind is subnet.",
 					},
-					"subnet_id": schema.StringAttribute{
+					"subnet": schema.SingleNestedAttribute{
 						Optional:    true,
-						Description: "Subnet ID. Configure exactly one of subnet_id or subnet_cidr when kind is subnet.",
-					},
-					"subnet_cidr": schema.StringAttribute{
-						Optional:    true,
-						Description: "Exact subnet CIDR. Configure exactly one of subnet_id or subnet_cidr when kind is subnet.",
+						Computed:    true,
+						Description: "Subnet that allocates the private IP. Required when kind is subnet; must be omitted when kind is ip.",
+						Attributes: map[string]schema.Attribute{
+							reference.ID: schema.StringAttribute{
+								Optional:    true,
+								Computed:    true,
+								Description: "Subnet ID (UUID). Configure exactly one of id or cidr.",
+							},
+							subnetCIDR: schema.StringAttribute{
+								Optional:    true,
+								Computed:    true,
+								Description: "Exact subnet CIDR. Configure exactly one of id or cidr.",
+							},
+						},
 					},
 					"delete_on_termination": schema.BoolAttribute{
 						Optional: true,
@@ -371,10 +396,13 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				PlanModifiers: []planmodifier.List{
 					preserveElasticIPState(),
 				},
+				// Every input is also Computed for the reason given on private_ips.
+				// preserveElasticIPState plans configured inputs as written.
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
 					"kind": schema.StringAttribute{
-						Required:    true,
-						Description: "Attachment kind: existing or new.",
+						Optional:    true,
+						Computed:    true,
+						Description: "Attachment kind: existing or new. Required for every attachment.",
 					},
 					"id": schema.StringAttribute{
 						Optional:    true,
@@ -383,10 +411,12 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					},
 					"enable_ipv4": schema.BoolAttribute{
 						Optional:    true,
+						Computed:    true,
 						Description: "Enable IPv4 when kind is new. Defaults to true.",
 					},
 					"enable_ipv6": schema.BoolAttribute{
 						Optional:    true,
+						Computed:    true,
 						Description: "Enable IPv6 when kind is new. Defaults to false.",
 					},
 					"delete_on_termination": schema.BoolAttribute{
@@ -416,11 +446,13 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Description: "Server bandwidth in Mbps. The backend enforces the supported range and rejects a " +
 					"value below its minimum, so omit it to accept the backend default.",
 			},
-			"security_group_ids": schema.SetAttribute{
+			"security_groups": schema.SetNestedAttribute{
 				Optional:    true,
 				Computed:    true,
-				ElementType: types.StringType,
-				Description: "Security group IDs attached to the server. Configure an empty set to detach all security groups.",
+				Description: "Security groups attached to the server. Configure an empty set to detach all security groups.",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: reference.PreservedAttributes(reference.ID, "Security group ID (UUID)."),
+				},
 			},
 			"quantity": schema.Int64Attribute{
 				Optional:    true,
@@ -477,8 +509,13 @@ func (r *ServerResource) ValidateConfig(ctx context.Context, req resource.Valida
 	validateServerPrivateIPs(ctx, config.PrivateIPs, &resp.Diagnostics)
 	validateServerElasticIPs(ctx, config.ElasticIPs, &resp.Diagnostics)
 	validateServerDataVolumes(ctx, config.DataVolumes, &resp.Diagnostics)
-	validateServerUUID(config.KeyPairID, path.Root("key_pair_id"), "key_pair_id", &resp.Diagnostics)
-	validateServerUUID(config.PlacementGroupID, path.Root("placement_group_id"), "placement_group_id", &resp.Diagnostics)
+	validateServerUUID(reference.Get(config.KeyPair, reference.ID), path.Root("key_pair").AtName(reference.ID), "key_pair.id", &resp.Diagnostics)
+	validateServerUUID(
+		reference.Get(config.PlacementGroup, reference.ID),
+		path.Root("placement_group").AtName(reference.ID),
+		"placement_group.id",
+		&resp.Diagnostics,
+	)
 }
 
 // ModifyPlan removes computed-only updates after the attribute modifiers have
@@ -488,18 +525,22 @@ func (r *ServerResource) ValidateConfig(ctx context.Context, req resource.Valida
 // unconfigured computed outputs makes the entire plan identical to refreshed
 // state. Any configured change or unknown input keeps the normal update plan.
 func (r *ServerResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() || !req.Config.Raw.IsFullyKnown() || len(resp.RequiresReplace) > 0 {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
 		return
 	}
-	candidate := req.Plan
-	for name, attribute := range req.Plan.Schema.GetAttributes() {
+	r.planSelectors(ctx, req, resp)
+	if resp.Diagnostics.HasError() || !req.Config.Raw.IsFullyKnown() || len(resp.RequiresReplace) > 0 {
+		return
+	}
+	candidate := resp.Plan
+	for name, attribute := range resp.Plan.Schema.GetAttributes() {
 		if !attribute.IsComputed() {
 			continue
 		}
 		p := path.Root(name)
 		var configured, planned, prior attr.Value
 		resp.Diagnostics.Append(req.Config.GetAttribute(ctx, p, &configured)...)
-		resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, p, &planned)...)
+		resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, p, &planned)...)
 		resp.Diagnostics.Append(req.State.GetAttribute(ctx, p, &prior)...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -532,6 +573,10 @@ func (r *ServerResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	body, diags := r.buildCreateBody(ctx, plan)
 	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(recordServerSelectorIDs(ctx, body, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -578,6 +623,11 @@ func (r *ServerResource) Create(ctx context.Context, req resource.CreateRequest,
 	if server == nil {
 		resp.Diagnostics.AddError("Error reading server after creation", emptyServerResponse(serverID))
 		return
+	}
+	attached, attachDiags := r.attachExistingDataVolumesAfterCreate(ctx, serverID, &plan)
+	resp.Diagnostics.Append(attachDiags...)
+	if attached != nil {
+		server = attached
 	}
 	resp.Diagnostics.Append(r.refreshServerResourceState(ctx, server, &plan)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -658,6 +708,27 @@ func (r *ServerResource) Update(ctx context.Context, req resource.UpdateRequest,
 		imageFinder := serverlookup.NewImageFinder(r.client, r.projectID)
 		rebuildBody, expectedImageID, bootDiags = buildServerRebuildBody(ctx, plan.Boot, r.projectID, imageFinder.Resolve)
 		resp.Diagnostics.Append(bootDiags...)
+		if !resp.Diagnostics.HasError() && rebuildBody.ImageId != nil {
+			var boot BootInputModel
+			resp.Diagnostics.Append(plan.Boot.As(ctx, &boot, basetypes.ObjectAsOptions{})...)
+			var prior BootInputModel
+			resp.Diagnostics.Append(state.Boot.As(ctx, &prior, basetypes.ObjectAsOptions{})...)
+			if !resp.Diagnostics.HasError() {
+				currentID, known := selector.ID(prior.Image)
+				if !known {
+					var err error
+					currentID, err = r.currentSelectorID(ctx, state, "image", -1)
+					if err != nil {
+						resp.Diagnostics.AddError("Unable to read server image identity", err.Error())
+					}
+				}
+				bootChanged = currentID != expectedImageID
+				boot.Image = selector.WithID(boot.Image, types.StringValue(expectedImageID.String()))
+				var valueDiags diag.Diagnostics
+				plan.Boot, valueDiags = types.ObjectValueFrom(ctx, bootResourceAttributeTypes(), boot)
+				resp.Diagnostics.Append(valueDiags...)
+			}
+		}
 	}
 	needsResize, flavorDiags := flavorChanged(ctx, plan, state)
 	resp.Diagnostics.Append(flavorDiags...)
@@ -668,13 +739,36 @@ func (r *ServerResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	var securityGroupBody serversdk.ServerUpdateSecurityGroupSchema
 	if securityGroupsChanged(plan, state) && !resp.Diagnostics.HasError() {
-		securityGroupBody, diags = buildSecurityGroupUpdateBody(ctx, plan.SecurityGroupIDs)
+		securityGroupBody, diags = buildSecurityGroupUpdateBody(plan.SecurityGroups)
 		resp.Diagnostics.Append(diags...)
 	}
 	attachmentPlan, attachmentDiags := r.buildAttachmentUpdatePlan(ctx, serverID, plan, state)
 	resp.Diagnostics.Append(attachmentDiags...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	if data := attachmentPlan.dataVolume; data != nil {
+		// Record each allocation against prior state before any waiter or
+		// attachment request can fail. The planned list can contain unknown
+		// entries for volumes that do not exist yet.
+		data.recordCreated = func(created DataVolumeInputModel) diag.Diagnostics {
+			var diags diag.Diagnostics
+			var volumes []DataVolumeInputModel
+			if !state.DataVolumes.IsNull() && !state.DataVolumes.IsUnknown() {
+				diags.Append(state.DataVolumes.ElementsAs(ctx, &volumes, false)...)
+			}
+			if diags.HasError() {
+				return diags
+			}
+			volumes = append(volumes, created)
+			value, valueDiags := types.ListValueFrom(ctx, types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()}, volumes)
+			diags.Append(valueDiags...)
+			if !diags.HasError() {
+				diags.Append(resp.State.SetAttribute(ctx, path.Root("data_volumes"), value)...)
+				state.DataVolumes = value
+			}
+			return diags
+		}
 	}
 
 	// Every request below mutates the server, so the refresh must run even when
@@ -718,10 +812,13 @@ func (r *ServerResource) Update(ctx context.Context, req resource.UpdateRequest,
 		resp.Diagnostics.AddError("Error reading server after update", emptyServerResponse(serverID))
 		return
 	}
-	// Update never changes the number of server-owned data volumes. Carry their
-	// stable order into refresh because computed plan values are otherwise
-	// unknown during any update and the server API can reorder attachments.
-	plan.DataVolumeIDs = state.DataVolumeIDs
+	if data := attachmentPlan.dataVolume; data != nil {
+		value, valueDiags := types.ListValueFrom(ctx, types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()}, dataVolumesAfterUpdate(data, server))
+		resp.Diagnostics.Append(valueDiags...)
+		if !valueDiags.HasError() {
+			plan.DataVolumes = value
+		}
+	}
 	resp.Diagnostics.Append(r.refreshServerResourceState(ctx, server, &plan)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -938,6 +1035,736 @@ func (r *ServerResource) waitUntilDeleted(ctx context.Context, id core.UUID) err
 	return nil
 }
 
+// planSelectors restores known catalog IDs before the computed no-op guard.
+// Unrelated unknown configuration must not suppress immutable selector changes.
+func (r *ServerResource) planSelectors(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	var plan, state ServerResourceModel
+	resp.Diagnostics.Append(resp.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	decide := func(planned, prior types.Object, p path.Path, image bool, index int) types.Object {
+		if planned.IsNull() && prior.IsNull() {
+			return planned
+		}
+		find := func(ctx context.Context) ([]core.UUID, error) {
+			var ids []core.UUID
+			if image {
+				filter, diags := serverselector.ImageFilter(ctx, planned, p.String())
+				if diags.HasError() {
+					return nil, fmt.Errorf("%v", diags)
+				}
+				candidates, err := serverlookup.NewImageFinder(r.client, r.projectID).Find(ctx, filter)
+				for _, candidate := range candidates {
+					ids = append(ids, candidate.Id)
+				}
+				return ids, err
+			}
+			filter, diags := blockstorageselector.VolumeTypeFilter(ctx, planned, p.String())
+			if diags.HasError() {
+				return nil, fmt.Errorf("%v", diags)
+			}
+			if zoneName := reference.Get(state.Zone, reference.Name); !zoneName.IsNull() && !zoneName.IsUnknown() {
+				name := strings.TrimSpace(zoneName.ValueString())
+				zone, err := projectlookup.NewZoneFinder(r.projectClient, r.projectID).Resolve(ctx, projectlookup.ZoneFilter{Name: &name})
+				if err != nil {
+					return nil, err
+				}
+				filter.ZoneID = &zone.Id
+			}
+			candidates, err := blockstoragelookup.NewVolumeTypeFinder(r.blockStorageClient).Find(ctx, filter)
+			for _, candidate := range candidates {
+				ids = append(ids, candidate.Id)
+			}
+			return ids, err
+		}
+		kind := "volume_type"
+		if image {
+			kind = "image"
+		}
+		decision, id, diags := selector.Decide(ctx, planned, prior, p.String(), find,
+			func(ctx context.Context) (core.UUID, error) { return r.currentSelectorID(ctx, state, kind, index) })
+		resp.Diagnostics.Append(diags...)
+		if !image && index < 0 && decision != selector.Same {
+			resp.RequiresReplace = append(resp.RequiresReplace, p)
+		}
+		value := selector.WithID(planned, id)
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, p, value)...)
+		return value
+	}
+	if plan.Boot.IsUnknown() {
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("boot").AtName("volume_type"))
+	} else if !plan.Boot.IsNull() && !state.Boot.IsNull() && !state.Boot.IsUnknown() {
+		var planned, prior BootInputModel
+		resp.Diagnostics.Append(plan.Boot.As(ctx, &planned, basetypes.ObjectAsOptions{})...)
+		resp.Diagnostics.Append(state.Boot.As(ctx, &prior, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if planned.BootType.Equal(prior.BootType) {
+			switch normalizedString(planned.BootType) {
+			case "image", "local_disk":
+				decide(planned.Image, prior.Image, path.Root("boot").AtName("image"), true, -1)
+			}
+			decide(planned.VolumeType, prior.VolumeType, path.Root("boot").AtName("volume_type"), false, -1)
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if plan.DataVolumes.IsUnknown() {
+		return
+	}
+	if plan.DataVolumes.IsNull() || state.DataVolumes.IsNull() || state.DataVolumes.IsUnknown() {
+		return
+	}
+	var planned, prior []DataVolumeInputModel
+	resp.Diagnostics.Append(plan.DataVolumes.ElementsAs(ctx, &planned, false)...)
+	resp.Diagnostics.Append(state.DataVolumes.ElementsAs(ctx, &prior, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	matches, _, matchDiags := matchDataVolumeConfigs(planned, prior)
+	resp.Diagnostics.Append(matchDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for i := range planned {
+		if matches[i] < 0 || dataVolumeKind(planned[i]) != "new" {
+			continue
+		}
+		decide(planned[i].VolumeType, prior[matches[i]].VolumeType, path.Root("data_volumes").AtListIndex(i).AtName("volume_type"), false, matches[i])
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+}
+
+// currentSelectorID reads resource responses only for state without selector IDs.
+func (r *ServerResource) currentSelectorID(ctx context.Context, state ServerResourceModel, kind string, index int) (core.UUID, error) {
+	serverID, diags := parse.UUIDString(state.ID, "id")
+	if diags.HasError() {
+		return core.UUID{}, fmt.Errorf("%v", diags)
+	}
+	server, err := r.get(ctx, serverID)
+	if err != nil {
+		return core.UUID{}, err
+	}
+	if server == nil {
+		return core.UUID{}, fmt.Errorf("server response is empty")
+	}
+	if kind == "image" && server.Image != nil {
+		return server.Image.Id, nil
+	}
+	volumeID, found := serverRootVolumeID(server)
+	if index >= 0 {
+		ids := dataVolumeIDs(server)
+		// Each configured volume keeps its own ID across attachment reordering.
+		if !state.DataVolumes.IsNull() && !state.DataVolumes.IsUnknown() {
+			var stored []DataVolumeInputModel
+			if diags := state.DataVolumes.ElementsAs(ctx, &stored, false); diags.HasError() {
+				return core.UUID{}, fmt.Errorf("%v", diags)
+			}
+			if index < len(stored) && !stored[index].ID.IsNull() && !stored[index].ID.IsUnknown() {
+				ids = make([]string, index+1)
+				ids[index] = stored[index].ID.ValueString()
+			}
+		}
+		if index >= len(ids) {
+			return core.UUID{}, fmt.Errorf("data volume %d is missing", index)
+		}
+		volumeID, err = core.ParseUUID(ids[index])
+		found = err == nil
+	}
+	if !found {
+		return core.UUID{}, fmt.Errorf("server volume identity is missing: %w", selector.ErrNoIdentity)
+	}
+	volume, err := r.blockStorageClient.GetVolume(ctx, volumeID, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+	if err != nil {
+		return core.UUID{}, err
+	}
+	if volume != nil {
+		if kind == "image" && volume.CreateFrom.Image != nil {
+			return volume.CreateFrom.Image.Id, nil
+		}
+		if kind == "volume_type" && volume.CreateFrom.VolumeType != nil {
+			return volume.CreateFrom.VolumeType.Id, nil
+		}
+	}
+	return core.UUID{}, fmt.Errorf("server volume %s: %w", kind, selector.ErrNoIdentity)
+}
+
+func (r *ServerResource) refreshServerDataVolumeState(ctx context.Context, server *serversdk.ServerDetailSchema, state *ServerResourceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+	var configured []DataVolumeInputModel
+	if !state.DataVolumes.IsNull() && !state.DataVolumes.IsUnknown() {
+		diags.Append(state.DataVolumes.ElementsAs(ctx, &configured, false)...)
+	}
+	if diags.HasError() {
+		return diags
+	}
+	var attachments []serversdk.NestedServerVolumeSchema
+	for _, attachment := range server.Volumes {
+		if attachment.MountAs == "data" {
+			attachments = append(attachments, attachment)
+		}
+	}
+	matches, used := matchAttachmentIDs(len(configured), len(attachments), func(i, j int) bool {
+		id, err := core.ParseUUID(configured[i].ID.ValueString())
+		return err == nil && id == attachments[j].Volume.Id
+	}, func(i int) bool { return !configured[i].ID.IsNull() && !configured[i].ID.IsUnknown() })
+	result := make([]DataVolumeInputModel, 0, len(attachments))
+	for i, config := range configured {
+		if !config.ID.IsNull() && !config.ID.IsUnknown() {
+			_, idDiags := parse.UUIDString(config.ID, fmt.Sprintf("data_volumes[%d].id", i))
+			diags.Append(idDiags...)
+			if diags.HasError() {
+				return diags
+			}
+		}
+		if matches[i] < 0 {
+			// A new volume remains owned when allocation succeeds but attach
+			// fails. Retaining it lets the next update retry with the same ID.
+			if dataVolumeKind(config) == "new" && !config.ID.IsNull() && !config.ID.IsUnknown() {
+				id, _ := core.ParseUUID(config.ID.ValueString())
+				volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+				if errors.Is(err, blockstoragesdk.ErrNotFound) {
+					continue
+				}
+				if err != nil || volume == nil {
+					diags.AddError("Error reading detached server-owned volume", fmt.Sprintf("Volume %s: %v", id, err))
+					return diags
+				}
+				diags.Append(populateServerDataVolume(volume, false, &config)...)
+				result = append(result, config)
+			}
+			continue
+		}
+		volume, err := r.blockStorageClient.GetVolume(ctx, attachments[matches[i]].Volume.Id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if err != nil || volume == nil {
+			diags.AddError("Error reading server data volume", fmt.Sprintf("Unable to read volume %s: %v", attachments[matches[i]].Volume.Id, err))
+			return diags
+		}
+		diags.Append(populateServerDataVolume(volume, true, &config)...)
+		result = append(result, config)
+	}
+	for i, attachment := range attachments {
+		if used[i] {
+			continue
+		}
+		volume, err := r.blockStorageClient.GetVolume(ctx, attachment.Volume.Id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if err != nil || volume == nil {
+			diags.AddError("Error reading server data volume", fmt.Sprintf("Unable to read volume %s: %v", attachment.Volume.Id, err))
+			return diags
+		}
+		config := DataVolumeInputModel{Kind: types.StringValue("existing")}
+		diags.Append(populateServerDataVolume(volume, true, &config)...)
+		result = append(result, config)
+	}
+	if diags.HasError() {
+		return diags
+	}
+	state.DataVolumes, diags = types.ListValueFrom(ctx, types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()}, result)
+	return diags
+}
+
+func (r *ServerResource) attachExistingDataVolumesAfterCreate(ctx context.Context, serverID core.UUID, plan *ServerResourceModel) (*serversdk.ServerDetailSchema, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	var configs []DataVolumeInputModel
+	if plan.DataVolumes.IsNull() || plan.DataVolumes.IsUnknown() {
+		return nil, diags
+	}
+	diags.Append(plan.DataVolumes.ElementsAs(ctx, &configs, false)...)
+	if diags.HasError() {
+		return nil, diags
+	}
+	var latest *serversdk.ServerDetailSchema
+	for i, config := range configs {
+		if dataVolumeKind(config) != "existing" {
+			continue
+		}
+		id, idDiags := parse.UUIDString(config.ID, fmt.Sprintf("data_volumes[%d].id", i))
+		diags.Append(idDiags...)
+		if diags.HasError() {
+			return latest, diags
+		}
+		if err := r.requestServerOperation(ctx, serverID, func(ctx context.Context) error {
+			return r.client.AttachVolume(ctx, serverID, serversdk.AttachVolumeParams{ProjectID: r.projectID}, serversdk.ServerVolumeAttachSchema{VolumeId: id})
+		}); err != nil {
+			diags.AddError("Error attaching server data volume", err.Error())
+			return latest, diags
+		}
+		var err error
+		latest, err = r.waitUntilDataVolumeAttachment(ctx, serverID, id, true)
+		if err != nil {
+			diags.AddError("Error waiting for server data volume attachment", err.Error())
+			return latest, diags
+		}
+	}
+	return latest, diags
+}
+
+func (r *ServerResource) buildDataVolumeUpdatePlan(ctx context.Context, plan, state ServerResourceModel) (*dataVolumeUpdatePlan, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if plan.DataVolumes.IsUnknown() {
+		diags.AddError("Unknown data volumes", "data_volumes must be known before updating the server.")
+		return nil, diags
+	}
+	if plan.DataVolumes.IsNull() {
+		return nil, diags
+	}
+	var planned, prior []DataVolumeInputModel
+	diags.Append(plan.DataVolumes.ElementsAs(ctx, &planned, false)...)
+	if !state.DataVolumes.IsNull() && !state.DataVolumes.IsUnknown() {
+		diags.Append(state.DataVolumes.ElementsAs(ctx, &prior, false)...)
+	}
+	if diags.HasError() {
+		return nil, diags
+	}
+	matches, used, matchDiags := matchDataVolumeConfigs(planned, prior)
+	diags.Append(matchDiags...)
+	if diags.HasError() {
+		return nil, diags
+	}
+	resolvedSelectors := false
+	result := &dataVolumeUpdatePlan{desiredIDs: make(map[core.UUID]struct{}), removedIDs: make(map[core.UUID]struct{}), planned: planned, cleanupConfigs: make(map[core.UUID]DataVolumeInputModel)}
+	for i, config := range planned {
+		if matches[i] >= 0 {
+			old := prior[matches[i]]
+			id, idDiags := parse.UUIDString(old.ID, fmt.Sprintf("prior data_volumes[%d].id", matches[i]))
+			diags.Append(idDiags...)
+			if idDiags.HasError() {
+				continue
+			}
+			// An omitted list preserves detached ownership with attached=false.
+			// Configured entries plan attached=true before an attachment retry.
+			if config.Attached.Equal(types.BoolValue(false)) {
+				continue
+			}
+			result.desiredIDs[id] = struct{}{}
+			if !old.Attached.IsNull() && !old.Attached.IsUnknown() && !old.Attached.ValueBool() {
+				result.existingIDs = append(result.existingIDs, id)
+			}
+			if dataVolumeKind(config) == "new" && !config.VolumeSize.Equal(old.VolumeSize) {
+				target, ok := increasedVolumeSize(config.VolumeSize, old.VolumeSize, fmt.Sprintf("data_volumes[%d].volume_size", i), &diags)
+				if ok && r.resolveVolumeResize(ctx, id, dataVolumeLabel(id), target, &diags) {
+					result.resizeIDs = append(result.resizeIDs, id)
+					result.resizeSizes = append(result.resizeSizes, target)
+				}
+			}
+			if dataVolumeKind(config) == "new" {
+				update := dataVolumePropertyUpdate{id: id}
+				if !config.IOPS.IsNull() && !config.IOPS.IsUnknown() && !config.IOPS.Equal(old.IOPS) {
+					iops := int(config.IOPS.ValueInt64())
+					update.iops = &iops
+				}
+				selectedID, known := selector.ID(config.VolumeType)
+				currentID, currentKnown := selector.ID(old.VolumeType)
+				// A null ID is an entry that the backend does not identify, so
+				// only a pending selection resolves a new volume type.
+				pending := selector.Pending(config.VolumeType)
+				if pending && selector.Equal(config.VolumeType, old.VolumeType) && currentKnown {
+					selectedID, known, pending = currentID, true, false
+				}
+				if pending && !selector.Equal(config.VolumeType, old.VolumeType) || known && (!currentKnown || selectedID != currentID) {
+					volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+					if err != nil || volume == nil || volume.CreateFrom.VolumeType == nil {
+						diags.AddError("Error reading data volume before type change", fmt.Sprintf("Volume %s does not identify its type: %v", id, err))
+						continue
+					}
+					currentID = volume.CreateFrom.VolumeType.Id
+					if !known {
+						zoneID := volume.Zone.Id
+						volumeType, typeDiags := blockstorageselector.ResolveVolumeType(ctx, config.VolumeType, fmt.Sprintf("data_volumes[%d].volume_type", i), &zoneID, int(config.VolumeSize.ValueInt64()), blockstoragelookup.NewVolumeTypeFinder(r.blockStorageClient).ResolveForCreate)
+						diags.Append(typeDiags...)
+						if typeDiags.HasError() {
+							continue
+						}
+						selectedID, known = volumeType.Id, true
+						resolvedSelectors = true
+					}
+					if selectedID != currentID {
+						update.volumeTypeID = selectedID
+					}
+				}
+				if known {
+					result.planned[i].VolumeType = selector.WithID(config.VolumeType, types.StringValue(selectedID.String()))
+				}
+				if update.iops != nil || update.volumeTypeID != core.NilUUID {
+					result.updates = append(result.updates, update)
+				}
+			}
+			continue
+		}
+		switch dataVolumeKind(config) {
+		case "existing":
+			id, idDiags := parse.UUIDString(config.ID, fmt.Sprintf("data_volumes[%d].id", i))
+			diags.Append(idDiags...)
+			if !idDiags.HasError() {
+				result.existingIDs = append(result.existingIDs, id)
+				result.desiredIDs[id] = struct{}{}
+			}
+		case "new":
+			body, bodyDiags := r.buildNewDataVolumeBody(ctx, state, &result.planned[i])
+			diags.Append(bodyDiags...)
+			result.newBodies = append(result.newBodies, body)
+			result.newIndexes = append(result.newIndexes, i)
+		default:
+			diags.AddError("Invalid data volume kind", "data_volumes.kind must be new or existing.")
+		}
+	}
+	for i, config := range prior {
+		if used[i] {
+			continue
+		}
+		id, idDiags := parse.UUIDString(config.ID, fmt.Sprintf("prior data_volumes[%d].id", i))
+		diags.Append(idDiags...)
+		if idDiags.HasError() {
+			continue
+		}
+		result.removedIDs[id] = struct{}{}
+		if dataVolumeKind(config) == "new" && boolValueOrDefault(config.DeleteOnTermination, true) {
+			result.deletedIDs = append(result.deletedIDs, id)
+			result.cleanupConfigs[id] = config
+		} else {
+			result.detachConfigs = append(result.detachConfigs, config)
+		}
+	}
+	if diags.HasError() {
+		return nil, diags
+	}
+	if len(result.resizeIDs)+len(result.removedIDs)+len(result.existingIDs)+len(result.newBodies)+len(result.updates) == 0 && !resolvedSelectors {
+		return nil, diags
+	}
+	return result, diags
+}
+
+// dataVolumesAfterUpdate lists the entries that the refresh after an update
+// matches against the server. An update can fail before it creates a new
+// volume or detaches a removed one. The refresh matches an entry without an ID
+// by position. An uncreated volume could then take the identity of a removed
+// attachment, which can be a volume that the practitioner owns. The list
+// therefore leaves out each uncreated volume and keeps each removed entry that
+// is still attached, with its kind and cleanup flag, for the next apply.
+func dataVolumesAfterUpdate(plan *dataVolumeUpdatePlan, server *serversdk.ServerDetailSchema) []DataVolumeInputModel {
+	attached := make(map[core.UUID]struct{})
+	for _, attachment := range server.Volumes {
+		if attachment.MountAs == "data" {
+			attached[attachment.Volume.Id] = struct{}{}
+		}
+	}
+	volumes := make([]DataVolumeInputModel, 0, len(plan.planned)+len(plan.detachConfigs)+len(plan.cleanupConfigs))
+	for _, config := range plan.planned {
+		if !config.ID.IsUnknown() {
+			volumes = append(volumes, config)
+		}
+	}
+	for _, config := range plan.detachConfigs {
+		if id, err := core.ParseUUID(config.ID.ValueString()); err == nil {
+			if _, ok := attached[id]; ok {
+				volumes = append(volumes, config)
+			}
+		}
+	}
+	for _, config := range plan.cleanupConfigs {
+		volumes = append(volumes, config)
+	}
+	return volumes
+}
+
+func (r *ServerResource) buildNewDataVolumeBody(ctx context.Context, state ServerResourceModel, config *DataVolumeInputModel) (blockstoragesdk.VolumeCreateSchema, diag.Diagnostics) {
+	var body blockstoragesdk.VolumeCreateSchema
+	var diags diag.Diagnostics
+	if config.VolumeSize.IsNull() || config.VolumeSize.IsUnknown() || config.VolumeSize.ValueInt64() < 1 {
+		diags.AddError("Invalid new data volume size", "volume_size must be known and greater than zero for kind new.")
+		return body, diags
+	}
+	serverID, idDiags := parse.UUIDString(state.ID, "id")
+	diags.Append(idDiags...)
+	if diags.HasError() {
+		return body, diags
+	}
+	server, err := r.get(ctx, serverID)
+	if err != nil || server == nil {
+		diags.AddError("Error reading server before volume creation", fmt.Sprint(err))
+		return body, diags
+	}
+	zoneID := server.Zone.Id
+	volumeTypeID, known := selector.ID(config.VolumeType)
+	if !known {
+		volumeType, typeDiags := blockstorageselector.ResolveVolumeType(ctx, config.VolumeType, "data_volumes.volume_type", &zoneID, int(config.VolumeSize.ValueInt64()), blockstoragelookup.NewVolumeTypeFinder(r.blockStorageClient).ResolveForCreate)
+		diags.Append(typeDiags...)
+		if diags.HasError() {
+			return body, diags
+		}
+		volumeTypeID = volumeType.Id
+	}
+	config.VolumeType = selector.WithID(config.VolumeType, types.StringValue(volumeTypeID.String()))
+	body.Name = "server-data-" + core.NewUUID().String()
+	err = body.CreateFrom.FromVolumeCreateEmptySchema(blockstoragesdk.VolumeCreateEmptySchema{Size: int(config.VolumeSize.ValueInt64()), VolumeTypeId: volumeTypeID})
+	if err != nil {
+		diags.AddError("Error building data volume source", err.Error())
+	}
+	if !config.IOPS.IsNull() && !config.IOPS.IsUnknown() {
+		iops := int(config.IOPS.ValueInt64())
+		body.Iops = &iops
+	}
+	return body, diags
+}
+
+func (r *ServerResource) applyDataVolumeUpdate(ctx context.Context, serverID core.UUID, plan *dataVolumeUpdatePlan) diag.Diagnostics {
+	var diags diag.Diagnostics
+	for id := range plan.removedIDs {
+		server, err := r.get(ctx, serverID)
+		if err != nil || server == nil {
+			diags.AddError("Error reading server before volume detach", fmt.Sprint(err))
+			return diags
+		}
+		for _, attachment := range server.Volumes {
+			if attachment.Volume.Id != id {
+				continue
+			}
+			if attachment.MountAs != "data" {
+				diags.AddError("Invalid data volume attachment", "A data_volumes entry cannot detach a boot volume.")
+				return diags
+			}
+			err := r.requestServerOperation(ctx, serverID, func(ctx context.Context) error {
+				return r.client.DetachVolume(ctx, serverID, serversdk.DetachVolumeParams{ProjectID: r.projectID}, serversdk.ServerVolumeAttachSchema{VolumeId: id})
+			})
+			if err != nil && !errors.Is(err, serversdk.ErrNotFound) {
+				diags.AddError("Error detaching server data volume", err.Error())
+				return diags
+			}
+			break
+		}
+		if _, err := r.waitUntilDataVolumeAttachment(ctx, serverID, id, false); err != nil {
+			diags.AddError("Error waiting for server data volume detach", err.Error())
+			return diags
+		}
+	}
+	for _, id := range plan.deletedIDs {
+		if err := r.blockStorageClient.DeleteVolume(ctx, id, blockstoragesdk.DeleteVolumeParams{ProjectID: r.projectID}); err != nil && !errors.Is(err, blockstoragesdk.ErrNotFound) {
+			diags.AddError("Error deleting detached server data volume", err.Error())
+			return diags
+		}
+		if err := r.waitUntilDataVolumeDeleted(ctx, id); err != nil {
+			diags.AddError("Error waiting for data volume deletion", err.Error())
+			return diags
+		}
+		delete(plan.cleanupConfigs, id)
+	}
+	for _, update := range plan.updates {
+		if update.volumeTypeID != core.NilUUID {
+			if err := r.blockStorageClient.RetypeVolume(ctx, update.id, blockstoragesdk.RetypeVolumeParams{ProjectID: r.projectID}, blockstoragesdk.VolumeRetypeSchema{VolumeTypeId: update.volumeTypeID}); err != nil {
+				diags.AddError("Error changing server data volume type", err.Error())
+				return diags
+			}
+			if err := r.waitUntilDataVolumeProperties(ctx, dataVolumePropertyUpdate{id: update.id, volumeTypeID: update.volumeTypeID}); err != nil {
+				diags.AddError("Error waiting for server data volume type", err.Error())
+				return diags
+			}
+		}
+		if update.iops != nil {
+			if _, err := r.blockStorageClient.UpdateVolume(ctx, update.id, blockstoragesdk.UpdateVolumeParams{ProjectID: r.projectID}, blockstoragesdk.VolumePartialUpdateSchema{Iops: update.iops}); err != nil {
+				diags.AddError("Error updating server data volume IOPS", err.Error())
+				return diags
+			}
+		}
+		if update.iops != nil {
+			if err := r.waitUntilDataVolumeProperties(ctx, update); err != nil {
+				diags.AddError("Error waiting for server data volume update", err.Error())
+				return diags
+			}
+		}
+	}
+	for i, id := range plan.resizeIDs {
+		diags.Append(r.resizeVolume(ctx, id, plan.resizeSizes[i], dataVolumeLabel(id))...)
+		if diags.HasError() {
+			return diags
+		}
+	}
+	for _, id := range plan.existingIDs {
+		if err := r.requestServerOperation(ctx, serverID, func(ctx context.Context) error {
+			return r.client.AttachVolume(ctx, serverID, serversdk.AttachVolumeParams{ProjectID: r.projectID}, serversdk.ServerVolumeAttachSchema{VolumeId: id})
+		}); err != nil {
+			diags.AddError("Error attaching server data volume", err.Error())
+			return diags
+		}
+		if _, err := r.waitUntilDataVolumeAttachment(ctx, serverID, id, true); err != nil {
+			diags.AddError("Error waiting for server data volume attachment", err.Error())
+			return diags
+		}
+	}
+	for i, body := range plan.newBodies {
+		volume, err := r.blockStorageClient.CreateVolume(ctx, blockstoragesdk.CreateVolumeParams{ProjectID: r.projectID}, body)
+		if err != nil || volume == nil {
+			diags.AddError("Error creating server data volume", fmt.Sprint(err))
+			return diags
+		}
+		plan.planned[plan.newIndexes[i]].ID = types.StringValue(volume.Id.String())
+		if plan.recordCreated != nil {
+			created := plan.planned[plan.newIndexes[i]]
+			diags.Append(populateServerDataVolume(volume, false, &created)...)
+			if !diags.HasError() {
+				diags.Append(plan.recordCreated(created)...)
+			}
+			if diags.HasError() {
+				return diags
+			}
+		}
+		if err := r.waitUntilDataVolumeAvailable(ctx, volume.Id); err != nil {
+			diags.AddError("Error waiting for new server data volume", err.Error())
+			return diags
+		}
+		if err := r.requestServerOperation(ctx, serverID, func(ctx context.Context) error {
+			return r.client.AttachVolume(ctx, serverID, serversdk.AttachVolumeParams{ProjectID: r.projectID}, serversdk.ServerVolumeAttachSchema{VolumeId: volume.Id})
+		}); err != nil {
+			cleanupErr := r.blockStorageClient.DeleteVolume(ctx, volume.Id, blockstoragesdk.DeleteVolumeParams{ProjectID: r.projectID})
+			diags.AddError("Error attaching new server data volume", fmt.Sprintf("Volume %s: %v. Cleanup result: %v", volume.Id, err, cleanupErr))
+			return diags
+		}
+		if _, err := r.waitUntilDataVolumeAttachment(ctx, serverID, volume.Id, true); err != nil {
+			diags.AddError("Error waiting for new data volume attachment", fmt.Sprintf("Volume %s: %v", volume.Id, err))
+			return diags
+		}
+		plan.desiredIDs[volume.Id] = struct{}{}
+	}
+	if plan.desiredIDs != nil {
+		err := r.waitForServer(ctx, serverID, "data volume attachments to settle", func(server *serversdk.ServerDetailSchema) (bool, error) {
+			ids := dataVolumeIDs(server)
+			if serverIsBusy(server) || len(ids) != len(plan.desiredIDs) {
+				return false, nil
+			}
+			for _, value := range ids {
+				id, err := core.ParseUUID(value)
+				if err != nil {
+					return false, err
+				}
+				if _, ok := plan.desiredIDs[id]; !ok {
+					return false, nil
+				}
+			}
+			return true, nil
+		})
+		if err != nil {
+			diags.AddError("Error waiting for server data volumes", err.Error())
+		}
+	}
+	return diags
+}
+
+func (r *ServerResource) waitUntilDataVolumeAttachment(ctx context.Context, serverID, volumeID core.UUID, attached bool) (*serversdk.ServerDetailSchema, error) {
+	w := wait.New[*serversdk.ServerDetailSchema](serverPollInterval, serverOperationTimeout)
+	return w.WaitFor(ctx, func(ctx context.Context) (*serversdk.ServerDetailSchema, error) {
+		server, err := r.get(ctx, serverID)
+		if err != nil {
+			return nil, err
+		}
+		if server == nil {
+			return nil, fmt.Errorf("server %s returned an empty response", serverID)
+		}
+		present := false
+		for _, attachment := range server.Volumes {
+			if attachment.Volume.Id == volumeID {
+				if attachment.MountAs != "data" {
+					return nil, fmt.Errorf("volume %s is a boot volume", volumeID)
+				}
+				present = true
+			}
+		}
+		volume, err := r.blockStorageClient.GetVolume(ctx, volumeID, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if !attached && errors.Is(err, blockstoragesdk.ErrNotFound) && !present {
+			return server, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if volume == nil {
+			return nil, fmt.Errorf("volume %s returned an empty response", volumeID)
+		}
+		if serverVolumeStatusFailed(volume.Status) {
+			return nil, fmt.Errorf("volume %s entered terminal status %s", volumeID, volume.Status)
+		}
+		if !serverIsBusy(server) && present == attached && ((!attached && serverVolumeStatusReady(volume.Status)) || (attached && volume.Status == blockstoragesdk.VolumeStatusInUse)) {
+			return server, nil
+		}
+		return nil, fmt.Errorf("volume %s attached=%t status=%s: %w", volumeID, present, volume.Status, wait.ErrNotReady)
+	})
+}
+
+func (r *ServerResource) waitUntilDataVolumeAvailable(ctx context.Context, id core.UUID) error {
+	w := wait.New[bool](serverPollInterval, serverOperationTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (bool, error) {
+		volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if err != nil {
+			return false, err
+		}
+		if volume == nil {
+			return false, fmt.Errorf("volume %s returned an empty response", id)
+		}
+		if volume.Status == blockstoragesdk.VolumeStatusAvailable {
+			return true, nil
+		}
+		if serverVolumeStatusFailed(volume.Status) {
+			return false, fmt.Errorf("volume %s entered terminal status %s", id, volume.Status)
+		}
+		return false, fmt.Errorf("volume %s status=%s: %w", id, volume.Status, wait.ErrNotReady)
+	})
+	return err
+}
+
+func (r *ServerResource) waitUntilDataVolumeProperties(ctx context.Context, update dataVolumePropertyUpdate) error {
+	w := wait.New[bool](serverPollInterval, serverOperationTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (bool, error) {
+		volume, err := r.blockStorageClient.GetVolume(ctx, update.id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if err != nil {
+			return false, err
+		}
+		if volume == nil {
+			return false, fmt.Errorf("volume %s returned an empty response", update.id)
+		}
+		if serverVolumeStatusFailed(volume.Status) {
+			return false, fmt.Errorf("volume %s entered terminal status %s", update.id, volume.Status)
+		}
+		typeMatches := update.volumeTypeID == core.NilUUID || volume.CreateFrom.VolumeType != nil && volume.CreateFrom.VolumeType.Id == update.volumeTypeID
+		iopsMatch := update.iops == nil || volume.Iops != nil && *volume.Iops == *update.iops
+		if serverVolumeStatusReady(volume.Status) && typeMatches && iopsMatch {
+			return true, nil
+		}
+		return false, fmt.Errorf("volume %s still reports previous properties: %w", update.id, wait.ErrNotReady)
+	})
+	return err
+}
+
+func (r *ServerResource) waitUntilDataVolumeDeleted(ctx context.Context, id core.UUID) error {
+	// The volume can still report its previous status for a poll or two after
+	// the backend accepts the delete. A ready status therefore means a failed
+	// deletion only after the waiter observes deleting.
+	sawDeleting := false
+	w := wait.New[bool](serverPollInterval, serverOperationTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (bool, error) {
+		volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
+		if errors.Is(err, blockstoragesdk.ErrNotFound) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if volume == nil {
+			return false, fmt.Errorf("volume %s returned an empty response", id)
+		}
+		if volume.Status == blockstoragesdk.VolumeStatusDeleting {
+			sawDeleting = true
+		}
+		if serverVolumeStatusFailed(volume.Status) || sawDeleting && serverVolumeStatusReady(volume.Status) {
+			return false, fmt.Errorf("volume %s stopped deleting and settled in status %s", id, volume.Status)
+		}
+		return false, fmt.Errorf("volume %s status=%s: %w", id, volume.Status, wait.ErrNotReady)
+	})
+	return err
+}
+
 func (r *ServerResource) buildCreateBody(ctx context.Context, plan ServerResourceModel) (serversdk.ServerCreateSchema, diag.Diagnostics) {
 	zoneFinder := projectlookup.NewZoneFinder(r.projectClient, r.projectID)
 	flavorFinder := serverlookup.NewFlavorFinder(r.client, r.projectID)
@@ -965,12 +1792,44 @@ func (r *ServerResource) deleteTerminatedAttachments(ctx context.Context, state 
 	if diags.HasError() {
 		return
 	}
-	diags.Append(r.deletePrivateIPs(ctx, privateIPIDs)...)
+	for _, id := range privateIPIDs {
+		if err := r.deletePrivateIPWithRetry(ctx, id); err != nil && !errors.Is(err, networksdk.ErrNotFound) {
+			diags.AddError("Error deleting server private IP", fmt.Sprintf("Unable to delete private IP %s: %s", id, err))
+			continue
+		}
+		if err := r.waitUntilPrivateIPDeleted(ctx, id); err != nil {
+			diags.AddError("Error waiting for server private IP deletion", fmt.Sprintf("Unable to confirm private IP %s was deleted: %s", id, err))
+		}
+	}
 	for _, id := range elasticIPIDs {
-		if err := r.networkClient.DeleteElasticIp(ctx, id, networksdk.DeleteElasticIpParams{ProjectID: r.projectID}); err != nil && !errors.Is(err, networksdk.ErrNotFound) {
+		if err := r.deleteElasticIPWithRetry(ctx, id); err != nil && !errors.Is(err, networksdk.ErrNotFound) {
 			diags.AddError("Error deleting server elastic IP", fmt.Sprintf("Unable to delete elastic IP %s: %s", id, err))
 		}
 	}
+}
+
+func (r *ServerResource) deleteElasticIPWithRetry(ctx context.Context, id core.UUID) error {
+	w := wait.New[struct{}](privateIPDeleteInterval, privateIPDeleteTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (struct{}, error) {
+		err := r.networkClient.DeleteElasticIp(ctx, id, networksdk.DeleteElasticIpParams{ProjectID: r.projectID})
+		switch {
+		case err == nil || errors.Is(err, networksdk.ErrNotFound):
+			return struct{}{}, nil
+		case isElasticIPAttachedError(err):
+			return struct{}{}, fmt.Errorf("elastic IP %s is not ready to delete: %s: %w", id, err, wait.ErrNotReady)
+		default:
+			return struct{}{}, err
+		}
+	})
+	return err
+}
+
+func isElasticIPAttachedError(err error) bool {
+	if errors.Is(err, networksdk.ErrConflict) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "attached") || strings.Contains(s, "associated") || strings.Contains(s, "in use") || strings.Contains(s, "in-use")
 }
 
 // deleteTerminatedVolumes deletes the volumes a destroyed server left behind,
@@ -982,11 +1841,38 @@ func (r *ServerResource) deleteTerminatedVolumes(ctx context.Context, ids []core
 			diags.AddError("Error waiting for server volume to detach", err.Error())
 			continue
 		}
-		err := r.blockStorageClient.DeleteVolume(ctx, id, blockstoragesdk.DeleteVolumeParams{ProjectID: r.projectID})
-		if err != nil && !errors.Is(err, blockstoragesdk.ErrNotFound) {
+		if err := r.deleteVolumeWithRetry(ctx, id); err != nil && !errors.Is(err, blockstoragesdk.ErrNotFound) {
 			diags.AddError("Error deleting server volume", fmt.Sprintf("Unable to delete volume %s: %s", id, err))
 		}
 	}
+}
+
+func (r *ServerResource) deleteVolumeWithRetry(ctx context.Context, id core.UUID) error {
+	w := wait.New[struct{}](volumeDetachInterval, volumeDetachTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (struct{}, error) {
+		err := r.blockStorageClient.DeleteVolume(ctx, id, blockstoragesdk.DeleteVolumeParams{ProjectID: r.projectID})
+		switch {
+		case err == nil || errors.Is(err, blockstoragesdk.ErrNotFound):
+			return struct{}{}, nil
+		case isVolumeConflictError(err):
+			return struct{}{}, fmt.Errorf("volume %s is not ready to delete: %s: %w", id, err, wait.ErrNotReady)
+		default:
+			return struct{}{}, err
+		}
+	})
+	return err
+}
+
+func isVolumeConflictError(err error) bool {
+	if errors.Is(err, blockstoragesdk.ErrConflict) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "dependent objects") ||
+		strings.Contains(s, "conflict") ||
+		strings.Contains(s, "in-use") ||
+		strings.Contains(s, "in use") ||
+		strings.Contains(s, "attached")
 }
 
 // waitUntilVolumeDetached waits for a volume to become deletable: until the
@@ -1118,10 +2004,6 @@ func (r *ServerResource) refreshServerResourceState(
 	if diags.HasError() {
 		return diags
 	}
-	diags.Append(r.initializeImportedDataVolumeState(ctx, server, state)...)
-	if diags.HasError() {
-		return diags
-	}
 	diags.Append(populateServerResourceState(ctx, server, state)...)
 	if diags.HasError() || server == nil {
 		return diags
@@ -1131,130 +2013,6 @@ func (r *ServerResource) refreshServerResourceState(
 		return diags
 	}
 	diags.Append(r.refreshServerDataVolumeState(ctx, server, state)...)
-	return diags
-}
-
-// refreshServerDataVolumeState reads each managed data volume by its stable ID
-// and resolves the default for an unconfigured delete_on_termination. The
-// server API can return attachments in a different order between reads, so
-// positional configuration must follow data_volume_ids instead.
-func (r *ServerResource) refreshServerDataVolumeState(
-	ctx context.Context,
-	server *serversdk.ServerDetailSchema,
-	state *ServerResourceModel,
-) diag.Diagnostics {
-	var diags diag.Diagnostics
-	if state.DataVolumes.IsNull() || state.DataVolumes.IsUnknown() {
-		return diags
-	}
-	var volumes []DataVolumeInputModel
-	diags.Append(state.DataVolumes.ElementsAs(ctx, &volumes, false)...)
-	if diags.HasError() {
-		return diags
-	}
-	// An element whose ID is still unknown was just created, so it takes the
-	// attachment reported at its own position. Writing every reported value
-	// back below turns a position the server did not honor into an
-	// inconsistent-result error instead of a silently mismatched volume.
-	attached := dataVolumeIDs(server)
-	if len(attached) != len(volumes) {
-		diags.AddError(
-			"Unable to correlate server data volumes",
-			fmt.Sprintf("The server state contains %d configured data volumes and %d attached data volumes.", len(volumes), len(attached)),
-		)
-		return diags
-	}
-	for i := range volumes {
-		if volumes[i].ID.IsNull() || volumes[i].ID.IsUnknown() {
-			volumes[i].ID = types.StringValue(attached[i])
-		}
-		volumes[i].DeleteOnTermination = knownBoolOrDefault(volumes[i].DeleteOnTermination, true)
-		id, idDiags := parse.UUIDString(volumes[i].ID, fmt.Sprintf("data_volumes[%d].id", i))
-		diags.Append(idDiags...)
-		if idDiags.HasError() {
-			return diags
-		}
-		volume, err := r.blockStorageClient.GetVolume(
-			ctx,
-			id,
-			blockstoragesdk.GetVolumeParams{ProjectID: r.projectID},
-		)
-		if err != nil {
-			diags.AddError("Error reading server data volume", fmt.Sprintf("Unable to read data volume %s: %s", id, err))
-			return diags
-		}
-		if volume == nil {
-			diags.AddError("Error reading server data volume", fmt.Sprintf("The API returned an empty response for data volume %s.", id))
-			return diags
-		}
-		if volume.CreateFrom.VolumeType != nil {
-			volumes[i].VolumeType = preserveEquivalentString(volumes[i].VolumeType, volume.CreateFrom.VolumeType.Name)
-		}
-		volumes[i].VolumeSize = types.Int64Value(int64(volume.Size))
-		if volumes[i].IOPS.IsUnknown() {
-			volumes[i].IOPS = volumeIOPSValue(volume)
-		}
-	}
-	state.DataVolumes, diags = types.ListValueFrom(
-		ctx,
-		types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()},
-		volumes,
-	)
-	return diags
-}
-
-func (r *ServerResource) initializeImportedDataVolumeState(
-	ctx context.Context,
-	server *serversdk.ServerDetailSchema,
-	state *ServerResourceModel,
-) diag.Diagnostics {
-	var diags diag.Diagnostics
-	if server == nil || !state.Boot.IsNull() && !state.Boot.IsUnknown() ||
-		!state.DataVolumes.IsNull() && !state.DataVolumes.IsUnknown() {
-		return diags
-	}
-
-	volumes := make([]DataVolumeInputModel, 0)
-	for _, attachment := range server.Volumes {
-		if attachment.MountAs != "data" {
-			continue
-		}
-		volume, err := r.blockStorageClient.GetVolume(
-			ctx,
-			attachment.Volume.Id,
-			blockstoragesdk.GetVolumeParams{ProjectID: r.projectID},
-		)
-		if err != nil {
-			diags.AddError("Error reading imported server data volume", fmt.Sprintf("Unable to read data volume %s: %s", attachment.Volume.Id, err))
-			return diags
-		}
-		if volume == nil {
-			diags.AddError("Error reading imported server data volume", fmt.Sprintf("The API returned an empty response for data volume %s.", attachment.Volume.Id))
-			return diags
-		}
-		if volume.CreateFrom.VolumeType == nil || volume.CreateFrom.VolumeType.Name == "" {
-			diags.AddError(
-				"Unable to determine imported server data volume type",
-				fmt.Sprintf("Data volume %s does not identify its volume type, so Terraform cannot reconstruct data_volumes.", attachment.Volume.Id),
-			)
-			return diags
-		}
-		volumes = append(volumes, DataVolumeInputModel{
-			VolumeType:          types.StringValue(volume.CreateFrom.VolumeType.Name),
-			VolumeSize:          types.Int64Value(int64(volume.Size)),
-			IOPS:                volumeIOPSValue(volume),
-			DeleteOnTermination: types.BoolValue(true),
-		})
-	}
-	if len(volumes) == 0 {
-		state.DataVolumes = types.ListNull(types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()})
-		return diags
-	}
-	state.DataVolumes, diags = types.ListValueFrom(
-		ctx,
-		types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()},
-		volumes,
-	)
 	return diags
 }
 
@@ -1333,6 +2091,9 @@ func (r *ServerResource) refreshServerBootState(
 		current = BootInputModel{}
 	}
 	state.Boot = serverBootStateObject(server, rootVolume, rootVolumeID, bootType, current, &diags)
+	if diags.HasError() {
+		return diags
+	}
 	return diags
 }
 
@@ -1376,61 +2137,6 @@ func (r *ServerResource) buildBootVolumeResizePlan(
 		return nil, diags
 	}
 	return &bootVolumeUpdatePlan{resizeID: id, resizeSize: target}, diags
-}
-
-// buildDataVolumeUpdatePlan resolves every changed data_volumes size against
-// the volume that element already owns, taken from prior state because the
-// planned ID is unknown until the apply finishes. It returns nil when no size
-// changed.
-func (r *ServerResource) buildDataVolumeUpdatePlan(
-	ctx context.Context,
-	plan ServerResourceModel,
-	state ServerResourceModel,
-) (*dataVolumeUpdatePlan, diag.Diagnostics) {
-	var diags diag.Diagnostics
-	plannedData, plannedDataOK := decodeConfigList[DataVolumeInputModel](ctx, plan.DataVolumes, &diags)
-	priorData, priorDataOK := decodeConfigList[DataVolumeInputModel](ctx, state.DataVolumes, &diags)
-	if diags.HasError() {
-		return nil, diags
-	}
-	if plannedDataOK != priorDataOK || len(plannedData) != len(priorData) {
-		diags.AddError("Unable to resize data volumes", "The planned and prior data volume counts do not match.")
-		return nil, diags
-	}
-	if !plannedDataOK {
-		return nil, diags
-	}
-
-	result := dataVolumeUpdatePlan{
-		resizeIDs:   make([]core.UUID, 0, len(plannedData)),
-		resizeSizes: make([]int, 0, len(plannedData)),
-	}
-	for i := range plannedData {
-		if plannedData[i].VolumeSize.Equal(priorData[i].VolumeSize) {
-			continue
-		}
-		label := fmt.Sprintf("data_volumes[%d].volume_size", i)
-		target, ok := increasedVolumeSize(plannedData[i].VolumeSize, priorData[i].VolumeSize, label, &diags)
-		if !ok {
-			continue
-		}
-		id, idDiags := parse.UUIDString(priorData[i].ID, fmt.Sprintf("data_volumes[%d].id", i))
-		diags.Append(idDiags...)
-		if idDiags.HasError() {
-			continue
-		}
-		if r.resolveVolumeResize(ctx, id, dataVolumeLabel(id), target, &diags) {
-			result.resizeIDs = append(result.resizeIDs, id)
-			result.resizeSizes = append(result.resizeSizes, target)
-		}
-	}
-	if diags.HasError() {
-		return nil, diags
-	}
-	if len(result.resizeIDs) == 0 {
-		return nil, diags
-	}
-	return &result, diags
 }
 
 // resolveVolumeResize checks target against the volume's current backend size,
@@ -1587,11 +2293,9 @@ func (r *ServerResource) applyServerUpdate(
 		}
 	}
 	if data := req.attachments.dataVolume; data != nil {
-		for i, id := range data.resizeIDs {
-			diags.Append(r.resizeVolume(ctx, id, data.resizeSizes[i], dataVolumeLabel(id))...)
-			if diags.HasError() {
-				return diags
-			}
+		diags.Append(r.applyDataVolumeUpdate(ctx, serverID, data)...)
+		if diags.HasError() {
+			return diags
 		}
 	}
 	if req.attachments.private != nil {
@@ -2132,6 +2836,34 @@ func (r *ServerResource) deletePrivateIPs(ctx context.Context, ids []core.UUID) 
 	return diags
 }
 
+func (r *ServerResource) deletePrivateIPWithRetry(ctx context.Context, id core.UUID) error {
+	w := wait.New[struct{}](privateIPDeleteInterval, privateIPDeleteTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (struct{}, error) {
+		err := r.networkClient.DeletePrivateIp(
+			ctx,
+			id,
+			networksdk.DeletePrivateIpParams{ProjectID: r.projectID},
+		)
+		switch {
+		case err == nil || errors.Is(err, networksdk.ErrNotFound):
+			return struct{}{}, nil
+		case isPrivateIPAttachedError(err):
+			return struct{}{}, fmt.Errorf("private IP %s is not ready to delete: %s: %w", id, err, wait.ErrNotReady)
+		default:
+			return struct{}{}, err
+		}
+	})
+	return err
+}
+
+func isPrivateIPAttachedError(err error) bool {
+	if errors.Is(err, networksdk.ErrConflict) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "attached") || strings.Contains(s, "in use") || strings.Contains(s, "in-use") || strings.Contains(s, "dependent")
+}
+
 func (r *ServerResource) waitUntilPrivateIPDeleted(ctx context.Context, id core.UUID) error {
 	w := wait.New[struct{}](privateIPDeleteInterval, privateIPDeleteTimeout)
 	_, err := w.WaitFor(ctx, func(ctx context.Context) (struct{}, error) {
@@ -2452,7 +3184,152 @@ func (r *ServerResource) waitUntilElasticIPs(
 	})
 }
 
+// --- Boot volume plan modifiers ---
+
+func (bootIOPSStatePlanModifier) Description(context.Context) string {
+	return "Preserves allocated boot IOPS while the boot volume size and type stay unchanged."
+}
+
+func (m bootIOPSStatePlanModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+// PlanModifyInt64 works like UseStateForUnknown, except that a resize or a
+// retype leaves unconfigured IOPS unknown, because the backend recalculates it.
+func (bootIOPSStatePlanModifier) PlanModifyInt64(ctx context.Context, req planmodifier.Int64Request, resp *planmodifier.Int64Response) {
+	if req.StateValue.IsNull() || !req.PlanValue.IsUnknown() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	parent := req.Path.ParentPath()
+	var plannedSize, priorSize types.Int64
+	var plannedType, priorType types.Object
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, parent.AtName("volume_size"), &plannedSize)...)
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, parent.AtName("volume_size"), &priorSize)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, parent.AtName("volume_type"), &plannedType)...)
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, parent.AtName("volume_type"), &priorType)...)
+	// The selector ID is computed and can be unknown on any update, so only
+	// the criteria decide whether the volume type changed.
+	if resp.Diagnostics.HasError() || !plannedSize.Equal(priorSize) || !selector.Equal(plannedType, priorType) {
+		return
+	}
+	resp.PlanValue = req.StateValue
+}
+
 // --- Attachment list plan modifiers ---
+
+func (dataVolumeStatePlanModifier) Description(context.Context) string {
+	return "Preserves computed values by data-volume identity."
+}
+
+func (m dataVolumeStatePlanModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (dataVolumeStatePlanModifier) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if preserveUnconfiguredAttachmentList(req, resp) || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() {
+		return
+	}
+	if req.StateValue.IsNull() || req.StateValue.IsUnknown() {
+		planCreatedDataVolumeTypes(ctx, req, resp)
+		return
+	}
+	var planned, configured, prior []DataVolumeInputModel
+	resp.Diagnostics.Append(req.PlanValue.ElementsAs(ctx, &planned, false)...)
+	resp.Diagnostics.Append(req.ConfigValue.ElementsAs(ctx, &configured, false)...)
+	resp.Diagnostics.Append(req.StateValue.ElementsAs(ctx, &prior, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	matches, _, matchDiags := matchDataVolumeConfigs(configured, prior)
+	resp.Diagnostics.Append(matchDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for i := range planned {
+		if i >= len(configured) {
+			continue
+		}
+		planned[i].Attached = types.BoolValue(true)
+		if matches[i] < 0 {
+			if dataVolumeKind(configured[i]) == "new" {
+				planned[i].ID = types.StringUnknown()
+				planned[i].VolumeType = selector.WithID(configured[i].VolumeType, types.StringUnknown())
+			}
+			if configured[i].IOPS.IsNull() {
+				planned[i].IOPS = types.Int64Unknown()
+			}
+			if configured[i].DeleteOnTermination.IsNull() {
+				planned[i].DeleteOnTermination = types.BoolUnknown()
+			}
+			if configured[i].VolumeType.IsNull() {
+				planned[i].VolumeType = types.ObjectUnknown(blockstorageselector.VolumeTypeAttributeTypes())
+			}
+			if configured[i].VolumeSize.IsNull() {
+				planned[i].VolumeSize = types.Int64Unknown()
+			}
+			continue
+		}
+		old := prior[matches[i]]
+		if configured[i].ID.IsNull() || configured[i].ID.IsUnknown() {
+			planned[i].ID = old.ID
+		} else {
+			planned[i].ID = configured[i].ID
+		}
+		if configured[i].VolumeType.IsNull() {
+			planned[i].VolumeType = old.VolumeType
+		} else if selector.Equal(configured[i].VolumeType, old.VolumeType) {
+			planned[i].VolumeType = selector.WithID(configured[i].VolumeType, old.VolumeType.Attributes()["id"].(types.String))
+		} else {
+			planned[i].VolumeType = selector.WithID(configured[i].VolumeType, types.StringUnknown())
+		}
+		if configured[i].VolumeSize.IsNull() {
+			planned[i].VolumeSize = old.VolumeSize
+		}
+		if configured[i].IOPS.IsNull() {
+			// Resize and retype can change backend-assigned IOPS.
+			if (selector.Equal(configured[i].VolumeType, old.VolumeType) && planned[i].VolumeSize.Equal(old.VolumeSize)) || dataVolumeKind(configured[i]) == "existing" {
+				planned[i].IOPS = old.IOPS
+			} else {
+				planned[i].IOPS = types.Int64Unknown()
+			}
+		}
+		if configured[i].DeleteOnTermination.IsNull() {
+			if dataVolumeKind(configured[i]) == dataVolumeKind(old) {
+				planned[i].DeleteOnTermination = old.DeleteOnTermination
+			} else {
+				planned[i].DeleteOnTermination = types.BoolValue(dataVolumeKind(configured[i]) == "new")
+			}
+		}
+	}
+	value, diags := types.ListValueFrom(ctx, req.PlanValue.ElementType(ctx), planned)
+	resp.Diagnostics.Append(diags...)
+	if !diags.HasError() {
+		resp.PlanValue = value
+	}
+}
+
+// planCreatedDataVolumeTypes plans each configured volume type selector as
+// configured. Its criteria are Computed only so that an omitted selector keeps
+// its prior value. Without this, the framework plans every unconfigured
+// criterion unknown on create, and apply cannot resolve the selector.
+func planCreatedDataVolumeTypes(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	var planned, configured []DataVolumeInputModel
+	resp.Diagnostics.Append(req.PlanValue.ElementsAs(ctx, &planned, false)...)
+	resp.Diagnostics.Append(req.ConfigValue.ElementsAs(ctx, &configured, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for i := range min(len(planned), len(configured)) {
+		if !configured[i].VolumeType.IsNull() {
+			planned[i].VolumeType = selector.WithID(configured[i].VolumeType, types.StringUnknown())
+		}
+	}
+	value, diags := types.ListValueFrom(ctx, req.PlanValue.ElementType(ctx), planned)
+	resp.Diagnostics.Append(diags...)
+	if !diags.HasError() {
+		resp.PlanValue = value
+	}
+}
 
 func (privateIPStatePlanModifier) Description(context.Context) string {
 	return "Preserves computed private IP values only while the attachment configuration is unchanged."
@@ -2463,21 +3340,26 @@ func (privateIPStatePlanModifier) MarkdownDescription(context.Context) string {
 }
 
 func (privateIPStatePlanModifier) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
-	if preserveUnconfiguredAttachmentList(req, resp) || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() ||
-		req.StateValue.IsNull() || req.StateValue.IsUnknown() {
+	if preserveUnconfiguredAttachmentList(req, resp) || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() || req.ConfigValue.IsNull() {
 		return
 	}
 
 	var planned []PrivateIPInputModel
 	var configured []PrivateIPInputModel
-	var prior []PrivateIPInputModel
 	resp.Diagnostics.Append(req.PlanValue.ElementsAs(ctx, &planned, false)...)
 	resp.Diagnostics.Append(req.ConfigValue.ElementsAs(ctx, &configured, false)...)
-	resp.Diagnostics.Append(req.StateValue.ElementsAs(ctx, &prior, false)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	preservePrivateIPComputedValues(planned, configured, prior)
+	planPrivateIPInputs(planned, configured)
+	if !req.StateValue.IsNull() && !req.StateValue.IsUnknown() {
+		var prior []PrivateIPInputModel
+		resp.Diagnostics.Append(req.StateValue.ElementsAs(ctx, &prior, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		preservePrivateIPComputedValues(planned, configured, prior)
+	}
 	value, diags := types.ListValueFrom(ctx, req.PlanValue.ElementType(ctx), planned)
 	resp.Diagnostics.Append(diags...)
 	if !diags.HasError() {
@@ -2494,21 +3376,26 @@ func (elasticIPStatePlanModifier) MarkdownDescription(context.Context) string {
 }
 
 func (elasticIPStatePlanModifier) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
-	if preserveUnconfiguredAttachmentList(req, resp) || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() ||
-		req.StateValue.IsNull() || req.StateValue.IsUnknown() {
+	if preserveUnconfiguredAttachmentList(req, resp) || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() || req.ConfigValue.IsNull() {
 		return
 	}
 
 	var planned []ElasticIPInputModel
 	var configured []ElasticIPInputModel
-	var prior []ElasticIPInputModel
 	resp.Diagnostics.Append(req.PlanValue.ElementsAs(ctx, &planned, false)...)
 	resp.Diagnostics.Append(req.ConfigValue.ElementsAs(ctx, &configured, false)...)
-	resp.Diagnostics.Append(req.StateValue.ElementsAs(ctx, &prior, false)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	preserveElasticIPComputedValues(planned, configured, prior)
+	planElasticIPInputs(planned, configured)
+	if !req.StateValue.IsNull() && !req.StateValue.IsUnknown() {
+		var prior []ElasticIPInputModel
+		resp.Diagnostics.Append(req.StateValue.ElementsAs(ctx, &prior, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		preserveElasticIPComputedValues(planned, configured, prior)
+	}
 	value, diags := types.ListValueFrom(ctx, req.PlanValue.ElementType(ctx), planned)
 	resp.Diagnostics.Append(diags...)
 	if !diags.HasError() {
@@ -2575,26 +3462,6 @@ func buildServerUpdateBody(plan, state ServerResourceModel) (serversdk.ServerPar
 func bandwidthChanged(plan, state ServerResourceModel) bool {
 	return !plan.Bandwidth.IsNull() && !plan.Bandwidth.IsUnknown() &&
 		(state.Bandwidth.IsNull() || state.Bandwidth.IsUnknown() || !plan.Bandwidth.Equal(state.Bandwidth))
-}
-
-// dataVolumeCountChanged reports whether the plan attaches a different number
-// of data volumes than the server was created with. The Framework only calls
-// it once the plan and state lists already differ. A difference confined to
-// one element — a changed volume_type or volume_size, or the computed iops
-// going unknown — is left to the modifiers on those attributes.
-func dataVolumeCountChanged(
-	_ context.Context,
-	req planmodifier.ListRequest,
-	resp *listplanmodifier.RequiresReplaceIfFuncResponse,
-) {
-	if req.PlanValue.IsUnknown() {
-		return
-	}
-	if req.StateValue.IsNull() || req.PlanValue.IsNull() {
-		resp.RequiresReplace = !req.StateValue.Equal(req.PlanValue)
-		return
-	}
-	resp.RequiresReplace = len(req.StateValue.Elements()) != len(req.PlanValue.Elements())
 }
 
 // bootVolumeLabel and dataVolumeLabel name a volume in resize diagnostics.
@@ -2710,7 +3577,7 @@ func serverVolumeCascadeTargets(
 			attached[id] = struct{}{}
 		}
 		for i, volume := range volumes {
-			if !boolValueOrDefault(volume.DeleteOnTermination, true) {
+			if !boolValueOrDefault(volume.DeleteOnTermination, dataVolumeKind(volume) == "new") {
 				continue
 			}
 			if volume.ID.IsNull() || volume.ID.IsUnknown() || strings.TrimSpace(volume.ID.ValueString()) == "" {
@@ -2721,7 +3588,7 @@ func serverVolumeCascadeTargets(
 			if idDiags.HasError() {
 				continue
 			}
-			if _, ok := attached[id.String()]; ok {
+			if _, ok := attached[id.String()]; ok || dataVolumeKind(volume) == "new" {
 				ids = append(ids, id)
 			}
 		}
@@ -2790,22 +3657,14 @@ func buildServerRebuildBody(
 	}
 	switch strings.TrimSpace(boot.BootType.ValueString()) {
 	case "image", "local_disk":
-		image, imageDiags := resolveConfiguredName(
-			ctx,
-			boot.Image,
-			"boot.image",
-			"image",
-			func(ctx context.Context, name string) (serversdk.ImageSchema, error) {
-				return resolveImage(ctx, serverlookup.ImageFilter{Name: &name})
-			},
-		)
+		image, imageDiags := serverselector.ResolveImage(ctx, boot.Image, "boot.image", resolveImage)
 		diags.Append(imageDiags...)
 		if !imageDiags.HasError() {
 			body.ImageId = &image.Id
 			return body, image.Id, diags
 		}
 	case "custom_image":
-		imageID, imageDiags := parse.UUIDString(boot.CustomImageID, "boot.custom_image_id")
+		imageID, imageDiags := parse.UUIDString(reference.Get(boot.CustomImage, reference.ID), "boot.custom_image.id")
 		diags.Append(imageDiags...)
 		if !imageDiags.HasError() {
 			body.CustomImageId = &imageID
@@ -2817,21 +3676,13 @@ func buildServerRebuildBody(
 	return body, core.UUID{}, diags
 }
 
-func buildSecurityGroupUpdateBody(ctx context.Context, value types.Set) (serversdk.ServerUpdateSecurityGroupSchema, diag.Diagnostics) {
+func buildSecurityGroupUpdateBody(value types.Set) (serversdk.ServerUpdateSecurityGroupSchema, diag.Diagnostics) {
 	body := serversdk.ServerUpdateSecurityGroupSchema{SecurityGroups: make([]serversdk.ServerSecurityGroup, 0, len(value.Elements()))}
 	var diags diag.Diagnostics
 	if value.IsNull() || value.IsUnknown() {
 		return body, diags
 	}
-	var configuredIDs []types.String
-	diags.Append(value.ElementsAs(ctx, &configuredIDs, false)...)
-	for i, configuredID := range configuredIDs {
-		id, idDiags := parse.UUIDString(configuredID, fmt.Sprintf("security_group_ids[%d]", i))
-		diags.Append(idDiags...)
-		if !idDiags.HasError() {
-			body.SecurityGroups = append(body.SecurityGroups, serversdk.ServerSecurityGroup{Id: id})
-		}
-	}
+	body.SecurityGroups = append(body.SecurityGroups, securityGroupReferences(value, &diags)...)
 	return body, diags
 }
 
@@ -2880,17 +3731,17 @@ func bootSourceChanged(ctx context.Context, plan, state ServerResourceModel) (bo
 	}
 	switch strings.TrimSpace(plannedBoot.BootType.ValueString()) {
 	case "image", "local_disk":
-		return normalizedString(plannedBoot.Image) != normalizedString(priorBoot.Image), diags
+		return selector.Pending(plannedBoot.Image), diags
 	case "custom_image":
-		return normalizedString(plannedBoot.CustomImageID) != normalizedString(priorBoot.CustomImageID), diags
+		return referenceCriterion(plannedBoot.CustomImage, reference.ID) != referenceCriterion(priorBoot.CustomImage, reference.ID), diags
 	default:
 		return false, diags
 	}
 }
 
 func securityGroupsChanged(plan, state ServerResourceModel) bool {
-	return !plan.SecurityGroupIDs.IsNull() && !plan.SecurityGroupIDs.IsUnknown() &&
-		!plan.SecurityGroupIDs.Equal(state.SecurityGroupIDs)
+	return !plan.SecurityGroups.IsNull() && !plan.SecurityGroups.IsUnknown() &&
+		!plan.SecurityGroups.Equal(state.SecurityGroups)
 }
 
 func validateDesiredPowerState(value types.String) diag.Diagnostics {
@@ -2954,26 +3805,39 @@ func resolvePrivateIPSubnet(
 	index int,
 	resolve func(context.Context, networklookup.SubnetFilter) (networksdk.SubnetSchema, error),
 ) (core.UUID, diag.Diagnostics) {
+	return privateIPSubnetID(ctx, config, index, func(ctx context.Context, cidr string) (networksdk.SubnetSchema, error) {
+		return resolve(ctx, networklookup.SubnetFilter{CIDR: &cidr})
+	})
+}
+
+// privateIPSubnetID returns the subnet that a kind subnet private IP selects,
+// by its configured ID or by resolving its configured CIDR.
+func privateIPSubnetID(
+	ctx context.Context,
+	config PrivateIPInputModel,
+	index int,
+	resolveSubnet subnetResolveFunc,
+) (core.UUID, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	hasID := normalizedString(config.SubnetID) != ""
-	hasCIDR := normalizedString(config.SubnetCIDR) != ""
+	subnetID := reference.Get(config.Subnet, reference.ID)
+	cidr := reference.Get(config.Subnet, subnetCIDR)
+	hasID := normalizedString(subnetID) != ""
+	hasCIDR := normalizedString(cidr) != ""
 	if hasID == hasCIDR {
-		diags.AddError("Invalid subnet reference", fmt.Sprintf("private_ips[%d] must configure exactly one of subnet_id or subnet_cidr.", index))
+		diags.AddError("Invalid subnet reference", fmt.Sprintf("private_ips[%d].subnet must configure exactly one of id or cidr.", index))
 		return core.UUID{}, diags
 	}
 	if hasID {
-		id, idDiags := parse.UUIDString(config.SubnetID, fmt.Sprintf("private_ips[%d].subnet_id", index))
+		id, idDiags := parse.UUIDString(subnetID, fmt.Sprintf("private_ips[%d].subnet.id", index))
 		diags.Append(idDiags...)
 		return id, diags
 	}
 	subnet, subnetDiags := resolveConfiguredName(
 		ctx,
-		config.SubnetCIDR,
-		fmt.Sprintf("private_ips[%d].subnet_cidr", index),
+		cidr,
+		fmt.Sprintf("private_ips[%d].subnet.cidr", index),
 		"subnet",
-		func(ctx context.Context, cidr string) (networksdk.SubnetSchema, error) {
-			return resolve(ctx, networklookup.SubnetFilter{CIDR: &cidr})
-		},
+		resolveSubnet,
 	)
 	diags.Append(subnetDiags...)
 	return subnet.Id, diags
@@ -3046,6 +3910,12 @@ func normalizedString(value types.String) string {
 		return ""
 	}
 	return strings.TrimSpace(value.ValueString())
+}
+
+// referenceCriterion returns one criterion of a reference, trimmed, or an empty
+// string when the reference or the criterion is null or unknown.
+func referenceCriterion(value types.Object, criterion string) string {
+	return normalizedString(reference.Get(value, criterion))
 }
 
 func boolValueOrDefault(value types.Bool, fallback bool) bool {
@@ -3128,6 +3998,30 @@ func preserveUnconfiguredAttachmentList(req planmodifier.ListRequest, resp *plan
 	return true
 }
 
+// planPrivateIPInputs plans every input as configured. The inputs are Computed
+// only so that an omitted list keeps its prior value, so a configured element
+// must not inherit an input from the prior element at the same index.
+func planPrivateIPInputs(planned, configured []PrivateIPInputModel) {
+	for i := range planned {
+		if i < len(configured) {
+			planned[i].Kind = configured[i].Kind
+			planned[i].Subnet = configured[i].Subnet
+		}
+	}
+}
+
+// planElasticIPInputs plans every input as configured, for the reason given on
+// planPrivateIPInputs.
+func planElasticIPInputs(planned, configured []ElasticIPInputModel) {
+	for i := range planned {
+		if i < len(configured) {
+			planned[i].Kind = configured[i].Kind
+			planned[i].EnableIPv4 = configured[i].EnableIPv4
+			planned[i].EnableIPv6 = configured[i].EnableIPv6
+		}
+	}
+}
+
 func preservePrivateIPComputedValues(planned, configured, prior []PrivateIPInputModel) {
 	used := make([]bool, len(prior))
 	for i := range planned {
@@ -3139,6 +4033,9 @@ func preservePrivateIPComputedValues(planned, configured, prior []PrivateIPInput
 			planned[i].ID = prior[j].ID
 			planned[i].IPAddress = prior[j].IPAddress
 			planned[i].MACAddress = prior[j].MACAddress
+			if configured[i].DeleteOnTermination.IsNull() {
+				planned[i].DeleteOnTermination = prior[j].DeleteOnTermination
+			}
 			used[j] = true
 			matched = true
 			break
@@ -3170,6 +4067,9 @@ func preserveElasticIPComputedValues(planned, configured, prior []ElasticIPInput
 			planned[i].IPAddress = prior[j].IPAddress
 			planned[i].IPv6Address = prior[j].IPv6Address
 			planned[i].Status = prior[j].Status
+			if configured[i].DeleteOnTermination.IsNull() {
+				planned[i].DeleteOnTermination = prior[j].DeleteOnTermination
+			}
 			used[j] = true
 			matched = true
 			matchedCount++
@@ -3200,8 +4100,8 @@ func privateIPPlanIdentityEqual(left, right PrivateIPInputModel) bool {
 		return false
 	}
 	if normalizedString(left.Kind) == "subnet" {
-		return normalizedString(left.SubnetID) == normalizedString(right.SubnetID) &&
-			normalizedString(left.SubnetCIDR) == normalizedString(right.SubnetCIDR)
+		return referenceCriterion(left.Subnet, reference.ID) == referenceCriterion(right.Subnet, reference.ID) &&
+			referenceCriterion(left.Subnet, subnetCIDR) == referenceCriterion(right.Subnet, subnetCIDR)
 	}
 	return normalizedString(left.ID) != "" && normalizedString(left.ID) == normalizedString(right.ID)
 }
@@ -3221,6 +4121,199 @@ func elasticIPPlanIdentityEqual(left, right ElasticIPInputModel) bool {
 }
 
 // --- Create request construction ---
+
+// recordServerSelectorIDs carries resolved create identities into pending state.
+func recordServerSelectorIDs(ctx context.Context, body serversdk.ServerCreateSchema, plan *ServerResourceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+	var boot BootInputModel
+	diags.Append(plan.Boot.As(ctx, &boot, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return diags
+	}
+	value, err := body.Boot.ValueByDiscriminator()
+	if err != nil {
+		diags.AddError("Unable to read resolved server boot", err.Error())
+		return diags
+	}
+	var imageID, volumeTypeID *core.UUID
+	switch value := value.(type) {
+	case serversdk.ServerBootFromImage:
+		imageID, volumeTypeID = &value.ImageId, &value.VolumeTypeId
+	case serversdk.ServerBootFromLocalDisk:
+		imageID = &value.ImageId
+	case serversdk.ServerBootFromCustomImage:
+		volumeTypeID = &value.VolumeTypeId
+	}
+	if imageID != nil {
+		boot.Image = selector.WithID(boot.Image, types.StringValue(imageID.String()))
+	}
+	if volumeTypeID != nil {
+		boot.VolumeType = selector.WithID(boot.VolumeType, types.StringValue(volumeTypeID.String()))
+	}
+	var valueDiags diag.Diagnostics
+	plan.Boot, valueDiags = types.ObjectValueFrom(ctx, bootResourceAttributeTypes(), boot)
+	diags.Append(valueDiags...)
+	if body.DataVolumes != nil {
+		var volumes []DataVolumeInputModel
+		diags.Append(plan.DataVolumes.ElementsAs(ctx, &volumes, false)...)
+		if diags.HasError() {
+			return diags
+		}
+		created := 0
+		for i := range volumes {
+			if dataVolumeKind(volumes[i]) != "new" {
+				continue
+			}
+			if created >= len(*body.DataVolumes) {
+				diags.AddError("Unable to read resolved data volumes", "The resolved volume count differs from the plan.")
+				return diags
+			}
+			volumes[i].VolumeType = selector.WithID(volumes[i].VolumeType, types.StringValue((*body.DataVolumes)[created].VolumeTypeId.String()))
+			created++
+		}
+		plan.DataVolumes, valueDiags = types.ListValueFrom(ctx, types.ObjectType{AttrTypes: dataVolumeResourceAttributeTypes()}, volumes)
+		diags.Append(valueDiags...)
+	}
+	return diags
+}
+
+func dataVolumeKind(config DataVolumeInputModel) string {
+	if config.Kind.IsNull() {
+		return "new"
+	}
+	return normalizedString(config.Kind)
+}
+
+// matchDataVolumeConfigs requires a unique identity before any volume mutation.
+// An unchanged list keeps its IDs, including otherwise identical new volumes.
+func matchDataVolumeConfigs(planned, prior []DataVolumeInputModel) ([]int, []bool, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	matches := make([]int, len(planned))
+	used := make([]bool, len(prior))
+	for i := range matches {
+		matches[i] = -1
+	}
+	bind := func(i, j int) {
+		matches[i] = j
+		used[j] = true
+		if planned[i].ID.IsNull() || planned[i].ID.IsUnknown() {
+			planned[i].ID = prior[j].ID
+		}
+	}
+	// Explicit IDs reserve their volumes before content matching can use them.
+	for i, config := range planned {
+		if config.ID.IsNull() || config.ID.IsUnknown() {
+			continue
+		}
+		id, err := core.ParseUUID(config.ID.ValueString())
+		if err != nil {
+			diags.AddAttributeError(path.Root("data_volumes").AtListIndex(i).AtName("id"), "Invalid data volume ID", err.Error())
+			continue
+		}
+		for j := range prior {
+			oldID, oldErr := core.ParseUUID(prior[j].ID.ValueString())
+			if oldErr == nil && id == oldID {
+				if used[j] {
+					diags.AddError("Duplicate data volume ID", fmt.Sprintf("data_volumes[%d] refers to a volume that another entry already uses.", i))
+				} else {
+					bind(i, j)
+				}
+				break
+			}
+		}
+		if matches[i] < 0 && dataVolumeKind(config) == "new" {
+			diags.AddAttributeError(path.Root("data_volumes").AtListIndex(i).AtName("id"), "Unknown server-owned data volume", "For kind new, id must identify a prior data volume of this server. To attach another volume, use kind existing.")
+		}
+	}
+	if diags.HasError() {
+		return nil, nil, diags
+	}
+	unchanged := len(planned) == len(prior)
+	for i := range planned {
+		if !unchanged {
+			break
+		}
+		if matches[i] >= 0 {
+			unchanged = matches[i] == i
+		} else {
+			unchanged = dataVolumeKind(planned[i]) == "new" && dataVolumeKind(prior[i]) == "new" && dataVolumeContentEqual(planned[i], prior[i], true)
+		}
+	}
+	if unchanged {
+		for i := range planned {
+			bind(i, i)
+		}
+		return matches, used, diags
+	}
+	// Exact matches reserve unchanged volumes before size or property updates.
+	for pass := range 3 {
+		for i := range planned {
+			if matches[i] >= 0 || dataVolumeKind(planned[i]) != "new" {
+				continue
+			}
+			var candidates []int
+			for j := range prior {
+				if used[j] || dataVolumeKind(prior[j]) != "new" {
+					continue
+				}
+				if pass == 2 || dataVolumeContentEqual(planned[i], prior[j], pass == 0) {
+					candidates = append(candidates, j)
+				}
+			}
+			if len(candidates) > 1 {
+				diags.AddAttributeError(path.Root("data_volumes").AtListIndex(i), "Ambiguous data volume identity", fmt.Sprintf("data_volumes[%d] matches %d prior volumes. Set id to the intended volume ID from state before changing or removing attachments.", i, len(candidates)))
+				return nil, nil, diags
+			}
+			if len(candidates) == 1 {
+				bind(i, candidates[0])
+			}
+		}
+	}
+	return matches, used, diags
+}
+
+func dataVolumeContentEqual(config, prior DataVolumeInputModel, exactSize bool) bool {
+	return !config.VolumeType.IsNull() && !config.VolumeType.IsUnknown() &&
+		selector.Equal(config.VolumeType, prior.VolumeType) &&
+		(config.IOPS.IsNull() || config.IOPS.IsUnknown() || config.IOPS.Equal(prior.IOPS)) &&
+		(!exactSize || config.VolumeSize.Equal(prior.VolumeSize))
+}
+
+func validateServerDataVolumes(ctx context.Context, value types.List, diags *diag.Diagnostics) {
+	configs, ok := decodeConfigList[DataVolumeInputModel](ctx, value, diags)
+	if !ok {
+		return
+	}
+	seen := make(map[string]int)
+	for i, config := range configs {
+		element := path.Root("data_volumes").AtListIndex(i)
+		switch dataVolumeKind(config) {
+		case "new":
+			validateServerUUID(config.ID, element.AtName("id"), fmt.Sprintf("data_volumes[%d].id", i), diags)
+			requireConfiguredSelector(config.VolumeType, element.AtName("volume_type"), fmt.Sprintf("data_volumes[%d].volume_type", i), "kind is new", diags)
+			requireConfiguredInt64(config.VolumeSize, element.AtName("volume_size"), fmt.Sprintf("data_volumes[%d].volume_size", i), "kind is new", diags)
+			requirePositiveInt64(config.VolumeSize, element.AtName("volume_size"), fmt.Sprintf("data_volumes[%d].volume_size", i), diags)
+			requirePositiveInt64(config.IOPS, element.AtName("iops"), fmt.Sprintf("data_volumes[%d].iops", i), diags)
+		case "existing":
+			requireConfigured(config.ID, element.AtName("id"), fmt.Sprintf("data_volumes[%d].id", i), "kind is existing", diags)
+			validateServerUUID(config.ID, element.AtName("id"), fmt.Sprintf("data_volumes[%d].id", i), diags)
+			rejectConfigured(config.VolumeType, element.AtName("volume_type"), fmt.Sprintf("data_volumes[%d].volume_type", i), "kind is existing", diags)
+			rejectConfiguredInt64(config.VolumeSize, element.AtName("volume_size"), fmt.Sprintf("data_volumes[%d].volume_size", i), "kind is existing", diags)
+			rejectConfiguredInt64(config.IOPS, element.AtName("iops"), fmt.Sprintf("data_volumes[%d].iops", i), "kind is existing", diags)
+		case "":
+			if !config.Kind.IsUnknown() {
+				diags.AddAttributeError(element.AtName("kind"), "Invalid data volume kind", "kind must be new or existing.")
+			}
+		default:
+			diags.AddAttributeError(element.AtName("kind"), "Invalid data volume kind", "kind must be new or existing.")
+		}
+		duplicateID := config.ID
+		if id, err := core.ParseUUID(config.ID.ValueString()); err == nil {
+			duplicateID = types.StringValue(id.String())
+		}
+		rejectDuplicateID(duplicateID, element.AtName("id"), "data_volumes", i, seen, diags)
+	}
+}
 
 func buildServerCreateBody(
 	ctx context.Context,
@@ -3259,22 +4352,22 @@ func buildServerCreateBody(
 	}
 	body.Quantity = &quantity
 
-	if !plan.Zone.IsNull() && !plan.Zone.IsUnknown() {
-		zone, zoneDiags := resolveConfiguredName(ctx, plan.Zone, "zone", "zone", resolveZone)
+	if zoneName := reference.Get(plan.Zone, reference.Name); !zoneName.IsNull() && !zoneName.IsUnknown() {
+		zone, zoneDiags := resolveConfiguredName(ctx, zoneName, "zone.name", "zone", resolveZone)
 		diags.Append(zoneDiags...)
 		if !zoneDiags.HasError() {
 			body.ZoneId = &zone.Id
 		}
 	}
-	if !plan.KeyPairID.IsNull() && !plan.KeyPairID.IsUnknown() {
-		keyPairID, idDiags := parse.UUIDString(plan.KeyPairID, "key_pair_id")
+	if keyPair := reference.Get(plan.KeyPair, reference.ID); !keyPair.IsNull() && !keyPair.IsUnknown() {
+		keyPairID, idDiags := parse.UUIDString(keyPair, "key_pair.id")
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
 			body.KeyPairId = &keyPairID
 		}
 	}
-	if !plan.PlacementGroupID.IsNull() && !plan.PlacementGroupID.IsUnknown() {
-		placementGroupID, idDiags := parse.UUIDString(plan.PlacementGroupID, "placement_group_id")
+	if placementGroup := reference.Get(plan.PlacementGroup, reference.ID); !placementGroup.IsNull() && !placementGroup.IsUnknown() {
+		placementGroupID, idDiags := parse.UUIDString(placementGroup, "placement_group.id")
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
 			body.PlacementGroupId = &placementGroupID
@@ -3298,7 +4391,7 @@ func buildServerCreateBody(
 	buildPrivateIPs(ctx, plan.PrivateIPs, &body, resolveSubnet, &diags)
 	buildDataVolumes(ctx, plan.DataVolumes, &body, body.ZoneId, resolveVolumeType, &diags)
 	buildElasticIPs(ctx, plan.ElasticIPs, &body, &diags)
-	buildSecurityGroups(ctx, plan.SecurityGroupIDs, &body, &diags)
+	buildSecurityGroups(plan.SecurityGroups, &body, &diags)
 	return body, diags
 }
 
@@ -3380,15 +4473,7 @@ func buildBoot(
 		if !ok {
 			return result, diags
 		}
-		image, imageDiags := resolveConfiguredName(
-			ctx,
-			boot.Image,
-			"boot.image",
-			"image",
-			func(ctx context.Context, name string) (serversdk.ImageSchema, error) {
-				return resolveImage(ctx, serverlookup.ImageFilter{Name: &name})
-			},
-		)
+		image, imageDiags := serverselector.ResolveImage(ctx, boot.Image, "boot.image", resolveImage)
 		diags.Append(imageDiags...)
 		if imageDiags.HasError() {
 			return result, diags
@@ -3402,7 +4487,7 @@ func buildBoot(
 		}
 		appendUnionDiagnostic(&diags, result.FromServerBootFromImage(value), "boot")
 	case "custom_image":
-		customImageID, idDiags := parse.UUIDString(boot.CustomImageID, "boot.custom_image_id")
+		customImageID, idDiags := parse.UUIDString(reference.Get(boot.CustomImage, reference.ID), "boot.custom_image.id")
 		diags.Append(idDiags...)
 		volumeType, ok := resolveBootVolumeType(ctx, boot, zoneID, resolveVolumeType, &diags)
 		if idDiags.HasError() || !ok {
@@ -3417,21 +4502,13 @@ func buildBoot(
 		}
 		appendUnionDiagnostic(&diags, result.FromServerBootFromCustomImage(value), "boot")
 	case "local_disk":
-		image, imageDiags := resolveConfiguredName(
-			ctx,
-			boot.Image,
-			"boot.image",
-			"image",
-			func(ctx context.Context, name string) (serversdk.ImageSchema, error) {
-				return resolveImage(ctx, serverlookup.ImageFilter{Name: &name})
-			},
-		)
+		image, imageDiags := serverselector.ResolveImage(ctx, boot.Image, "boot.image", resolveImage)
 		diags.Append(imageDiags...)
 		if !imageDiags.HasError() {
 			appendUnionDiagnostic(&diags, result.FromServerBootFromLocalDisk(serversdk.ServerBootFromLocalDisk{ImageId: image.Id}), "boot")
 		}
 	case "volume":
-		volumeID, idDiags := parse.UUIDString(boot.VolumeID, "boot.volume_id")
+		volumeID, idDiags := parse.UUIDString(reference.Get(boot.Volume, reference.ID), "boot.volume.id")
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
 			appendUnionDiagnostic(&diags, result.FromServerBootFromVolume(serversdk.ServerBootFromVolume{VolumeId: volumeID}), "boot")
@@ -3453,17 +4530,7 @@ func resolveBootVolumeType(
 		diags.AddError("Invalid boot volume size", "boot.volume_size must be known and greater than zero.")
 		return blockstoragesdk.VolumeTypeSchema{}, false
 	}
-	volumeType, valueDiags := resolveConfiguredName(
-		ctx,
-		boot.VolumeType,
-		"boot.volume_type",
-		"volume type",
-		func(ctx context.Context, name string) (blockstoragesdk.VolumeTypeSchema, error) {
-			return resolve(ctx, blockstoragelookup.VolumeTypeResolveRequest{
-				Name: name, ZoneID: zoneID, RequestedSize: int(boot.VolumeSize.ValueInt64()),
-			})
-		},
-	)
+	volumeType, valueDiags := blockstorageselector.ResolveVolumeType(ctx, boot.VolumeType, "boot.volume_type", zoneID, int(boot.VolumeSize.ValueInt64()), resolve)
 	diags.Append(valueDiags...)
 	return volumeType, !valueDiags.HasError()
 }
@@ -3497,41 +4564,18 @@ func buildPrivateIPs(
 				diags.AddError("Invalid subnet private IP", fmt.Sprintf("private_ips[%d].id must not be configured when kind is subnet.", i))
 				continue
 			}
-			hasID := normalizedString(config.SubnetID) != ""
-			hasCIDR := normalizedString(config.SubnetCIDR) != ""
-			if hasID == hasCIDR {
-				diags.AddError("Invalid subnet reference", fmt.Sprintf("private_ips[%d] must configure exactly one of subnet_id or subnet_cidr.", i))
+			subnetID, subnetDiags := privateIPSubnetID(ctx, config, i, resolveSubnet)
+			diags.Append(subnetDiags...)
+			if subnetDiags.HasError() {
 				continue
-			}
-			var subnetID core.UUID
-			if hasID {
-				parsed, idDiags := parse.UUIDString(config.SubnetID, fmt.Sprintf("private_ips[%d].subnet_id", i))
-				diags.Append(idDiags...)
-				if idDiags.HasError() {
-					continue
-				}
-				subnetID = parsed
-			} else {
-				subnet, subnetDiags := resolveConfiguredName(
-					ctx,
-					config.SubnetCIDR,
-					fmt.Sprintf("private_ips[%d].subnet_cidr", i),
-					"subnet",
-					resolveSubnet,
-				)
-				diags.Append(subnetDiags...)
-				if subnetDiags.HasError() {
-					continue
-				}
-				subnetID = subnet.Id
 			}
 			if err := item.FromNewServerPrivateIP(serversdk.NewServerPrivateIP{SubnetId: subnetID}); err != nil {
 				appendUnionDiagnostic(diags, err, fmt.Sprintf("private_ips[%d]", i))
 				continue
 			}
 		case "ip":
-			if normalizedString(config.SubnetID) != "" || normalizedString(config.SubnetCIDR) != "" {
-				diags.AddError("Invalid private IP reference", fmt.Sprintf("private_ips[%d] must not configure subnet_id or subnet_cidr when kind is ip.", i))
+			if referenceCriterion(config.Subnet, reference.ID) != "" || referenceCriterion(config.Subnet, subnetCIDR) != "" {
+				diags.AddError("Invalid private IP reference", fmt.Sprintf("private_ips[%d] must not configure subnet when kind is ip.", i))
 				continue
 			}
 			id, idDiags := parse.UUIDString(config.ID, fmt.Sprintf("private_ips[%d].id", i))
@@ -3571,21 +4615,25 @@ func buildDataVolumes(
 	}
 	items := make([]serversdk.ServerDataVolume, 0, len(configs))
 	for i, config := range configs {
+		if dataVolumeKind(config) == "existing" {
+			if _, errors := parse.UUIDString(config.ID, fmt.Sprintf("data_volumes[%d].id", i)); errors.HasError() {
+				diags.Append(errors...)
+			}
+			continue
+		}
+		if dataVolumeKind(config) != "new" {
+			diags.AddError("Invalid data volume kind", "data_volumes.kind must be new or existing.")
+			continue
+		}
+		if !config.ID.IsNull() && !config.ID.IsUnknown() {
+			diags.AddError("Invalid new data volume ID on create", fmt.Sprintf("Omit data_volumes[%d].id when creating a server with kind new. To attach an existing volume, use kind existing.", i))
+			continue
+		}
 		if config.VolumeSize.IsNull() || config.VolumeSize.IsUnknown() || config.VolumeSize.ValueInt64() < 1 {
 			diags.AddError("Invalid data volume size", fmt.Sprintf("data_volumes[%d].volume_size must be known and greater than zero.", i))
 			continue
 		}
-		volumeType, typeDiags := resolveConfiguredName(
-			ctx,
-			config.VolumeType,
-			fmt.Sprintf("data_volumes[%d].volume_type", i),
-			"volume type",
-			func(ctx context.Context, name string) (blockstoragesdk.VolumeTypeSchema, error) {
-				return resolve(ctx, blockstoragelookup.VolumeTypeResolveRequest{
-					Name: name, ZoneID: zoneID, RequestedSize: int(config.VolumeSize.ValueInt64()),
-				})
-			},
-		)
+		volumeType, typeDiags := blockstorageselector.ResolveVolumeType(ctx, config.VolumeType, fmt.Sprintf("data_volumes[%d].volume_type", i), zoneID, int(config.VolumeSize.ValueInt64()), resolve)
 		diags.Append(typeDiags...)
 		if typeDiags.HasError() {
 			continue
@@ -3652,24 +4700,27 @@ func buildElasticIPs(ctx context.Context, value types.List, body *serversdk.Serv
 	body.ElasticIps = &items
 }
 
-func buildSecurityGroups(ctx context.Context, value types.Set, body *serversdk.ServerCreateSchema, diags *diag.Diagnostics) {
+func buildSecurityGroups(value types.Set, body *serversdk.ServerCreateSchema, diags *diag.Diagnostics) {
 	if value.IsNull() || value.IsUnknown() {
 		return
 	}
-	var configuredIDs []types.String
-	diags.Append(value.ElementsAs(ctx, &configuredIDs, false)...)
-	if diags.HasError() {
-		return
-	}
+	securityGroups := securityGroupReferences(value, diags)
+	body.SecurityGroups = &securityGroups
+}
+
+// securityGroupReferences parses the ID of every configured security group.
+// The caller must check that the set is known.
+func securityGroupReferences(value types.Set, diags *diag.Diagnostics) []serversdk.ServerSecurityGroup {
+	configuredIDs := reference.Strings(value, reference.ID)
 	securityGroups := make([]serversdk.ServerSecurityGroup, 0, len(configuredIDs))
 	for i, configuredID := range configuredIDs {
-		id, idDiags := parse.UUIDString(configuredID, fmt.Sprintf("security_group_ids[%d]", i))
+		id, idDiags := parse.UUIDString(configuredID, fmt.Sprintf("security_groups[%d].id", i))
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
 			securityGroups = append(securityGroups, serversdk.ServerSecurityGroup{Id: id})
 		}
 	}
-	body.SecurityGroups = &securityGroups
+	return securityGroups
 }
 
 func resolveConfiguredName[T any](
@@ -3773,21 +4824,21 @@ func validateServerBoot(ctx context.Context, value types.Object, diags *diag.Dia
 	switch bootType {
 	case "image", "custom_image":
 		if bootType == "image" {
-			requireConfigured(boot.Image, root.AtName("image"), "boot.image", because, diags)
-			rejectConfigured(boot.CustomImageID, root.AtName("custom_image_id"), "boot.custom_image_id", because, diags)
+			requireConfiguredSelector(boot.Image, root.AtName("image"), "boot.image", because, diags)
+			rejectConfigured(boot.CustomImage, root.AtName("custom_image"), "boot.custom_image", because, diags)
 		} else {
-			requireConfigured(boot.CustomImageID, root.AtName("custom_image_id"), "boot.custom_image_id", because, diags)
+			requireReference(boot.CustomImage, reference.ID, root.AtName("custom_image"), "boot.custom_image", because, diags)
 			rejectConfigured(boot.Image, root.AtName("image"), "boot.image", because, diags)
 		}
-		requireConfigured(boot.VolumeType, root.AtName("volume_type"), "boot.volume_type", because, diags)
+		requireConfiguredSelector(boot.VolumeType, root.AtName("volume_type"), "boot.volume_type", because, diags)
 		requireConfiguredInt64(boot.VolumeSize, root.AtName("volume_size"), "boot.volume_size", because, diags)
 		requirePositiveInt64(boot.VolumeSize, root.AtName("volume_size"), "boot.volume_size", diags)
 		requirePositiveInt64(boot.IOPS, root.AtName("iops"), "boot.iops", diags)
-		rejectConfigured(boot.VolumeID, root.AtName("volume_id"), "boot.volume_id", because, diags)
+		rejectConfigured(boot.Volume, root.AtName("volume"), "boot.volume", because, diags)
 	case "local_disk":
-		requireConfigured(boot.Image, root.AtName("image"), "boot.image", because, diags)
-		rejectConfigured(boot.CustomImageID, root.AtName("custom_image_id"), "boot.custom_image_id", because, diags)
-		rejectConfigured(boot.VolumeID, root.AtName("volume_id"), "boot.volume_id", because, diags)
+		requireConfiguredSelector(boot.Image, root.AtName("image"), "boot.image", because, diags)
+		rejectConfigured(boot.CustomImage, root.AtName("custom_image"), "boot.custom_image", because, diags)
+		rejectConfigured(boot.Volume, root.AtName("volume"), "boot.volume", because, diags)
 		rejectConfigured(boot.VolumeType, root.AtName("volume_type"), "boot.volume_type", because, diags)
 		rejectConfiguredInt64(boot.VolumeSize, root.AtName("volume_size"), "boot.volume_size", because, diags)
 		rejectConfiguredInt64(boot.IOPS, root.AtName("iops"), "boot.iops", because, diags)
@@ -3799,9 +4850,9 @@ func validateServerBoot(ctx context.Context, value types.Object, diags *diag.Dia
 			diags,
 		)
 	case "volume":
-		requireConfigured(boot.VolumeID, root.AtName("volume_id"), "boot.volume_id", because, diags)
+		requireReference(boot.Volume, reference.ID, root.AtName("volume"), "boot.volume", because, diags)
 		rejectConfigured(boot.Image, root.AtName("image"), "boot.image", because, diags)
-		rejectConfigured(boot.CustomImageID, root.AtName("custom_image_id"), "boot.custom_image_id", because, diags)
+		rejectConfigured(boot.CustomImage, root.AtName("custom_image"), "boot.custom_image", because, diags)
 		rejectConfigured(boot.VolumeType, root.AtName("volume_type"), "boot.volume_type", because, diags)
 		rejectConfiguredInt64(boot.VolumeSize, root.AtName("volume_size"), "boot.volume_size", because, diags)
 		rejectConfiguredInt64(boot.IOPS, root.AtName("iops"), "boot.iops", because, diags)
@@ -3822,23 +4873,20 @@ func validateServerPrivateIPs(ctx context.Context, value types.List, diags *diag
 	seen := make(map[string]int, len(configs))
 	for i, config := range configs {
 		element := path.Root("private_ips").AtListIndex(i)
-		if config.Kind.IsNull() || config.Kind.IsUnknown() {
+		if config.Kind.IsNull() {
+			requireConfigured(config.Kind, element.AtName("kind"), fmt.Sprintf("private_ips[%d].kind", i), "every private IP attachment needs a kind", diags)
+			continue
+		}
+		if config.Kind.IsUnknown() {
 			continue
 		}
 		switch normalizedString(config.Kind) {
 		case "subnet":
 			rejectConfigured(config.ID, element.AtName("id"), fmt.Sprintf("private_ips[%d].id", i), `kind is "subnet"`, diags)
-			if config.SubnetID.IsNull() == config.SubnetCIDR.IsNull() {
-				diags.AddAttributeError(
-					element,
-					"Invalid subnet reference",
-					fmt.Sprintf("private_ips[%d] must configure exactly one of subnet_id or subnet_cidr.", i),
-				)
-			}
+			validatePrivateIPSubnet(config.Subnet, element.AtName("subnet"), i, diags)
 		case "ip":
 			requireConfigured(config.ID, element.AtName("id"), fmt.Sprintf("private_ips[%d].id", i), `kind is "ip"`, diags)
-			rejectConfigured(config.SubnetID, element.AtName("subnet_id"), fmt.Sprintf("private_ips[%d].subnet_id", i), `kind is "ip"`, diags)
-			rejectConfigured(config.SubnetCIDR, element.AtName("subnet_cidr"), fmt.Sprintf("private_ips[%d].subnet_cidr", i), `kind is "ip"`, diags)
+			rejectConfigured(config.Subnet, element.AtName("subnet"), fmt.Sprintf("private_ips[%d].subnet", i), `kind is "ip"`, diags)
 			rejectDuplicateID(config.ID, element.AtName("id"), "private_ips", i, seen, diags)
 		default:
 			diags.AddAttributeError(
@@ -3850,6 +4898,29 @@ func validateServerPrivateIPs(ctx context.Context, value types.List, diags *diag
 	}
 }
 
+// validatePrivateIPSubnet requires a kind subnet private IP to select its
+// subnet by exactly one of id or cidr. An unknown subnet is left to apply.
+func validatePrivateIPSubnet(value types.Object, attribute path.Path, index int, diags *diag.Diagnostics) {
+	if value.IsUnknown() {
+		return
+	}
+	if value.IsNull() {
+		diags.AddAttributeError(
+			attribute,
+			fmt.Sprintf("Missing private_ips[%d].subnet", index),
+			fmt.Sprintf(`private_ips[%d].subnet must be configured because kind is "subnet".`, index),
+		)
+		return
+	}
+	if reference.Get(value, reference.ID).IsNull() == reference.Get(value, subnetCIDR).IsNull() {
+		diags.AddAttributeError(
+			attribute,
+			"Invalid subnet reference",
+			fmt.Sprintf("private_ips[%d].subnet must configure exactly one of id or cidr.", index),
+		)
+	}
+}
+
 func validateServerElasticIPs(ctx context.Context, value types.List, diags *diag.Diagnostics) {
 	configs, ok := decodeConfigList[ElasticIPInputModel](ctx, value, diags)
 	if !ok {
@@ -3858,7 +4929,11 @@ func validateServerElasticIPs(ctx context.Context, value types.List, diags *diag
 	seen := make(map[string]int, len(configs))
 	for i, config := range configs {
 		element := path.Root("elastic_ips").AtListIndex(i)
-		if config.Kind.IsNull() || config.Kind.IsUnknown() {
+		if config.Kind.IsNull() {
+			requireConfigured(config.Kind, element.AtName("kind"), fmt.Sprintf("elastic_ips[%d].kind", i), "every elastic IP attachment needs a kind", diags)
+			continue
+		}
+		if config.Kind.IsUnknown() {
 			continue
 		}
 		switch normalizedString(config.Kind) {
@@ -3887,18 +4962,6 @@ func validateServerElasticIPs(ctx context.Context, value types.List, diags *diag
 	}
 }
 
-func validateServerDataVolumes(ctx context.Context, value types.List, diags *diag.Diagnostics) {
-	configs, ok := decodeConfigList[DataVolumeInputModel](ctx, value, diags)
-	if !ok {
-		return
-	}
-	for i, config := range configs {
-		element := path.Root("data_volumes").AtListIndex(i)
-		requirePositiveInt64(config.VolumeSize, element.AtName("volume_size"), fmt.Sprintf("data_volumes[%d].volume_size", i), diags)
-		requirePositiveInt64(config.IOPS, element.AtName("iops"), fmt.Sprintf("data_volumes[%d].iops", i), diags)
-	}
-}
-
 func decodeConfigObject[T any](ctx context.Context, value types.Object, diags *diag.Diagnostics) (T, bool) {
 	var decoded T
 	if value.IsNull() || value.IsUnknown() {
@@ -3921,8 +4984,9 @@ func decodeConfigList[T any](ctx context.Context, value types.List, diags *diag.
 
 // requireConfigured treats an unknown value as configured because Terraform
 // resolves it before apply.
-func requireConfigured(value types.String, attribute path.Path, name, because string, diags *diag.Diagnostics) {
-	if value.IsNull() || (!value.IsUnknown() && strings.TrimSpace(value.ValueString()) == "") {
+func requireConfigured(value attr.Value, attribute path.Path, name, because string, diags *diag.Diagnostics) {
+	text, isText := value.(types.String)
+	if value.IsNull() || (isText && !value.IsUnknown() && strings.TrimSpace(text.ValueString()) == "") {
 		diags.AddAttributeError(
 			attribute,
 			"Missing "+name,
@@ -3931,7 +4995,18 @@ func requireConfigured(value types.String, attribute path.Path, name, because st
 	}
 }
 
-func rejectConfigured(value types.String, attribute path.Path, name, because string, diags *diag.Diagnostics) {
+// requireReference requires a reference with a non-empty criterion. An
+// unknown reference or criterion counts as configured, as in
+// requireConfigured.
+func requireReference(value types.Object, criterion string, attribute path.Path, name, because string, diags *diag.Diagnostics) {
+	if value.IsNull() {
+		requireConfigured(types.StringNull(), attribute, name, because, diags)
+		return
+	}
+	requireConfigured(reference.Get(value, criterion), attribute.AtName(criterion), name+"."+criterion, because, diags)
+}
+
+func rejectConfigured(value attr.Value, attribute path.Path, name, because string, diags *diag.Diagnostics) {
 	if !value.IsNull() {
 		diags.AddAttributeError(
 			attribute,
@@ -4007,5 +5082,12 @@ func validateServerUUID(value types.String, attribute path.Path, name string, di
 			"Invalid "+name,
 			fmt.Sprintf("%s must be a valid UUID.", name),
 		)
+	}
+}
+
+func requireConfiguredSelector(value types.Object, attribute path.Path, name, because string, diags *diag.Diagnostics) {
+	requireConfigured(value, attribute, name, because, diags)
+	if !value.IsNull() {
+		diags.Append(selector.Validate(value, name, false)...)
 	}
 }

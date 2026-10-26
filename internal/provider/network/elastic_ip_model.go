@@ -2,7 +2,6 @@ package network
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -17,17 +16,20 @@ type ElasticIPModel struct {
 	IPAddress   types.String `tfsdk:"ip_address"`
 	IPv6Address types.String `tfsdk:"ipv6_address"`
 	Status      types.String `tfsdk:"status"`
-	Region      types.String `tfsdk:"region"`
 	CreatedAt   types.String `tfsdk:"created_at"`
 	UpdatedAt   types.String `tfsdk:"updated_at"`
 }
 
+// ElasticIPResourceModel references its region as an object, while the data
+// source keeps the region name as a plain lookup argument.
 type ElasticIPResourceModel struct {
 	ElasticIPModel
+	Region types.Object `tfsdk:"region"`
 }
 
 type ElasticIPDataSourceModel struct {
 	ElasticIPModel
+	Region types.String `tfsdk:"region"`
 	// Available filters on attachment state; the API returns no matching field,
 	// so it stays as configured.
 	Available types.Bool `tfsdk:"available"`
@@ -39,7 +41,6 @@ func populateElasticIPModel(eip *networksdk.ElasticIPDetailSchema, m *ElasticIPM
 	}
 
 	m.ID = types.StringValue(eip.Id.String())
-	m.Region = types.StringValue(eip.Region.Name)
 	m.EnableIPv4 = types.BoolValue(eip.EnableIpv4)
 	m.EnableIPv6 = types.BoolValue(eip.EnableIpv6)
 	m.CreatedAt = types.StringValue(eip.CreatedAt.Format(time.RFC3339))
@@ -72,14 +73,8 @@ func populateElasticIPResourceState(eip *networksdk.ElasticIPDetailSchema, state
 		return
 	}
 
-	configuredRegion := state.Region
 	populateElasticIPModel(eip, &state.ElasticIPModel)
-	// Keep the configured representation when the backend only trims outer
-	// whitespace, otherwise Terraform reports an inconsistent result.
-	if !configuredRegion.IsNull() && !configuredRegion.IsUnknown() &&
-		strings.TrimSpace(configuredRegion.ValueString()) == eip.Region.Name {
-		state.Region = configuredRegion
-	}
+	state.Region = regionReferenceState(state.Region, eip.Region.Name)
 }
 
 func populateElasticIPDataSourceState(eip *networksdk.ElasticIPDetailSchema, state *ElasticIPDataSourceModel) {
@@ -88,4 +83,5 @@ func populateElasticIPDataSourceState(eip *networksdk.ElasticIPDetailSchema, sta
 	}
 
 	populateElasticIPModel(eip, &state.ElasticIPModel)
+	state.Region = types.StringValue(eip.Region.Name)
 }

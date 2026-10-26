@@ -4,6 +4,7 @@
 # Chain lifecycle (shared fixture state):
 #   run "createFleet_threeEmptyVolumeConfigs_allVolumesAvailable" {
 #   run "omitZone_configuredZone_zonePreservedInPlace" {
+#   run "planAgain_zoneOmitted_stateStable" {
 #   run "addTwoVolumes_threeVolumeFleet_existingIdsPreserved" {
 #   run "removeTwoVolumes_fiveVolumeFleet_remainingIdsPreserved" {
 #   run "changeName_existingPrimaryVolume_nameUpdatedInPlace" {
@@ -22,6 +23,19 @@
 #   run "planAgain_externalSourceFleet_stateStable" {
 #   run "changeVolumeType_backupBackedVolume_volumeRetypedInPlace" {
 #   run "planAgain_retypedVolumeFleet_stateStable" {
+
+# Chain selectors (state_key "selectors"): independent image volume, then cleanup.
+#   run "createVolume_imageAndVolumeTypeCriteria_selectorsPreserved" {
+#   run "planAgain_catalogCriteria_stateStable" {
+#   run "changeSelectorsToNames_sameCatalogEntries_updatedWithoutRetypeOrReplace" {
+#   run "changeDescription_catalogCriteria_updatedInPlace" {
+#   run "changeVolumeTypeSelector_catalogCriteria_retypedInPlace" {
+#   run "changeImageSelector_catalogCriteria_volumeReplaced" {
+# Chain selector import (state_key "selectors-import-source" -> "selectors-import"; plan-only import).
+#   run "createVolume_catalogCriteriaForImport_volumeCreated" {
+#   run "changeSelectorsToNames_selectorImportOwner_identityPreserved" {
+#   run "importVolume_selectorCreatedVolume_backendFieldsReturned" {
+#   run "changeSelectorsToCriteria_namedSelectorImportOwner_updatedWithoutRetypeOrReplace" {
 
 provider "viettelcloud" {
   endpoint   = var.api_endpoint
@@ -59,10 +73,9 @@ variable "source_volume_size" {
   default     = 30
 }
 
-# The volume type fixes the IOPS range, and Ceph_HDD_1A_10K pins it to exactly
-# 500: the backend rejects any other value with "IOPS must be between 500 and
-# 500". The tests therefore configure the value the type allows instead of
-# changing it. Override this together with volume_type.
+# hdd_st1, selected by var.volume_type, fixes IOPS at 500.
+# The backend rejects other values with "IOPS must be between 500 and 500".
+# Override volume_iops together with var.volume_type.
 variable "volume_iops" {
   description = "IOPS the configured volume type accepts."
   type        = number
@@ -71,17 +84,18 @@ variable "volume_iops" {
 
 # The retype runs move one volume onto a second type. It has to be a ready type
 # the backend accepts for an existing volume of var.source_volume_size GiB, and
-# it must differ from var.volume_type or the retype would be a no-op.
+# it must differ from the type that var.volume_type selects, or the retype
+# would be a no-op.
 variable "alternate_volume_type" {
-  description = "Name of a second ready volume type an existing volume can be retyped to."
-  type        = string
-  default     = "Ceph_HDD_50K"
+  description = "Criteria of a second ready volume type for retyping, without encryption or multiple attachments."
+  type        = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
+  default     = { name = "hdd_io1", encryption_key_size = "0", multiattach = false }
 }
 
 variables {
-  volume_type = "Ceph_HDD_1A_10K"
   image_name  = "cirros"
   zone        = "vn-central-1a"
+  volume_type = { name = "hdd_st1", encryption_key_size = "0", multiattach = false }
 }
 
 # Every run performs exactly one change so a failure names the operation that
@@ -124,9 +138,11 @@ run "createFleet_threeEmptyVolumeConfigs_allVolumesAvailable" {
           volume.size == 30 &&
           volume.status == "available" &&
           !volume.bootable &&
-          volume.zone == var.zone &&
+          volume.zone.name == var.zone &&
           length(volume.zone_id) > 0 &&
-          volume.volume_type == var.volume_type &&
+          length(volume.volume_type) > 0 &&
+          volume.create_from.volume_type.id != null &&
+          volume.create_from.volume_type == merge(var.volume_type, { id = volume.create_from.volume_type.id }) &&
           length(volume.created_at) > 0 &&
           length(volume.updated_at) > 0
         )
@@ -176,6 +192,39 @@ run "omitZone_configuredZone_zonePreservedInPlace" {
       )
     ])
     error_message = "Removing zone from configuration replaced a volume or discarded its current zone."
+  }
+}
+
+run "planAgain_zoneOmitted_stateStable" {
+  command = plan
+
+  module {
+    source = "./fixtures/volume/resource"
+  }
+
+  variables {
+    zone = null
+    volumes = {
+      primary = {
+        name = "tf-test-volume-primary"
+        size = 30
+      }
+      logs = {
+        name        = "tf-test-volume-logs"
+        description = "Log volume"
+        size        = 30
+      }
+      cache = {
+        name = "tf-test-volume-cache"
+        size = 30
+        iops = var.volume_iops
+      }
+    }
+  }
+
+  assert {
+    condition     = output.volumes == run.omitZone_configuredZone_zonePreservedInPlace.volumes
+    error_message = "Re-planning with zone omitted proposed a change to the volume fleet."
   }
 }
 
@@ -407,7 +456,8 @@ run "increaseSize_existingPrimaryVolume_volumeResizedInPlace" {
 
 # IOPS is fixed by the volume type, so this proves that configuring the value
 # the type allows is accepted and does not replace the volume. A type with a
-# range would also exercise the update path; Ceph_HDD_1A_10K cannot.
+# range would also exercise the update path; the type that var.volume_type
+# selects cannot.
 run "setIops_resizedPrimaryVolume_iopsUpdatedInPlace" {
   command = apply
 
@@ -633,7 +683,7 @@ run "configureImageSource_emptyPrimaryVolume_primaryReplaced" {
         size = 40
         create_from = {
           source_type = "image"
-          image       = var.image_name
+          image       = { name = var.image_name }
         }
       }
       cache = {
@@ -658,10 +708,11 @@ run "configureImageSource_emptyPrimaryVolume_primaryReplaced" {
       viettelcloud_volume.volume["primary"].name == "tf-test-volume-primary-from-image" &&
       viettelcloud_volume.volume["primary"].size == 40 &&
       viettelcloud_volume.volume["primary"].status == "available" &&
-      viettelcloud_volume.volume["primary"].volume_type == var.volume_type &&
+      length(viettelcloud_volume.volume["primary"].volume_type) > 0 &&
       viettelcloud_volume.volume["primary"].create_from.source_type == "image" &&
-      viettelcloud_volume.volume["primary"].create_from.image == var.image_name &&
-      viettelcloud_volume.volume["primary"].create_from.volume_type == var.volume_type
+      viettelcloud_volume.volume["primary"].create_from.image.name == var.image_name &&
+      viettelcloud_volume.volume["primary"].create_from.volume_type.id != null &&
+      viettelcloud_volume.volume["primary"].create_from.volume_type == merge(var.volume_type, { id = viettelcloud_volume.volume["primary"].create_from.volume_type.id })
     )
     error_message = "Replacing the empty source with an image did not recreate only the primary volume with the expected image source."
   }
@@ -681,7 +732,7 @@ run "planAgain_fleetWithImageBackedPrimary_stateStable" {
         size = 40
         create_from = {
           source_type = "image"
-          image       = var.image_name
+          image       = { name = var.image_name }
         }
       }
       cache = {
@@ -742,7 +793,7 @@ run "addSnapshotVolume_fleetWithImageBackedPrimary_existingIdsPreserved" {
         size = 40
         create_from = {
           source_type = "image"
-          image       = var.image_name
+          image       = { name = var.image_name }
         }
       }
       cache = {
@@ -761,7 +812,7 @@ run "addSnapshotVolume_fleetWithImageBackedPrimary_existingIdsPreserved" {
         name = "tf-test-volume-from-snapshot"
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
     }
@@ -791,16 +842,16 @@ run "addSnapshotVolume_fleetWithImageBackedPrimary_existingIdsPreserved" {
       viettelcloud_volume.volume["snapshot"].status == "available" &&
       viettelcloud_volume.volume["snapshot"].size > 0 &&
       length(viettelcloud_volume.volume["snapshot"].volume_type) > 0 &&
-      length(viettelcloud_volume.volume["snapshot"].zone) > 0 &&
+      length(viettelcloud_volume.volume["snapshot"].zone.name) > 0 &&
       length(viettelcloud_volume.volume["snapshot"].zone_id) > 0 &&
       length(viettelcloud_volume.volume["snapshot"].created_at) > 0 &&
       length(viettelcloud_volume.volume["snapshot"].updated_at) > 0 &&
       viettelcloud_volume.volume["snapshot"].create_from.source_type == "snapshot" &&
-      viettelcloud_volume.volume["snapshot"].create_from.snapshot_id == var.snapshot_id &&
+      viettelcloud_volume.volume["snapshot"].create_from.snapshot.id == var.snapshot_id &&
       viettelcloud_volume.volume["snapshot"].create_from.volume_type == null &&
       viettelcloud_volume.volume["snapshot"].create_from.image == null &&
-      viettelcloud_volume.volume["snapshot"].create_from.custom_image_id == null &&
-      viettelcloud_volume.volume["snapshot"].create_from.backup_id == null
+      viettelcloud_volume.volume["snapshot"].create_from.custom_image == null &&
+      viettelcloud_volume.volume["snapshot"].create_from.backup == null
     )
     error_message = "The snapshot-backed volume did not derive its size from the snapshot or reported the wrong source."
   }
@@ -828,7 +879,7 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
         name = "tf-test-volume-from-snapshot"
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
       backup = {
@@ -836,7 +887,7 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
         size = var.source_volume_size
         create_from = {
           source_type = "backup"
-          backup_id   = var.backup_id
+          backup      = { id = var.backup_id }
         }
       }
       # Restore this member together with the custom_image assertion below and
@@ -845,8 +896,8 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
       #   name = "tf-test-volume-from-custom-image"
       #   size = var.source_volume_size
       #   create_from = {
-      #     source_type     = "custom_image"
-      #     custom_image_id = var.custom_image_id
+      #     source_type  = "custom_image"
+      #     custom_image = { id = var.custom_image_id }
       #   }
       # }
     }
@@ -861,7 +912,7 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
         for volume in values(viettelcloud_volume.volume) : (
           volume.status == "available" &&
           volume.size > 0 &&
-          length(volume.zone) > 0 &&
+          length(volume.zone.name) > 0 &&
           length(volume.zone_id) > 0 &&
           length(volume.volume_type) > 0 &&
           length(volume.created_at) > 0 &&
@@ -880,11 +931,11 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
       viettelcloud_volume.volume["snapshot"].size > 0 &&
       length(viettelcloud_volume.volume["snapshot"].volume_type) > 0 &&
       viettelcloud_volume.volume["snapshot"].create_from.source_type == "snapshot" &&
-      viettelcloud_volume.volume["snapshot"].create_from.snapshot_id == var.snapshot_id &&
+      viettelcloud_volume.volume["snapshot"].create_from.snapshot.id == var.snapshot_id &&
       viettelcloud_volume.volume["snapshot"].create_from.volume_type == null &&
       viettelcloud_volume.volume["snapshot"].create_from.image == null &&
-      viettelcloud_volume.volume["snapshot"].create_from.custom_image_id == null &&
-      viettelcloud_volume.volume["snapshot"].create_from.backup_id == null
+      viettelcloud_volume.volume["snapshot"].create_from.custom_image == null &&
+      viettelcloud_volume.volume["snapshot"].create_from.backup == null
     )
     error_message = "The snapshot-backed volume did not derive its size from the snapshot or reported the wrong source."
   }
@@ -892,13 +943,14 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
   assert {
     condition = (
       viettelcloud_volume.volume["backup"].size == var.source_volume_size &&
-      viettelcloud_volume.volume["backup"].volume_type == var.volume_type &&
+      length(viettelcloud_volume.volume["backup"].volume_type) > 0 &&
       viettelcloud_volume.volume["backup"].create_from.source_type == "backup" &&
-      viettelcloud_volume.volume["backup"].create_from.backup_id == var.backup_id &&
-      viettelcloud_volume.volume["backup"].create_from.volume_type == var.volume_type &&
+      viettelcloud_volume.volume["backup"].create_from.backup.id == var.backup_id &&
+      viettelcloud_volume.volume["backup"].create_from.volume_type.id != null &&
+      viettelcloud_volume.volume["backup"].create_from.volume_type == merge(var.volume_type, { id = viettelcloud_volume.volume["backup"].create_from.volume_type.id }) &&
       viettelcloud_volume.volume["backup"].create_from.image == null &&
-      viettelcloud_volume.volume["backup"].create_from.custom_image_id == null &&
-      viettelcloud_volume.volume["backup"].create_from.snapshot_id == null
+      viettelcloud_volume.volume["backup"].create_from.custom_image == null &&
+      viettelcloud_volume.volume["backup"].create_from.snapshot == null
     )
     error_message = "The backup-backed volume did not honor the requested size and volume type or reported the wrong source."
   }
@@ -906,13 +958,14 @@ run "switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated"
   # assert {
   #   condition = (
   #     viettelcloud_volume.volume["custom_image"].size == var.source_volume_size &&
-  #     viettelcloud_volume.volume["custom_image"].volume_type == var.volume_type &&
+  #     length(viettelcloud_volume.volume["custom_image"].volume_type) > 0 &&
   #     viettelcloud_volume.volume["custom_image"].create_from.source_type == "custom_image" &&
-  #     viettelcloud_volume.volume["custom_image"].create_from.custom_image_id == var.custom_image_id &&
-  #     viettelcloud_volume.volume["custom_image"].create_from.volume_type == var.volume_type &&
+  #     viettelcloud_volume.volume["custom_image"].create_from.custom_image.id == var.custom_image_id &&
+  #     viettelcloud_volume.volume["custom_image"].create_from.volume_type.id != null &&
+  #     viettelcloud_volume.volume["custom_image"].create_from.volume_type == merge(var.volume_type, { id = viettelcloud_volume.volume["custom_image"].create_from.volume_type.id }) &&
   #     viettelcloud_volume.volume["custom_image"].create_from.image == null &&
-  #     viettelcloud_volume.volume["custom_image"].create_from.snapshot_id == null &&
-  #     viettelcloud_volume.volume["custom_image"].create_from.backup_id == null
+  #     viettelcloud_volume.volume["custom_image"].create_from.snapshot == null &&
+  #     viettelcloud_volume.volume["custom_image"].create_from.backup == null
   #   )
   #   error_message = "The custom-image-backed volume did not honor the requested size and volume type or reported the wrong source."
   # }
@@ -934,7 +987,7 @@ run "increaseSize_snapshotBackedVolume_volumeResizedInPlace" {
         size = run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].size + 10
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
       backup = {
@@ -942,15 +995,15 @@ run "increaseSize_snapshotBackedVolume_volumeResizedInPlace" {
         size = var.source_volume_size
         create_from = {
           source_type = "backup"
-          backup_id   = var.backup_id
+          backup      = { id = var.backup_id }
         }
       }
       # custom_image = {
       #   name = "tf-test-volume-from-custom-image"
       #   size = var.source_volume_size
       #   create_from = {
-      #     source_type     = "custom_image"
-      #     custom_image_id = var.custom_image_id
+      #     source_type  = "custom_image"
+      #     custom_image = { id = var.custom_image_id }
       #   }
       # }
     }
@@ -962,7 +1015,7 @@ run "increaseSize_snapshotBackedVolume_volumeResizedInPlace" {
       viettelcloud_volume.volume["snapshot"].id == run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].id &&
       viettelcloud_volume.volume["snapshot"].size == run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].size + 10 &&
       viettelcloud_volume.volume["snapshot"].status == "available" &&
-      viettelcloud_volume.volume["snapshot"].create_from.snapshot_id == var.snapshot_id &&
+      viettelcloud_volume.volume["snapshot"].create_from.snapshot.id == var.snapshot_id &&
       viettelcloud_volume.volume["backup"].id == run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["backup"].id &&
       viettelcloud_volume.volume["backup"].size == run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["backup"].size
     )
@@ -984,7 +1037,7 @@ run "planAgain_externalSourceFleet_stateStable" {
         size = run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].size + 10
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
       backup = {
@@ -992,15 +1045,15 @@ run "planAgain_externalSourceFleet_stateStable" {
         size = var.source_volume_size
         create_from = {
           source_type = "backup"
-          backup_id   = var.backup_id
+          backup      = { id = var.backup_id }
         }
       }
       # custom_image = {
       #   name = "tf-test-volume-from-custom-image"
       #   size = var.source_volume_size
       #   create_from = {
-      #     source_type     = "custom_image"
-      #     custom_image_id = var.custom_image_id
+      #     source_type  = "custom_image"
+      #     custom_image = { id = var.custom_image_id }
       #   }
       # }
     }
@@ -1027,9 +1080,9 @@ run "planAgain_externalSourceFleet_stateStable" {
         volume.created_at == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].created_at &&
         volume.create_from.source_type == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_type &&
         volume.create_from.image == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_image &&
-        volume.create_from.custom_image_id == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_custom_image_id &&
-        volume.create_from.snapshot_id == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_snapshot_id &&
-        volume.create_from.backup_id == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_backup_id &&
+        volume.create_from.custom_image == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_custom_image &&
+        volume.create_from.snapshot == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_snapshot &&
+        volume.create_from.backup == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_backup &&
         volume.create_from.volume_type == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes[key].source_volume_type
       )
     ])
@@ -1058,7 +1111,7 @@ run "changeVolumeType_backupBackedVolume_volumeRetypedInPlace" {
         size = run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].size + 10
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
       backup = {
@@ -1066,7 +1119,7 @@ run "changeVolumeType_backupBackedVolume_volumeRetypedInPlace" {
         size = var.source_volume_size
         create_from = {
           source_type = "backup"
-          backup_id   = var.backup_id
+          backup      = { id = var.backup_id }
           volume_type = var.alternate_volume_type
         }
       }
@@ -1076,8 +1129,9 @@ run "changeVolumeType_backupBackedVolume_volumeRetypedInPlace" {
   assert {
     condition = (
       viettelcloud_volume.volume["backup"].id == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].id &&
-      viettelcloud_volume.volume["backup"].volume_type == var.alternate_volume_type &&
-      viettelcloud_volume.volume["backup"].create_from.volume_type == var.alternate_volume_type &&
+      viettelcloud_volume.volume["backup"].volume_type != run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].volume_type &&
+      viettelcloud_volume.volume["backup"].create_from.volume_type.id != run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].source_volume_type.id &&
+      viettelcloud_volume.volume["backup"].create_from.volume_type == merge(var.alternate_volume_type, { id = viettelcloud_volume.volume["backup"].create_from.volume_type.id }) &&
       viettelcloud_volume.volume["backup"].size == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].size &&
       viettelcloud_volume.volume["backup"].zone == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].zone &&
       viettelcloud_volume.volume["backup"].zone_id == run.increaseSize_snapshotBackedVolume_volumeResizedInPlace.volumes["backup"].zone_id &&
@@ -1112,7 +1166,7 @@ run "planAgain_retypedVolumeFleet_stateStable" {
         size = run.switchToExternalSources_mixedVolumeFleet_snapshotPreservedAndBackupCreated.volumes["snapshot"].size + 10
         create_from = {
           source_type = "snapshot"
-          snapshot_id = var.snapshot_id
+          snapshot    = { id = var.snapshot_id }
         }
       }
       backup = {
@@ -1120,7 +1174,7 @@ run "planAgain_retypedVolumeFleet_stateStable" {
         size = var.source_volume_size
         create_from = {
           source_type = "backup"
-          backup_id   = var.backup_id
+          backup      = { id = var.backup_id }
           volume_type = var.alternate_volume_type
         }
       }
@@ -1145,11 +1199,251 @@ run "planAgain_retypedVolumeFleet_stateStable" {
         volume.volume_type == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].volume_type &&
         volume.created_at == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].created_at &&
         volume.create_from.source_type == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_type &&
-        volume.create_from.snapshot_id == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_snapshot_id &&
-        volume.create_from.backup_id == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_backup_id &&
+        volume.create_from.snapshot == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_snapshot &&
+        volume.create_from.backup == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_backup &&
         volume.create_from.volume_type == run.changeVolumeType_backupBackedVolume_volumeRetypedInPlace.volumes[key].source_volume_type
       )
     ])
     error_message = "Re-planning the retyped fleet proposed a change; a retype does not settle into a stable state."
+  }
+}
+
+# These criteria must identify one catalog entry in the test project.
+# Override them when the catalog differs. Each image must fit a 30 GiB volume.
+variable "selector_image_name" {
+  description = "Name of the image selected by selector_image."
+  type        = string
+  default     = "cirros"
+}
+
+variable "selector_alternate_image_name" {
+  description = "Name of a different image for selector replacement."
+  type        = string
+  default     = "ubuntu-22.04-publiccloud"
+}
+
+variable "selector_image" {
+  type    = object({ name = optional(string), os = optional(string), version = optional(string), type = optional(string) })
+  default = { os = "cirros", version = "20.04" }
+}
+
+variable "selector_volume_type" {
+  type    = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
+  default = { name = "hdd_st1", encryption_key_size = "0", multiattach = false }
+}
+
+run "createVolume_imageAndVolumeTypeCriteria_selectorsPreserved" {
+  command   = apply
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = null
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.selector_volume_type }
+    } }
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].create_from.image == merge(var.selector_image, { id = viettelcloud_volume.volume["selected"].create_from.image.id }) && viettelcloud_volume.volume["selected"].create_from.volume_type == merge(var.selector_volume_type, { id = viettelcloud_volume.volume["selected"].create_from.volume_type.id })
+    error_message = "The volume selector lifecycle did not preserve the expected selection or identity."
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].create_from.image.id != null && viettelcloud_volume.volume["selected"].create_from.volume_type.id != null
+    error_message = "Created selectors must contain catalog IDs."
+  }
+
+}
+
+run "planAgain_catalogCriteria_stateStable" {
+  command   = plan
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = null
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.selector_volume_type }
+    } }
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume["selected"].id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].id &&
+      viettelcloud_volume.volume["selected"].created_at == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].created_at &&
+      viettelcloud_volume.volume["selected"].create_from.image == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].source_image &&
+      viettelcloud_volume.volume["selected"].create_from.volume_type == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].source_volume_type &&
+      viettelcloud_volume.volume["selected"].volume_type == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].volume_type &&
+      viettelcloud_volume.volume["selected"].status == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].status
+    )
+    error_message = "The volume selector lifecycle did not preserve the expected selection or identity."
+  }
+}
+
+run "changeSelectorsToNames_sameCatalogEntries_updatedWithoutRetypeOrReplace" {
+  command   = apply
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = null
+      create_from = {
+        source_type = "image"
+        image       = { name = var.selector_image_name }
+        volume_type = { name = run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].volume_type }
+      }
+    } }
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume["selected"].id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volume_ids["selected"] &&
+      viettelcloud_volume.volume["selected"].created_at == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].created_at &&
+      viettelcloud_volume.volume["selected"].create_from.image.id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].source_image.id &&
+      viettelcloud_volume.volume["selected"].create_from.volume_type.id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].source_volume_type.id
+    )
+    error_message = "Equivalent names changed the volume or its catalog identities."
+  }
+}
+
+run "changeDescription_catalogCriteria_updatedInPlace" {
+  command   = apply
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = "selector update"
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.selector_volume_type }
+    } }
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].create_from.image == merge(var.selector_image, { id = viettelcloud_volume.volume["selected"].create_from.image.id }) && viettelcloud_volume.volume["selected"].create_from.volume_type == merge(var.selector_volume_type, { id = viettelcloud_volume.volume["selected"].create_from.volume_type.id }) && viettelcloud_volume.volume["selected"].id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volume_ids["selected"] && viettelcloud_volume.volume["selected"].description == "selector update"
+    error_message = "The volume selector lifecycle did not preserve the expected selection or identity."
+  }
+}
+
+run "changeVolumeTypeSelector_catalogCriteria_retypedInPlace" {
+  command   = apply
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = "selector update"
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.alternate_volume_type }
+    } }
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].id == run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volume_ids["selected"] && viettelcloud_volume.volume["selected"].create_from.volume_type.id != run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volumes["selected"].source_volume_type.id && viettelcloud_volume.volume["selected"].create_from.volume_type == merge(var.alternate_volume_type, { id = viettelcloud_volume.volume["selected"].create_from.volume_type.id })
+    error_message = "The volume selector lifecycle did not preserve the expected selection or identity."
+  }
+}
+
+run "changeImageSelector_catalogCriteria_volumeReplaced" {
+  command   = apply
+  state_key = "selectors"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selectors"
+      size        = 30
+      description = "selector update"
+      create_from = { source_type = "image", image = { name = var.selector_alternate_image_name }, volume_type = var.alternate_volume_type }
+    } }
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].id != run.createVolume_imageAndVolumeTypeCriteria_selectorsPreserved.volume_ids["selected"] && viettelcloud_volume.volume["selected"].create_from.image.name == var.selector_alternate_image_name
+    error_message = "The volume selector lifecycle did not preserve the expected selection or identity."
+  }
+}
+
+run "createVolume_catalogCriteriaForImport_volumeCreated" {
+  command   = apply
+  state_key = "selectors-import-source"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = "tf-test-volume-selector-import"
+      size        = 30
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.selector_volume_type }
+    } }
+  }
+  assert {
+    condition     = viettelcloud_volume.volume["selected"].create_from.image.id != null && viettelcloud_volume.volume["selected"].create_from.volume_type.id != null
+    error_message = "The import owner must record both catalog IDs."
+  }
+}
+
+# Import refresh returns name selectors. The owner first records those names
+# because criterion-based creation leaves the selector names null in state.
+run "changeSelectorsToNames_selectorImportOwner_identityPreserved" {
+  command   = apply
+  state_key = "selectors-import-source"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name = run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].name
+      size = run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].size
+      create_from = {
+        source_type = "image"
+        image       = { name = var.selector_image_name }
+        volume_type = { name = run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].volume_type }
+      }
+    } }
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume["selected"].id == run.createVolume_catalogCriteriaForImport_volumeCreated.volume_ids["selected"] &&
+      viettelcloud_volume.volume["selected"].created_at == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].created_at &&
+      viettelcloud_volume.volume["selected"].create_from.image.id == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].source_image.id &&
+      viettelcloud_volume.volume["selected"].create_from.volume_type.id == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].source_volume_type.id
+    )
+    error_message = "Name selectors changed the import owner or its catalog identities."
+  }
+}
+
+run "importVolume_selectorCreatedVolume_backendFieldsReturned" {
+  command   = plan
+  state_key = "selectors-import"
+  module { source = "./fixtures/volume/import" }
+  variables {
+    volume_id   = run.createVolume_catalogCriteriaForImport_volumeCreated.volume_ids["selected"]
+    volume_size = run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].size
+    volume_name = run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].name
+    image       = { name = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].source_image.name }
+    volume_type = { name = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].source_volume_type.name }
+  }
+  assert {
+    condition     = viettelcloud_volume.imported.id == run.createVolume_catalogCriteriaForImport_volumeCreated.volume_ids["selected"] && viettelcloud_volume.imported.create_from.image.id == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].source_image.id && viettelcloud_volume.imported.create_from.volume_type.id == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].source_volume_type.id && viettelcloud_volume.imported.size == 30 && viettelcloud_volume.imported.volume_type == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].volume_type && viettelcloud_volume.imported.bootable == true && viettelcloud_volume.imported.zone_id == run.createVolume_catalogCriteriaForImport_volumeCreated.volumes["selected"].zone_id
+    error_message = "Import did not refresh the volume created with selectors."
+  }
+}
+
+# The plan-only import keeps one cleanup owner. Apply alternate criteria to
+# that owner to prove that matching catalog IDs preserve the infrastructure.
+run "changeSelectorsToCriteria_namedSelectorImportOwner_updatedWithoutRetypeOrReplace" {
+  command   = apply
+  state_key = "selectors-import-source"
+  module { source = "./fixtures/volume/resource" }
+  variables {
+    volumes = { selected = {
+      name        = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].name
+      size        = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].size
+      create_from = { source_type = "image", image = var.selector_image, volume_type = var.selector_volume_type }
+    } }
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume["selected"].id == run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volume_ids["selected"] &&
+      viettelcloud_volume.volume["selected"].created_at == run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].created_at &&
+      viettelcloud_volume.volume["selected"].volume_type == run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].volume_type &&
+      viettelcloud_volume.volume["selected"].create_from.image == merge(var.selector_image, { id = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].source_image.id }) &&
+      viettelcloud_volume.volume["selected"].create_from.volume_type == merge(var.selector_volume_type, { id = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].source_volume_type.id })
+    )
+    error_message = "Alternate criteria changed the import owner or its catalog identities."
   }
 }

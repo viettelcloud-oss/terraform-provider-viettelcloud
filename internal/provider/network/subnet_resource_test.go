@@ -19,6 +19,8 @@ import (
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -32,7 +34,7 @@ func TestSubnetModelsMatchSchemas(t *testing.T) {
 
 	subnetResourceSchema := subnetSchema(t)
 	resourcePlan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := resourcePlan.Set(context.Background(), &SubnetResourceModel{}); diags.HasError() {
+	if diags := resourcePlan.Set(context.Background(), &SubnetResourceModel{VPC: types.ObjectNull(reference.AttributeTypes(reference.ID))}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -93,52 +95,76 @@ func TestSubnetReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	subnetResourceSchema := subnetSchema(t)
-	for _, name := range []string{"cidr", "vpc_id"} {
-		attribute, ok := subnetResourceSchema.Attributes[name].(resourceschema.StringAttribute)
-		if !ok {
-			t.Fatalf("%s is not a string attribute", name)
-		}
-		if len(attribute.PlanModifiers) != 1 {
-			t.Fatalf("expected one plan modifier for %s, got %d", name, len(attribute.PlanModifiers))
-		}
+	attribute, ok := subnetResourceSchema.Attributes["cidr"].(resourceschema.StringAttribute)
+	if !ok {
+		t.Fatal("cidr is not a string attribute")
+	}
+	if len(attribute.PlanModifiers) != 1 {
+		t.Fatalf("expected one plan modifier for cidr, got %d", len(attribute.PlanModifiers))
+	}
 
-		state := tfsdk.State{Schema: subnetResourceSchema}
-		if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-			CIDR:  types.StringValue("before"),
-			VPCID: types.StringValue("before"),
-		}}); diags.HasError() {
-			t.Fatalf("set modifier state: %v", diags)
-		}
-		plan := tfsdk.Plan{Schema: subnetResourceSchema}
-		if diags := plan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-			CIDR:  types.StringValue("after"),
-			VPCID: types.StringValue("after"),
-		}}); diags.HasError() {
-			t.Fatalf("set modifier plan: %v", diags)
-		}
-		request := planmodifier.StringRequest{
-			State:      state,
-			Plan:       plan,
-			StateValue: types.StringValue("before"),
-			PlanValue:  types.StringValue("after"),
-		}
-		var response planmodifier.StringResponse
-		attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
-		if !response.RequiresReplace {
-			t.Errorf("expected changing %s to require replacement", name)
-		}
+	state := tfsdk.State{Schema: subnetResourceSchema}
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{CIDR: types.StringValue("before")},
+		VPC:         reference.Value(reference.ID, types.StringValue("before")),
+	}); diags.HasError() {
+		t.Fatalf("set modifier state: %v", diags)
+	}
+	plan := tfsdk.Plan{Schema: subnetResourceSchema}
+	if diags := plan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{CIDR: types.StringValue("after")},
+		VPC:         reference.Value(reference.ID, types.StringValue("after")),
+	}); diags.HasError() {
+		t.Fatalf("set modifier plan: %v", diags)
+	}
+	request := planmodifier.StringRequest{
+		State:      state,
+		Plan:       plan,
+		StateValue: types.StringValue("before"),
+		PlanValue:  types.StringValue("after"),
+	}
+	var response planmodifier.StringResponse
+	attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
+	if !response.RequiresReplace {
+		t.Error("expected changing cidr to require replacement")
+	}
+}
+
+func TestSubnetVPCReferenceSchemaAndReplacement(t *testing.T) {
+	t.Parallel()
+
+	subnetResourceSchema := subnetSchema(t)
+	vpc := requiredReferenceAttribute(t, subnetResourceSchema, "vpc", reference.ID)
+	before := reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String()))
+	tests := map[string]struct {
+		plan types.Object
+		want bool
+	}{
+		"same id updates in place": {plan: before},
+		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0xef}.String())), want: true},
+		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := referenceRequiresReplace(t, subnetResourceSchema, vpc, before, test.plan); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
 func TestBuildSubnetCreateBody(t *testing.T) {
 	t.Parallel()
 
-	body, diags := buildSubnetCreateBody(SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:        types.StringValue("  application  "),
-		Description: types.StringValue("application tier"),
-		CIDR:        types.StringValue("10.0.1.0/24"),
-		VPCID:       types.StringValue(subnetTestVPCID.String()),
-	}})
+	body, diags := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name:        types.StringValue("  application  "),
+			Description: types.StringValue("application tier"),
+			CIDR:        types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	})
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
@@ -151,12 +177,14 @@ func TestBuildSubnetCreateBody(t *testing.T) {
 func TestBuildSubnetCreateBodyOmitsDescription(t *testing.T) {
 	t.Parallel()
 
-	body, diags := buildSubnetCreateBody(SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:        types.StringValue("application"),
-		Description: types.StringNull(),
-		CIDR:        types.StringValue("10.0.1.0/24"),
-		VPCID:       types.StringValue(subnetTestVPCID.String()),
-	}})
+	body, diags := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name:        types.StringValue("application"),
+			Description: types.StringNull(),
+			CIDR:        types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	})
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
@@ -169,33 +197,39 @@ func TestBuildSubnetCreateBodyRejectsUnknownAndInvalidInputs(t *testing.T) {
 	t.Parallel()
 
 	// Unknown inputs
-	_, diagsUnknown := buildSubnetCreateBody(SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringUnknown(),
-		CIDR:  types.StringUnknown(),
-		VPCID: types.StringValue("not-a-uuid"),
-	}})
+	_, diagsUnknown := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringUnknown(),
+			CIDR: types.StringUnknown(),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue("not-a-uuid")),
+	})
 	if !diagsUnknown.HasError() || len(diagsUnknown.Errors()) != 3 {
 		t.Fatalf("expected diagnostics for unknown name, CIDR, and invalid VPC ID, got %v", diagsUnknown)
 	}
 
 	// Null inputs
-	_, diagsNull := buildSubnetCreateBody(SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringNull(),
-		CIDR:  types.StringNull(),
-		VPCID: types.StringNull(),
-	}})
+	_, diagsNull := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringNull(),
+			CIDR: types.StringNull(),
+		},
+		VPC: reference.Value(reference.ID, types.StringNull()),
+	})
 	if !diagsNull.HasError() || len(diagsNull.Errors()) != 3 {
 		t.Fatalf("expected diagnostics for null name, CIDR, and VPC ID, got %v", diagsNull)
 	}
 
 	// Unknown VPC ID
-	_, diagsUnknownVPC := buildSubnetCreateBody(SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue("application"),
-		CIDR:  types.StringValue("10.0.1.0/24"),
-		VPCID: types.StringUnknown(),
-	}})
-	if !diagsUnknownVPC.HasError() {
-		t.Fatalf("expected diagnostics for unknown VPC ID, got %v", diagsUnknownVPC)
+	_, diagsUnknownVPC := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("application"),
+			CIDR: types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringUnknown()),
+	})
+	if !diagsUnknownVPC.HasError() || !strings.Contains(diagsUnknownVPC.Errors()[0].Detail(), "vpc.id") {
+		t.Fatalf("expected diagnostics naming vpc.id for an unknown VPC ID, got %v", diagsUnknownVPC)
 	}
 }
 
@@ -361,15 +395,17 @@ func TestPopulateSubnetResourceState(t *testing.T) {
 	t.Parallel()
 
 	subnet := mockSubnet("application", "application tier")
-	state := SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue("  application  "),
-		VPCID: types.StringValue(strings.ToUpper(subnet.Vpc.Id.String())),
-	}}
+	state := SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("  application  "),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(strings.ToUpper(subnet.Vpc.Id.String()))),
+	}
 	populateSubnetResourceState(subnet, &state)
 
 	if state.ID.ValueString() != subnet.Id.String() || state.Name.ValueString() != "  application  " ||
 		state.Description.ValueString() != "application tier" || state.CIDR.ValueString() != subnet.Cidr ||
-		state.VPCID.ValueString() != strings.ToUpper(subnet.Vpc.Id.String()) || state.VPCName.ValueString() != subnet.Vpc.Name ||
+		reference.Get(state.VPC, reference.ID).ValueString() != strings.ToUpper(subnet.Vpc.Id.String()) || state.VPCName.ValueString() != subnet.Vpc.Name ||
 		state.Region.ValueString() != subnet.Region.Name || state.DisplayName.ValueString() != subnet.DisplayName {
 		t.Fatalf("unexpected subnet state: %#v", state)
 	}
@@ -423,14 +459,14 @@ func TestPopulateSubnetResourceStateUsesChangedBackendVPCID(t *testing.T) {
 	configuredVPCID := subnetTestVPCID
 	subnet := mockSubnet("application", "application tier")
 	subnet.Vpc.Id = core.UUID{0xef}
-	state := SubnetResourceModel{SubnetModel: SubnetModel{
-		VPCID: types.StringValue(strings.ToUpper(configuredVPCID.String())),
-	}}
+	state := SubnetResourceModel{
+		VPC: reference.Value(reference.ID, types.StringValue(strings.ToUpper(configuredVPCID.String()))),
+	}
 
 	populateSubnetResourceState(subnet, &state)
 
-	if state.VPCID.ValueString() != subnet.Vpc.Id.String() {
-		t.Fatalf("expected backend VPC ID %q, got %q", subnet.Vpc.Id, state.VPCID.ValueString())
+	if reference.Get(state.VPC, reference.ID).ValueString() != subnet.Vpc.Id.String() {
+		t.Fatalf("expected backend VPC ID %q, got %q", subnet.Vpc.Id, reference.Get(state.VPC, reference.ID).ValueString())
 	}
 }
 
@@ -438,13 +474,15 @@ func TestPopulateSubnetResourceStateNullAndUnknownInputs(t *testing.T) {
 	t.Parallel()
 
 	subnet := mockSubnet("application", "tier")
-	state := SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringNull(),
-		VPCID: types.StringUnknown(),
-	}}
+	state := SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringNull(),
+		},
+		VPC: reference.Value(reference.ID, types.StringUnknown()),
+	}
 	populateSubnetResourceState(subnet, &state)
-	if state.Name.ValueString() != subnet.Name || state.VPCID.ValueString() != subnet.Vpc.Id.String() {
-		t.Fatalf("expected state to receive backend values, got name=%q vpc_id=%q", state.Name.ValueString(), state.VPCID.ValueString())
+	if state.Name.ValueString() != subnet.Name || reference.Get(state.VPC, reference.ID).ValueString() != subnet.Vpc.Id.String() {
+		t.Fatalf("expected state to receive backend values, got name=%q vpc_id=%q", state.Name.ValueString(), reference.Get(state.VPC, reference.ID).ValueString())
 	}
 }
 
@@ -452,12 +490,12 @@ func TestPopulateSubnetResourceStateInvalidVPCIDInState(t *testing.T) {
 	t.Parallel()
 
 	subnet := mockSubnet("application", "tier")
-	state := SubnetResourceModel{SubnetModel: SubnetModel{
-		VPCID: types.StringValue("not-a-valid-uuid"),
-	}}
+	state := SubnetResourceModel{
+		VPC: reference.Value(reference.ID, types.StringValue("not-a-valid-uuid")),
+	}
 	populateSubnetResourceState(subnet, &state)
-	if state.VPCID.ValueString() != subnet.Vpc.Id.String() {
-		t.Fatalf("expected backend VPC ID %q, got %q", subnet.Vpc.Id, state.VPCID.ValueString())
+	if reference.Get(state.VPC, reference.ID).ValueString() != subnet.Vpc.Id.String() {
+		t.Fatalf("expected backend VPC ID %q, got %q", subnet.Vpc.Id, reference.Get(state.VPC, reference.ID).ValueString())
 	}
 }
 
@@ -529,12 +567,14 @@ func TestSubnetResourceLifecycleUsesPublicSDK(t *testing.T) {
 
 	createPlan := tfsdk.Plan{Schema: subnetResourceSchema}
 	configuredVPCID := strings.ToUpper(subnetTestVPCID.String())
-	if diags := createPlan.Set(ctx, &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:        types.StringValue("application"),
-		Description: types.StringValue("before"),
-		CIDR:        types.StringValue("10.0.1.0/24"),
-		VPCID:       types.StringValue(configuredVPCID),
-	}}); diags.HasError() {
+	if diags := createPlan.Set(ctx, &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name:        types.StringValue("application"),
+			Description: types.StringValue("before"),
+			CIDR:        types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(configuredVPCID)),
+	}); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
 	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: subnetResourceSchema}}
@@ -553,8 +593,8 @@ func TestSubnetResourceLifecycleUsesPublicSDK(t *testing.T) {
 	if diags := readResponse.State.Get(ctx, &updatePlanModel); diags.HasError() {
 		t.Fatalf("get state before update: %v", diags)
 	}
-	if updatePlanModel.VPCID.ValueString() != configuredVPCID {
-		t.Fatalf("expected configured VPC ID %q after read, got %q", configuredVPCID, updatePlanModel.VPCID.ValueString())
+	if reference.Get(updatePlanModel.VPC, reference.ID).ValueString() != configuredVPCID {
+		t.Fatalf("expected configured VPC ID %q after read, got %q", configuredVPCID, reference.Get(updatePlanModel.VPC, reference.ID).ValueString())
 	}
 	updatePlanModel.Name = types.StringValue("services")
 	updatePlanModel.Description = types.StringValue("after")
@@ -625,11 +665,13 @@ func TestSubnetResourceLifecycleWithUntrimmedName(t *testing.T) {
 
 	untrimmedName := "  application  "
 	createPlan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := createPlan.Set(ctx, &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue(untrimmedName),
-		CIDR:  types.StringValue("10.0.1.0/24"),
-		VPCID: types.StringValue(subnetTestVPCID.String()),
-	}}); diags.HasError() {
+	if diags := createPlan.Set(ctx, &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue(untrimmedName),
+			CIDR: types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	}); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
 	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: subnetResourceSchema}}
@@ -667,11 +709,13 @@ func TestSubnetResourceCreateRejectsInvalidPlan(t *testing.T) {
 	r := &SubnetResource{projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	plan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := plan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue("application"),
-		CIDR:  types.StringValue("10.0.1.0/24"),
-		VPCID: types.StringValue("invalid-uuid"),
-	}}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("application"),
+			CIDR: types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue("invalid-uuid")),
+	}); diags.HasError() {
 		t.Fatalf("set invalid plan: %v", diags)
 	}
 
@@ -701,11 +745,13 @@ func TestSubnetResourceCreateReportsAPIError(t *testing.T) {
 	}
 	subnetResourceSchema := subnetSchema(t)
 	plan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := plan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue("application"),
-		CIDR:  types.StringValue("10.0.1.0/24"),
-		VPCID: types.StringValue(subnetTestVPCID.String()),
-	}}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("application"),
+			CIDR: types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	}); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
 
@@ -726,9 +772,12 @@ func TestSubnetResourceReadRejectsInvalidStateID(t *testing.T) {
 	r := &SubnetResource{projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue("not-a-valid-uuid"),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue("not-a-valid-uuid"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set invalid state ID: %v", diags)
 	}
 
@@ -761,9 +810,12 @@ func TestSubnetResourceReadRemovesMissingResourceAndDeleteAcceptsNotFound(t *tes
 	r := &SubnetResource{client: client, projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue(subnetTestUUID.String()),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue(subnetTestUUID.String()),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set initial state: %v", diags)
 	}
 
@@ -805,9 +857,12 @@ func TestSubnetResourceReadReportsAPIError(t *testing.T) {
 	r := &SubnetResource{client: client, projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue(subnetTestUUID.String()),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue(subnetTestUUID.String()),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 
@@ -827,15 +882,21 @@ func TestSubnetResourceUpdateRejectsInvalidInputs(t *testing.T) {
 
 	// Case 1: Invalid state ID
 	invalidState := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := invalidState.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue("bad-id"),
-	}}); diags.HasError() {
+	if diags := invalidState.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue("bad-id"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set invalid state: %v", diags)
 	}
 	validPlan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := validPlan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name: types.StringValue("app"),
-	}}); diags.HasError() {
+	if diags := validPlan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("app"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 	var resp1 resource.UpdateResponse
@@ -846,16 +907,22 @@ func TestSubnetResourceUpdateRejectsInvalidInputs(t *testing.T) {
 
 	// Case 2: Invalid plan name
 	validState := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := validState.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID:   types.StringValue(subnetTestUUID.String()),
-		Name: types.StringValue("app"),
-	}}); diags.HasError() {
+	if diags := validState.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID:   types.StringValue(subnetTestUUID.String()),
+			Name: types.StringValue("app"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 	invalidPlan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := invalidPlan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name: types.StringUnknown(),
-	}}); diags.HasError() {
+	if diags := invalidPlan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringUnknown(),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set invalid plan: %v", diags)
 	}
 	var resp2 resource.UpdateResponse
@@ -890,13 +957,15 @@ func TestSubnetResourceUpdateNoChangesCallsGetSubnet(t *testing.T) {
 	r := &SubnetResource{client: client, projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 
-	model := SubnetResourceModel{SubnetModel: SubnetModel{
-		ID:          types.StringValue(subnetTestUUID.String()),
-		Name:        types.StringValue("application"),
-		Description: types.StringValue("application tier"),
-		CIDR:        types.StringValue("10.0.1.0/24"),
-		VPCID:       types.StringValue(subnetTestVPCID.String()),
-	}}
+	model := SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID:          types.StringValue(subnetTestUUID.String()),
+			Name:        types.StringValue("application"),
+			Description: types.StringValue("application tier"),
+			CIDR:        types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	}
 
 	state := tfsdk.State{Schema: subnetResourceSchema}
 	if diags := state.Set(context.Background(), &model); diags.HasError() {
@@ -938,18 +1007,24 @@ func TestSubnetResourceUpdateReportsAPIError(t *testing.T) {
 	subnetResourceSchema := subnetSchema(t)
 
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID:          types.StringValue(subnetTestUUID.String()),
-		Name:        types.StringValue("before"),
-		Description: types.StringValue("before"),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID:          types.StringValue(subnetTestUUID.String()),
+			Name:        types.StringValue("before"),
+			Description: types.StringValue("before"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 	plan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := plan.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		Name:        types.StringValue("after"),
-		Description: types.StringValue("after"),
-	}}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name:        types.StringValue("after"),
+			Description: types.StringValue("after"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 
@@ -966,9 +1041,12 @@ func TestSubnetResourceDeleteRejectsInvalidStateID(t *testing.T) {
 	r := &SubnetResource{projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue("invalid-uuid"),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue("invalid-uuid"),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 
@@ -998,9 +1076,12 @@ func TestSubnetResourceDeleteReportsAPIError(t *testing.T) {
 	r := &SubnetResource{client: client, projectID: subnetProjectID}
 	subnetResourceSchema := subnetSchema(t)
 	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{SubnetModel: SubnetModel{
-		ID: types.StringValue(subnetTestUUID.String()),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			ID: types.StringValue(subnetTestUUID.String()),
+		},
+		VPC: types.ObjectNull(reference.AttributeTypes(reference.ID)),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 
@@ -1016,7 +1097,7 @@ func TestSubnetResourceImportState(t *testing.T) {
 
 	subnetResourceSchema := subnetSchema(t)
 	response := resource.ImportStateResponse{State: tfsdk.State{Schema: subnetResourceSchema}}
-	if diags := response.State.Set(context.Background(), &SubnetResourceModel{}); diags.HasError() {
+	if diags := response.State.Set(context.Background(), &SubnetResourceModel{VPC: types.ObjectNull(reference.AttributeTypes(reference.ID))}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 	(&SubnetResource{}).ImportState(context.Background(), resource.ImportStateRequest{
@@ -1033,6 +1114,23 @@ func TestSubnetResourceImportState(t *testing.T) {
 	}
 	if id.ValueString() != subnetTestUUID.String() {
 		t.Fatalf("expected imported ID %q, got %q", subnetTestUUID, id.ValueString())
+	}
+}
+
+func TestSubnetReadAfterImportFillsVPCReference(t *testing.T) {
+	t.Parallel()
+
+	subnet := mockSubnet("application", "description")
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &SubnetResource{client: client, projectID: subnetProjectID}
+	}, subnet.Id.String(), subnet)
+
+	var vpc types.Object
+	if diags := state.GetAttribute(context.Background(), path.Root("vpc"), &vpc); diags.HasError() {
+		t.Fatalf("read vpc: %v", diags)
+	}
+	if want := reference.Value(reference.ID, types.StringValue(subnet.Vpc.Id.String())); !vpc.Equal(want) {
+		t.Fatalf("imported vpc = %s, want %s", vpc, want)
 	}
 }
 

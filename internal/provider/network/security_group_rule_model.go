@@ -8,11 +8,12 @@ import (
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 type SecurityGroupRuleModel struct {
 	ID                types.String `tfsdk:"id"`
-	SecurityGroupID   types.String `tfsdk:"security_group_id"`
+	SecurityGroup     types.Object `tfsdk:"security_group"`
 	SecurityGroupName types.String `tfsdk:"security_group_name"`
 	Direction         types.String `tfsdk:"direction"`
 	Protocol          types.String `tfsdk:"protocol"`
@@ -35,7 +36,7 @@ func populateSecurityGroupRuleModel(rule *networksdk.SecurityGroupRuleSchema, m 
 	}
 
 	m.ID = types.StringValue(rule.Id.String())
-	m.SecurityGroupID = types.StringValue(rule.SecurityGroup.Id.String())
+	m.SecurityGroup = reference.Value(reference.ID, types.StringValue(rule.SecurityGroup.Id.String()))
 	m.SecurityGroupName = types.StringValue(rule.SecurityGroup.Name)
 	m.Direction = types.StringValue(string(rule.Direction))
 	m.Description = types.StringPointerValue(rule.Description)
@@ -85,15 +86,15 @@ func populateSecurityGroupRuleResourceState(rule *networksdk.SecurityGroupRuleSc
 		return
 	}
 
-	configuredSecurityGroupID := state.SecurityGroupID
+	configuredSecurityGroup := state.SecurityGroup
 	configuredDirection := state.Direction
 	configuredProtocol := state.Protocol
 	configuredRemoteIPPrefix := state.RemoteIPPrefix
 
 	populateSecurityGroupRuleModel(rule, state)
 
-	if compare.SameUUID(configuredSecurityGroupID, rule.SecurityGroup.Id) {
-		state.SecurityGroupID = configuredSecurityGroupID
+	if compare.SameUUID(reference.Get(configuredSecurityGroup, reference.ID), rule.SecurityGroup.Id) {
+		state.SecurityGroup = configuredSecurityGroup
 	}
 	if sameNormalizedSGRValue(configuredDirection, string(rule.Direction)) {
 		state.Direction = configuredDirection

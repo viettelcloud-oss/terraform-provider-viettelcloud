@@ -12,8 +12,10 @@ package compare
 // MAC addresses ignore separator style.
 
 import (
+	"encoding/json"
 	"net"
 	"net/netip"
+	"reflect"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -83,4 +85,12 @@ func SameUUIDSet(v, w types.Set) bool {
 		}
 	}
 	return true
+}
+
+func SameJSON(v, w types.String) bool {
+	if v.IsNull() || v.IsUnknown() || w.IsNull() || w.IsUnknown() {
+		return false
+	}
+	var configured, backend any
+	return json.Unmarshal([]byte(v.ValueString()), &configured) == nil && json.Unmarshal([]byte(w.ValueString()), &backend) == nil && reflect.DeepEqual(configured, backend)
 }

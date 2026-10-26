@@ -7,11 +7,14 @@ import (
 	"time"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
+	blockstorageselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/selector"
+	serverselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/selector"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/selector"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	blockstoragesdk "github.com/viettelcloud-oss/sdks/go/blockstorage"
 	"github.com/viettelcloud-oss/sdks/go/core"
 )
@@ -24,7 +27,6 @@ type VolumeModel struct {
 	Status      types.String `tfsdk:"status"`
 	Bootable    types.Bool   `tfsdk:"bootable"`
 	Encrypted   types.Bool   `tfsdk:"encrypted"`
-	Zone        types.String `tfsdk:"zone"`
 	ZoneID      types.String `tfsdk:"zone_id"`
 	VolumeType  types.String `tfsdk:"volume_type"`
 	ProjectID   types.String `tfsdk:"project_id"`
@@ -33,22 +35,38 @@ type VolumeModel struct {
 	IOPS        types.Int64  `tfsdk:"iops"`
 }
 
+// VolumeResourceModel references the zone as an object, while the data source
+// keeps filtering by a plain zone name.
 type VolumeResourceModel struct {
 	VolumeModel
+	Zone       types.Object `tfsdk:"zone"`
 	CreateFrom types.Object `tfsdk:"create_from"`
 }
 
 type VolumeDataSourceModel struct {
 	VolumeModel
+	Zone types.String `tfsdk:"zone"`
 }
 
 type VolumeCreateFromModel struct {
-	SourceType    types.String `tfsdk:"source_type"`
-	Image         types.String `tfsdk:"image"`
-	CustomImageID types.String `tfsdk:"custom_image_id"`
-	SnapshotID    types.String `tfsdk:"snapshot_id"`
-	BackupID      types.String `tfsdk:"backup_id"`
-	VolumeType    types.String `tfsdk:"volume_type"`
+	SourceType  types.String `tfsdk:"source_type"`
+	Image       types.Object `tfsdk:"image"`
+	CustomImage types.Object `tfsdk:"custom_image"`
+	Snapshot    types.Object `tfsdk:"snapshot"`
+	Backup      types.Object `tfsdk:"backup"`
+	VolumeType  types.Object `tfsdk:"volume_type"`
+}
+
+// volumeSource is create_from with every ID reference reduced to its ID, which
+// is what validation, requests, and plan checks read. The image and volume type
+// selectors stay objects because they combine several criteria.
+type volumeSource struct {
+	SourceType    types.String
+	Image         types.Object
+	CustomImageID types.String
+	SnapshotID    types.String
+	BackupID      types.String
+	VolumeType    types.Object
 }
 
 const (
@@ -65,15 +83,43 @@ type volumeOrigin struct {
 	value      types.String
 }
 
+// volumeSourceCriteria maps each create_from ID reference to the criterion that
+// selects the referenced object.
+var volumeSourceCriteria = map[string]string{
+	"custom_image": reference.ID,
+	"snapshot":     reference.ID,
+	"backup":       reference.ID,
+}
+
 func volumeCreateFromAttributeTypes() map[string]attr.Type {
-	return map[string]attr.Type{
-		"source_type":     types.StringType,
-		"image":           types.StringType,
-		"custom_image_id": types.StringType,
-		"snapshot_id":     types.StringType,
-		"backup_id":       types.StringType,
-		"volume_type":     types.StringType,
+	attributeTypes := map[string]attr.Type{
+		"source_type": types.StringType,
+		"image":       types.ObjectType{AttrTypes: serverselector.ImageAttributeTypes()},
+		"volume_type": types.ObjectType{AttrTypes: blockstorageselector.VolumeTypeAttributeTypes()},
 	}
+	for attribute, criterion := range volumeSourceCriteria {
+		attributeTypes[attribute] = reference.ObjectType(criterion)
+	}
+	return attributeTypes
+}
+
+// volumeCreateFromObject builds create_from from source_type and the ID of each
+// ID reference, keyed by attribute name, and from the image and volume type
+// selectors. A missing or null ID leaves its reference null.
+func volumeCreateFromObject(values map[string]types.String, image, volumeType types.Object) (types.Object, diag.Diagnostics) {
+	sourceType, ok := values["source_type"]
+	if !ok {
+		sourceType = types.StringNull()
+	}
+	attributes := map[string]attr.Value{"source_type": sourceType, "image": image, "volume_type": volumeType}
+	for attribute, criterion := range volumeSourceCriteria {
+		value, ok := values[attribute]
+		if !ok {
+			value = types.StringNull()
+		}
+		attributes[attribute] = reference.Value(criterion, value)
+	}
+	return types.ObjectValue(volumeCreateFromAttributeTypes(), attributes)
 }
 
 func populateVolumeModel(volume *blockstoragesdk.VolumeDetailSchema, state *VolumeModel) {
@@ -86,7 +132,6 @@ func populateVolumeModel(volume *blockstoragesdk.VolumeDetailSchema, state *Volu
 	state.Size = types.Int64Value(int64(volume.Size))
 	state.Status = types.StringValue(string(volume.Status))
 	state.Bootable = types.BoolValue(volume.Bootable)
-	state.Zone = types.StringValue(volume.Zone.Name)
 	state.ZoneID = types.StringValue(volume.Zone.Id.String())
 	state.ProjectID = types.StringValue(volume.ProjectId.String())
 	state.CreatedAt = types.StringValue(volume.CreatedAt.Format(time.RFC3339))
@@ -124,6 +169,7 @@ func populateVolumeResourceState(ctx context.Context, volume *blockstoragesdk.Vo
 	configuredName := state.Name
 	configuredSource := state.CreateFrom
 	populateVolumeModel(volume, &state.VolumeModel)
+	state.Zone = reference.Value(reference.Name, types.StringValue(volume.Zone.Name))
 	if !configuredName.IsNull() && !configuredName.IsUnknown() && strings.TrimSpace(configuredName.ValueString()) == volume.Name {
 		state.Name = configuredName
 	}
@@ -137,15 +183,10 @@ func populateVolumeResourceState(ctx context.Context, volume *blockstoragesdk.Vo
 }
 
 func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDetailSchema, configured types.Object) (types.Object, diag.Diagnostics) {
-	var diags diag.Diagnostics
 	attributeTypes := volumeCreateFromAttributeTypes()
-
-	var prior VolumeCreateFromModel
-	if !configured.IsNull() && !configured.IsUnknown() {
-		diags.Append(configured.As(ctx, &prior, basetypes.ObjectAsOptions{})...)
-		if diags.HasError() {
-			return types.ObjectNull(attributeTypes), diags
-		}
+	prior, diags := volumeCreateFromModel(ctx, configured)
+	if diags.HasError() {
+		return types.ObjectNull(attributeTypes), diags
 	}
 	priorSourceType := strings.TrimSpace(prior.SourceType.ValueString())
 
@@ -193,35 +234,40 @@ func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDe
 		}
 	}
 
-	values := map[string]attr.Value{
-		"source_type":     types.StringValue(volumeSourceTypeEmpty),
-		"image":           types.StringNull(),
-		"custom_image_id": types.StringNull(),
-		"snapshot_id":     types.StringNull(),
-		"backup_id":       types.StringNull(),
-		"volume_type":     types.StringNull(),
-	}
+	values := map[string]types.String{"source_type": types.StringValue(volumeSourceTypeEmpty)}
+	image := types.ObjectNull(serverselector.ImageAttributeTypes())
+	volumeType := types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())
 	sourceType := volumeSourceTypeEmpty
 	switch {
 	case selected != nil:
 		sourceType = selected.sourceType
 		values["source_type"] = types.StringValue(selected.sourceType)
-		values[selected.attribute] = selected.value
+		if selected.sourceType == volumeSourceTypeImage {
+			value, valueDiags := selector.Refresh(prior.Image, serverselector.ImageAttributeTypes(), &volume.CreateFrom.Image.Id, volume.CreateFrom.Image.Name)
+			diags.Append(valueDiags...)
+			image = value
+		} else {
+			values[selected.attribute] = selected.value
+		}
 	case retainPrior:
 		sourceType = priorSourceType
 		values["source_type"] = types.StringValue(priorSourceType)
-		if attribute, value, ok := priorVolumeSourceID(prior, priorSourceType); ok {
+		if priorSourceType == volumeSourceTypeImage {
+			image = prior.Image
+		} else if attribute, value, ok := priorVolumeSourceID(prior, priorSourceType); ok {
 			values[attribute] = value
 		}
 	}
 	// A snapshot source rejects create_from.volume_type in configuration because
 	// the snapshot picks the type, so the response value stays out of state.
 	if volume.CreateFrom.VolumeType != nil && sourceType != volumeSourceTypeSnapshot {
-		values["volume_type"] = types.StringValue(volume.CreateFrom.VolumeType.Name)
+		value, valueDiags := selector.Refresh(prior.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &volume.CreateFrom.VolumeType.Id, volume.CreateFrom.VolumeType.Name)
+		diags.Append(valueDiags...)
+		volumeType = value
 	}
 	preserveConfiguredVolumeSource(values, prior)
 
-	result, objectDiags := types.ObjectValue(attributeTypes, values)
+	result, objectDiags := volumeCreateFromObject(values, image, volumeType)
 	diags.Append(objectDiags...)
 	if diags.HasError() {
 		return types.ObjectNull(attributeTypes), diags
@@ -239,35 +285,33 @@ func volumeOrigins(volume *blockstoragesdk.VolumeDetailSchema) []volumeOrigin {
 		origins = append(origins, volumeOrigin{volumeSourceTypeImage, "image", types.StringValue(volume.CreateFrom.Image.Name)})
 	}
 	if volume.CreateFrom.CustomImage != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeCustomImage, "custom_image_id", types.StringValue(volume.CreateFrom.CustomImage.Id.String())})
+		origins = append(origins, volumeOrigin{volumeSourceTypeCustomImage, "custom_image", types.StringValue(volume.CreateFrom.CustomImage.Id.String())})
 	}
 	if volume.CreateFrom.Snapshot != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeSnapshot, "snapshot_id", types.StringValue(volume.CreateFrom.Snapshot.Id.String())})
+		origins = append(origins, volumeOrigin{volumeSourceTypeSnapshot, "snapshot", types.StringValue(volume.CreateFrom.Snapshot.Id.String())})
 	}
 	if volume.CreateFrom.Backup != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeBackup, "backup_id", types.StringValue(volume.CreateFrom.Backup.Id.String())})
+		origins = append(origins, volumeOrigin{volumeSourceTypeBackup, "backup", types.StringValue(volume.CreateFrom.Backup.Id.String())})
 	}
 	return origins
 }
 
-func priorVolumeSourceID(prior VolumeCreateFromModel, sourceType string) (string, types.String, bool) {
+func priorVolumeSourceID(prior volumeSource, sourceType string) (string, types.String, bool) {
 	switch sourceType {
-	case volumeSourceTypeImage:
-		return "image", prior.Image, true
 	case volumeSourceTypeCustomImage:
-		return "custom_image_id", prior.CustomImageID, true
+		return "custom_image", prior.CustomImageID, true
 	case volumeSourceTypeSnapshot:
-		return "snapshot_id", prior.SnapshotID, true
+		return "snapshot", prior.SnapshotID, true
 	case volumeSourceTypeBackup:
-		return "backup_id", prior.BackupID, true
+		return "backup", prior.BackupID, true
 	default:
 		return "", types.StringNull(), false
 	}
 }
 
-func preserveConfiguredVolumeSource(values map[string]attr.Value, prior VolumeCreateFromModel) {
+func preserveConfiguredVolumeSource(values map[string]types.String, prior volumeSource) {
 	keep := func(attribute string, configured types.String, equal func(configured types.String, refreshed string) bool) {
-		refreshed, ok := values[attribute].(types.String)
+		refreshed, ok := values[attribute]
 		if !ok || refreshed.IsNull() || configured.IsNull() || configured.IsUnknown() {
 			return
 		}
@@ -286,9 +330,16 @@ func preserveConfiguredVolumeSource(values map[string]attr.Value, prior VolumeCr
 	}
 
 	keep("source_type", prior.SourceType, exact)
-	keep("image", prior.Image, exact)
-	keep("volume_type", prior.VolumeType, exact)
-	keep("custom_image_id", prior.CustomImageID, sameUUID)
-	keep("snapshot_id", prior.SnapshotID, sameUUID)
-	keep("backup_id", prior.BackupID, sameUUID)
+	keep("custom_image", prior.CustomImageID, sameUUID)
+	keep("snapshot", prior.SnapshotID, sameUUID)
+	keep("backup", prior.BackupID, sameUUID)
+}
+
+// preservedUUID keeps the configured spelling of id, such as upper case or
+// braces, when it names the same object, and the backend's otherwise.
+func preservedUUID(configured types.String, id core.UUID) types.String {
+	if compare.SameUUID(configured, id) {
+		return configured
+	}
+	return types.StringValue(id.String())
 }

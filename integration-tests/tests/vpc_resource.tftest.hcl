@@ -34,7 +34,7 @@ run "createVpc_nameDescriptionCidrAndRegionConfigured_resourceAndDataSourceState
       viettelcloud_vpc.vpc.name == "tf-test-vpc-before" &&
       data.viettelcloud_vpc.vpc.name == "tf-test-vpc-before" &&
       viettelcloud_vpc.vpc.cidr == "10.60.0.0/16" &&
-      viettelcloud_vpc.vpc.region == "  vn-central-1  " &&
+      viettelcloud_vpc.vpc.region.name == "  vn-central-1  " &&
       length(viettelcloud_vpc.vpc.id) > 0
     )
     error_message = "VPC was not created with the expected values."

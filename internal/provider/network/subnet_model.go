@@ -5,8 +5,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 type SubnetModel struct {
@@ -14,7 +16,6 @@ type SubnetModel struct {
 	Name        types.String `tfsdk:"name"`
 	Description types.String `tfsdk:"description"`
 	CIDR        types.String `tfsdk:"cidr"`
-	VPCID       types.String `tfsdk:"vpc_id"`
 	VPCName     types.String `tfsdk:"vpc_name"`
 	Region      types.String `tfsdk:"region"`
 	DisplayName types.String `tfsdk:"display_name"`
@@ -22,12 +23,16 @@ type SubnetModel struct {
 	UpdatedAt   types.String `tfsdk:"updated_at"`
 }
 
+// SubnetResourceModel references its VPC as an object, while the data source
+// keeps the VPC ID as a plain lookup argument and result.
 type SubnetResourceModel struct {
 	SubnetModel
+	VPC types.Object `tfsdk:"vpc"`
 }
 
 type SubnetDataSourceModel struct {
 	SubnetModel
+	VPCID types.String `tfsdk:"vpc_id"`
 }
 
 func populateSubnetModel(subnet *networksdk.SubnetSchema, m *SubnetModel) {
@@ -38,7 +43,6 @@ func populateSubnetModel(subnet *networksdk.SubnetSchema, m *SubnetModel) {
 	m.ID = types.StringValue(subnet.Id.String())
 	m.Name = types.StringValue(subnet.Name)
 	m.CIDR = types.StringValue(subnet.Cidr)
-	m.VPCID = types.StringValue(subnet.Vpc.Id.String())
 	m.VPCName = types.StringValue(subnet.Vpc.Name)
 	m.Region = types.StringValue(subnet.Region.Name)
 	m.DisplayName = types.StringValue(subnet.DisplayName)
@@ -54,19 +58,15 @@ func populateSubnetResourceState(subnet *networksdk.SubnetSchema, state *SubnetR
 	}
 
 	originalName := state.Name
-	originalVPCID := state.VPCID
 	populateSubnetModel(subnet, &state.SubnetModel)
 
 	if !originalName.IsNull() && !originalName.IsUnknown() && strings.TrimSpace(originalName.ValueString()) == subnet.Name {
 		state.Name = originalName
 	}
-	// Keep the original representation only when its parsed UUID still
-	// identifies the VPC returned by the backend.
-	if !originalVPCID.IsNull() && !originalVPCID.IsUnknown() {
-		parsedVPCID, err := core.ParseUUID(originalVPCID.ValueString())
-		if err == nil && parsedVPCID == subnet.Vpc.Id {
-			state.VPCID = originalVPCID
-		}
+	// Keep the original reference only when its parsed UUID still identifies
+	// the VPC returned by the backend.
+	if !compare.SameUUID(reference.Get(state.VPC, reference.ID), subnet.Vpc.Id) {
+		state.VPC = reference.Value(reference.ID, types.StringValue(subnet.Vpc.Id.String()))
 	}
 }
 
@@ -76,4 +76,5 @@ func populateSubnetDataSourceState(subnet *networksdk.SubnetSchema, state *Subne
 	}
 
 	populateSubnetModel(subnet, &state.SubnetModel)
+	state.VPCID = types.StringValue(subnet.Vpc.Id.String())
 }

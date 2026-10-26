@@ -4,11 +4,11 @@
 # The network setup runs before the server chains so teardown destroys the VPC
 # after every chain releases its subnets.
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -31,7 +31,7 @@ variable "region" {
 resource "viettelcloud_vpc" "shared" {
   name   = var.name
   cidr   = var.cidr
-  region = var.region
+  region = { name = var.region }
 }
 
 output "vpc_id" {

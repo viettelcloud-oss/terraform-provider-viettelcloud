@@ -16,14 +16,17 @@ type ImageLister interface {
 }
 
 type ImageFilter struct {
-	ID     *core.UUID
-	Name   *string
-	Status *[]serversdk.ImageStatus
-	State  *[]serversdk.ImageState
+	ID      *core.UUID
+	Name    *string
+	OS      *string
+	Version *string
+	Type    *serversdk.ImageType
+	Status  *[]serversdk.ImageStatus
+	State   *[]serversdk.ImageState
 }
 
 func (f ImageFilter) String() string {
-	return finder.Criteria(finder.Part("id", f.ID), finder.Text("name", f.Name), finder.Part("status", f.Status), finder.Part("state", f.State))
+	return finder.Criteria(finder.Part("id", f.ID), finder.Text("name", f.Name), finder.Text("os", f.OS), finder.Text("version", f.Version), finder.Text("type", (*string)(f.Type)), finder.Part("status", f.Status), finder.Part("state", f.State))
 }
 
 // matches reports whether the image satisfies every criterion the filter can
@@ -36,6 +39,15 @@ func (f ImageFilter) matches(image *serversdk.ImageSchema) bool {
 	if name := finder.Trim(f.Name); name != "" && image.Name != name {
 		return false
 	}
+	if os := finder.Trim(f.OS); os != "" && (image.Os == nil || *image.Os != os) {
+		return false
+	}
+	if version := finder.Trim(f.Version); version != "" && (image.Version == nil || *image.Version != version) {
+		return false
+	}
+	if imageType := finder.Trim((*string)(f.Type)); imageType != "" && (image.Type == nil || string(*image.Type) != imageType) {
+		return false
+	}
 	return true
 }
 
@@ -43,6 +55,12 @@ func (f ImageFilter) params(projectID core.UUID) serversdk.ListImagesParams {
 	params := serversdk.ListImagesParams{ProjectID: projectID, Id: f.ID, Status: f.Status, State: f.State}
 	if name := finder.Trim(f.Name); name != "" {
 		params.Name = &name
+	}
+	if os := finder.Trim(f.OS); os != "" {
+		params.Os = &os
+	}
+	if imageType := finder.Trim((*string)(f.Type)); imageType != "" {
+		params.Type = new(serversdk.ImageType(imageType))
 	}
 	return params
 }
@@ -73,5 +91,5 @@ func (f *ImageFinder) Resolve(ctx context.Context, filter ImageFilter) (serversd
 }
 
 func imageSummary(image serversdk.ImageSchema) string {
-	return fmt.Sprintf("id=%s (name=%q)", image.Id, image.Name)
+	return fmt.Sprintf("id=%s (name=%q, os=%q, version=%q, type=%q)", image.Id, image.Name, finder.Trim(image.Os), finder.Trim(image.Version), finder.Trim((*string)(image.Type)))
 }

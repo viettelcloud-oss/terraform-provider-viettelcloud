@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
+
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -21,6 +23,8 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var securityGroupResourceTestUUID = core.UUID{1}
@@ -37,7 +41,7 @@ func TestSecurityGroupModelsMatchSchemas(t *testing.T) {
 	var resourceSchema resource.SchemaResponse
 	(&SecurityGroupResource{}).Schema(context.Background(), resource.SchemaRequest{}, &resourceSchema)
 	plan := tfsdk.Plan{Schema: resourceSchema.Schema}
-	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -58,9 +62,8 @@ func TestSecurityGroupSchemaMutability(t *testing.T) {
 		t.Fatalf("description must be optional, computed, and updatable in place, got %#v", response.Schema.Attributes["description"])
 	}
 
-	region, ok := response.Schema.Attributes["region"].(schema.StringAttribute)
-	if !ok || !region.Required || region.Computed || len(region.PlanModifiers) != 1 {
-		t.Fatalf("region must be required and create-only, got %#v", response.Schema.Attributes["region"])
+	if region := requiredReferenceAttribute(t, response.Schema, "region", reference.Name); len(region.PlanModifiers) != 1 {
+		t.Fatalf("region must be create-only, got %#v", region.PlanModifiers)
 	}
 
 	for _, attributeName := range []string{"id", "project_id", "created_at"} {
@@ -90,9 +93,9 @@ func TestBuildSecurityGroupCreateBodyResolvesRegionName(t *testing.T) {
 	body, diags := buildSecurityGroupCreateBody(context.Background(), SecurityGroupResourceModel{
 		SecurityGroupModel: SecurityGroupModel{
 			Name:        types.StringValue("web"),
-			Region:      types.StringValue("vn-central"),
 			Description: types.StringValue("Managed by Terraform"),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		if filter.Name == nil || *filter.Name != "vn-central" {
 			t.Fatalf("unexpected region filter %#v", filter.Name)
@@ -134,9 +137,9 @@ func TestBuildSecurityGroupCreateBodyDescriptionPresence(t *testing.T) {
 				SecurityGroupResourceModel{
 					SecurityGroupModel: SecurityGroupModel{
 						Name:        types.StringValue("web"),
-						Region:      types.StringValue("vn-central"),
 						Description: test.description,
 					},
+					Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 				},
 				func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 					return projectsdk.ProjectRegionSchema{
@@ -167,22 +170,22 @@ func TestBuildSecurityGroupCreateBodyRejectsMissingValues(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		plan   SecurityGroupModel
+		plan   SecurityGroupResourceModel
 		expect string
 	}{
 		{
 			name:   "blank name",
-			plan:   SecurityGroupModel{Name: types.StringValue(" "), Region: types.StringValue("vn-central")},
+			plan:   securityGroupCreatePlan(types.StringValue(" "), types.StringValue("vn-central")),
 			expect: "Missing name",
 		},
 		{
 			name:   "unknown name",
-			plan:   SecurityGroupModel{Name: types.StringUnknown(), Region: types.StringValue("vn-central")},
+			plan:   securityGroupCreatePlan(types.StringUnknown(), types.StringValue("vn-central")),
 			expect: "Missing name",
 		},
 		{
 			name:   "blank region",
-			plan:   SecurityGroupModel{Name: types.StringValue("web"), Region: types.StringValue(" ")},
+			plan:   securityGroupCreatePlan(types.StringValue("web"), types.StringValue(" ")),
 			expect: "Missing region",
 		},
 	}
@@ -193,7 +196,7 @@ func TestBuildSecurityGroupCreateBodyRejectsMissingValues(t *testing.T) {
 
 			_, diags := buildSecurityGroupCreateBody(
 				context.Background(),
-				SecurityGroupResourceModel{SecurityGroupModel: test.plan},
+				test.plan,
 				resolveUnexpected,
 			)
 			if !diags.HasError() || diags.Errors()[0].Summary() != test.expect {
@@ -205,10 +208,12 @@ func TestBuildSecurityGroupCreateBodyRejectsMissingValues(t *testing.T) {
 	expected := errors.New("region not found")
 	_, diags := buildSecurityGroupCreateBody(
 		context.Background(),
-		SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
-			Name:   types.StringValue("web"),
-			Region: types.StringValue("vn-central"),
-		}},
+		SecurityGroupResourceModel{
+			SecurityGroupModel: SecurityGroupModel{
+				Name: types.StringValue("web"),
+			},
+			Region: reference.Value(reference.Name, types.StringValue("vn-central")),
+		},
 		func(context.Context, projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 			return projectsdk.ProjectRegionSchema{}, expected
 		},
@@ -244,7 +249,7 @@ func TestPopulateSecurityGroupState(t *testing.T) {
 	}
 	if state.Name.ValueString() != "web" || state.DisplayName.ValueString() != "web (display)" ||
 		state.Description.ValueString() != description || !state.IsDefault.ValueBool() ||
-		state.Region.ValueString() != "vn-central" ||
+		reference.Get(state.Region, reference.Name).ValueString() != "vn-central" ||
 		state.RegionID.ValueString() != (core.UUID{5}).String() ||
 		state.ProjectID.ValueString() != (core.UUID{4}).String() ||
 		state.CreatedAt.ValueString() != created.Format(time.RFC3339) ||
@@ -278,22 +283,26 @@ func TestPopulateSecurityGroupResourceStateKeepsConfiguredValues(t *testing.T) {
 		Region: networksdk.NestedRegionSchema{Id: securityGroupResourceTestUUID, Name: "vn-central"},
 	}
 
-	state := SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
-		Name:   types.StringValue(" web "),
-		Region: types.StringValue(" vn-central "),
-	}}
+	state := SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{
+			Name: types.StringValue(" web "),
+		},
+		Region: reference.Value(reference.Name, types.StringValue(" vn-central ")),
+	}
 	populateSecurityGroupResourceState(sg, &state)
-	if state.Name.ValueString() != " web " || state.Region.ValueString() != " vn-central " {
+	if state.Name.ValueString() != " web " || reference.Get(state.Region, reference.Name).ValueString() != " vn-central " {
 		t.Fatalf("expected the configured representation to be preserved, got %#v", state)
 	}
 
 	// A genuinely different backend value must surface as drift.
-	state = SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
-		Name:   types.StringValue("renamed"),
-		Region: types.StringValue("vn-north"),
-	}}
+	state = SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{
+			Name: types.StringValue("renamed"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-north")),
+	}
 	populateSecurityGroupResourceState(sg, &state)
-	if state.Name.ValueString() != "web" || state.Region.ValueString() != "vn-central" {
+	if state.Name.ValueString() != "web" || reference.Get(state.Region, reference.Name).ValueString() != "vn-central" {
 		t.Fatalf("expected backend drift to be reported, got %#v", state)
 	}
 }
@@ -356,12 +365,12 @@ func TestSecurityGroupCreateSendsResolvedRegionAndMapsResponse(t *testing.T) {
 			DisplayName: types.StringUnknown(),
 			Description: types.StringValue("Managed by Terraform"),
 			IsDefault:   types.BoolUnknown(),
-			Region:      types.StringValue("vn-central"),
 			RegionID:    types.StringUnknown(),
 			ProjectID:   types.StringUnknown(),
 			CreatedAt:   types.StringUnknown(),
 			UpdatedAt:   types.StringUnknown(),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
@@ -378,7 +387,7 @@ func TestSecurityGroupCreateSendsResolvedRegionAndMapsResponse(t *testing.T) {
 	}
 	if state.ID.ValueString() != sgID.String() || state.Name.ValueString() != "web" ||
 		state.DisplayName.ValueString() != "web" || state.IsDefault.ValueBool() ||
-		state.Region.ValueString() != "vn-central" || state.RegionID.ValueString() != regionID.String() ||
+		reference.Get(state.Region, reference.Name).ValueString() != "vn-central" || state.RegionID.ValueString() != regionID.String() ||
 		state.ProjectID.ValueString() != projectID.String() {
 		t.Fatalf("unexpected create state: %#v", state)
 	}
@@ -446,6 +455,7 @@ func TestSecurityGroupReadRejectsInvalidStateID(t *testing.T) {
 	state := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := state.Set(context.Background(), &SecurityGroupResourceModel{
 		SecurityGroupModel: SecurityGroupModel{ID: types.StringValue("not-a-uuid")},
+		Region:             types.ObjectNull(reference.AttributeTypes(reference.Name)),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -601,33 +611,37 @@ func TestSecurityGroupUpdateSendsPatchAndMapsResponse(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	state := tfsdk.State{Schema: schemaResponse.Schema}
-	if diags := state.Set(context.Background(), &SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
-		ID:          types.StringValue(sgID.String()),
-		Name:        types.StringValue("web"),
-		DisplayName: types.StringValue("web"),
-		Description: types.StringValue("Managed by Terraform"),
-		IsDefault:   types.BoolValue(false),
-		Region:      types.StringValue("vn-central"),
-		RegionID:    types.StringValue(regionID.String()),
-		ProjectID:   types.StringValue(projectID.String()),
-		CreatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
-		UpdatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
-	}}); diags.HasError() {
+	if diags := state.Set(context.Background(), &SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{
+			ID:          types.StringValue(sgID.String()),
+			Name:        types.StringValue("web"),
+			DisplayName: types.StringValue("web"),
+			Description: types.StringValue("Managed by Terraform"),
+			IsDefault:   types.BoolValue(false),
+			RegionID:    types.StringValue(regionID.String()),
+			ProjectID:   types.StringValue(projectID.String()),
+			CreatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
+			UpdatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
+	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
-	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
-		ID:          types.StringValue(sgID.String()),
-		Name:        types.StringValue("renamed"),
-		DisplayName: types.StringUnknown(),
-		Description: types.StringValue("Managed by Terraform"),
-		IsDefault:   types.BoolUnknown(),
-		Region:      types.StringValue("vn-central"),
-		RegionID:    types.StringUnknown(),
-		ProjectID:   types.StringValue(projectID.String()),
-		CreatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
-		UpdatedAt:   types.StringUnknown(),
-	}}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{
+			ID:          types.StringValue(sgID.String()),
+			Name:        types.StringValue("renamed"),
+			DisplayName: types.StringUnknown(),
+			Description: types.StringValue("Managed by Terraform"),
+			IsDefault:   types.BoolUnknown(),
+			RegionID:    types.StringUnknown(),
+			ProjectID:   types.StringValue(projectID.String()),
+			CreatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
+			UpdatedAt:   types.StringUnknown(),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
+	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 
@@ -675,26 +689,25 @@ func TestSecurityGroupUpdateWithoutChangesReadsInstead(t *testing.T) {
 
 	var schemaResponse resource.SchemaResponse
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
-	unchanged := SecurityGroupModel{
+	unchanged := SecurityGroupResourceModel{SecurityGroupModel: SecurityGroupModel{
 		ID:          types.StringValue(sgID.String()),
 		Name:        types.StringValue("web"),
 		DisplayName: types.StringValue("web"),
 		Description: types.StringValue("Managed by Terraform"),
 		IsDefault:   types.BoolValue(false),
-		Region:      types.StringValue("vn-central"),
 		RegionID:    types.StringValue(regionID.String()),
 		ProjectID:   types.StringValue(projectID.String()),
 		CreatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
 		UpdatedAt:   types.StringValue("2026-01-02T03:04:05Z"),
-	}
+	}, Region: reference.Value(reference.Name, types.StringValue("vn-central"))}
 	state := tfsdk.State{Schema: schemaResponse.Schema}
-	if diags := state.Set(context.Background(), &SecurityGroupResourceModel{SecurityGroupModel: unchanged}); diags.HasError() {
+	if diags := state.Set(context.Background(), &unchanged); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
 	planned := unchanged
 	planned.UpdatedAt = types.StringUnknown()
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
-	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{SecurityGroupModel: planned}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &planned); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
 
@@ -775,7 +788,7 @@ func TestSecurityGroupImportState(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	response := resource.ImportStateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
-	if diags := response.State.Set(context.Background(), &SecurityGroupResourceModel{}); diags.HasError() {
+	if diags := response.State.Set(context.Background(), &SecurityGroupResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 
@@ -797,6 +810,28 @@ func TestSecurityGroupImportState(t *testing.T) {
 	}
 }
 
+func TestSecurityGroupReadAfterImportFillsRegionReference(t *testing.T) {
+	t.Parallel()
+
+	sg := &networksdk.SecurityGroupSchema{
+		Id:      securityGroupResourceTestUUID,
+		Name:    "web",
+		Project: networksdk.NestedProjectSchema{Id: core.UUID{4}, Name: "proj", Slug: "proj"},
+		Region:  networksdk.NestedRegionSchema{Id: core.UUID{5}, Name: "vn-central"},
+	}
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &SecurityGroupResource{client: client, projectID: securityGroupResourceTestUUID}
+	}, sg.Id.String(), sg)
+
+	var region types.Object
+	if diags := state.GetAttribute(context.Background(), path.Root("region"), &region); diags.HasError() {
+		t.Fatalf("read region: %v", diags)
+	}
+	if want := reference.Value(reference.Name, types.StringValue("vn-central")); !region.Equal(want) {
+		t.Fatalf("imported region = %s, want %s", region, want)
+	}
+}
+
 func securityGroupResourceTestState(t *testing.T, resourceUnderTest *SecurityGroupResource) tfsdk.State {
 	t.Helper()
 
@@ -805,10 +840,10 @@ func securityGroupResourceTestState(t *testing.T, resourceUnderTest *SecurityGro
 	state := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := state.Set(context.Background(), &SecurityGroupResourceModel{
 		SecurityGroupModel: SecurityGroupModel{
-			ID:     types.StringValue(securityGroupResourceTestUUID.String()),
-			Name:   types.StringValue("web"),
-			Region: types.StringValue("vn-central"),
+			ID:   types.StringValue(securityGroupResourceTestUUID.String()),
+			Name: types.StringValue("web"),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -845,4 +880,11 @@ func securityGroupResponseJSON(sgID, projectID, regionID core.UUID) string {
 		"created_at": "2026-01-02T03:04:05Z",
 		"updated_at": "2026-01-02T03:04:05Z"
 	}`, sgID.String(), projectID.String(), regionID.String())
+}
+
+func securityGroupCreatePlan(name, region types.String) SecurityGroupResourceModel {
+	return SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{Name: name},
+		Region:             reference.Value(reference.Name, region),
+	}
 }

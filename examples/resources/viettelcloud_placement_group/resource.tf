@@ -14,7 +14,9 @@ resource "viettelcloud_placement_group" "example" {
   name        = "my-placement-group"
   description = "Example placement group"
   policy      = "affinity"
-  region      = var.region
+  region = {
+    name = var.region
+  }
 }
 
 # Changing region forces a new Placement Group.
@@ -22,5 +24,7 @@ resource "viettelcloud_placement_group" "replacement" {
   name        = "my-placement-group-replacement"
   description = "Replacement placement group after region change"
   policy      = "affinity"
-  region      = var.replacement_region
+  region = {
+    name = var.replacement_region
+  }
 }

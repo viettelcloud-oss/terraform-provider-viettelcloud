@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -20,6 +21,7 @@ import (
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -68,12 +70,13 @@ func (r *VPCResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				},
 				Description: "IPv4 network CIDR, e.g. 10.0.0.0/16.",
 			},
-			"region": schema.StringAttribute{
-				Required: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+			"region": schema.SingleNestedAttribute{
+				Required:    true,
+				Description: "Project region where the VPC is created.",
+				Attributes:  reference.Attributes(reference.Name, "Region name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
-				Description: "Project region name where the VPC is created.",
 			},
 			"display_name": schema.StringAttribute{
 				Computed:    true,
@@ -229,22 +232,14 @@ func buildVPCCreateBody(
 	resolveRegion projectlookup.RegionResolveFunc,
 ) (networksdk.VPCCreateSchema, diag.Diagnostics) {
 	var body networksdk.VPCCreateSchema
-	var diags diag.Diagnostics
-	if plan.Region.IsNull() || plan.Region.IsUnknown() || strings.TrimSpace(plan.Region.ValueString()) == "" {
-		diags.AddError("Missing region", "region must be configured and known.")
-		return body, diags
-	}
-
-	name := plan.Region.ValueString()
-	region, err := resolveRegion(ctx, projectlookup.RegionFilter{Name: &name})
-	if err != nil {
-		diags.AddError("Unable to resolve region", "region: "+err.Error())
+	regionID, diags := resolveRegionReference(ctx, plan.Region, resolveRegion)
+	if diags.HasError() {
 		return body, diags
 	}
 
 	body.Name = strings.TrimSpace(plan.Name.ValueString())
 	body.Cidr = plan.CIDR.ValueString()
-	body.RegionId = region.Region.Id
+	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
 		description := plan.Description.ValueString()
 		body.Description = &description

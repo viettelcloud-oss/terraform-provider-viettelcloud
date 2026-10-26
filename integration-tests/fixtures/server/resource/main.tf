@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -44,6 +44,12 @@ variable "subnet_index" {
 # Which subnets the server allocates a private IP from: first, second, or both.
 # The second subnet can outlive its attachment so detach and subnet deletion
 # happen in separate applies.
+# Plan-only omission coverage keeps all existing references and attachments.
+variable "omit_preserved_references" {
+  type    = bool
+  default = false
+}
+
 variable "private_ip_mode" {
   type    = string
   default = "first"
@@ -88,7 +94,7 @@ variable "image" {
 }
 
 variable "volume_type" {
-  type = string
+  type = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
 }
 
 # Left unset so the backend allocates the boot volume IOPS.
@@ -128,6 +134,21 @@ variable "flavor_vcpus" {
 variable "flavor_ram" {
   type    = number
   default = 4
+}
+
+variable "include_data_volume" {
+  type    = bool
+  default = true
+}
+
+variable "data_volume_id" {
+  type    = string
+  default = null
+}
+
+variable "second_data_volume_id" {
+  type    = string
+  default = null
 }
 
 variable "data_volume_size" {
@@ -186,17 +207,17 @@ variable "security_group_ids" {
 }
 
 resource "viettelcloud_subnet" "subnet" {
-  name   = "${var.name_prefix}-subnet"
-  cidr   = "${var.vpc_cidr_prefix}.${var.subnet_index}.0/24"
-  vpc_id = var.vpc_id
+  name = "${var.name_prefix}-subnet"
+  cidr = "${var.vpc_cidr_prefix}.${var.subnet_index}.0/24"
+  vpc  = { id = var.vpc_id }
 }
 
 resource "viettelcloud_subnet" "second" {
   count = local.needs_second_subnet ? 1 : 0
 
-  name   = "${var.name_prefix}-subnet-second"
-  cidr   = "${var.vpc_cidr_prefix}.${var.subnet_index + 1}.0/24"
-  vpc_id = var.vpc_id
+  name = "${var.name_prefix}-subnet-second"
+  cidr = "${var.vpc_cidr_prefix}.${var.subnet_index + 1}.0/24"
+  vpc  = { id = var.vpc_id }
 }
 
 # A private IP the practitioner owns. The server may attach it by ID, and
@@ -204,7 +225,7 @@ resource "viettelcloud_subnet" "second" {
 resource "viettelcloud_private_ip" "managed" {
   count = var.create_managed_private_ip ? 1 : 0
 
-  subnet_id   = viettelcloud_subnet.subnet.id
+  subnet      = { id = viettelcloud_subnet.subnet.id }
   description = "Private IP managed independently and attached to the server by ID"
 }
 
@@ -217,17 +238,15 @@ locals {
   )
 
   subnet_private_ips = [for subnet_id in local.subnet_ids : {
-    kind        = "subnet"
-    id          = null
-    subnet_id   = subnet_id
-    subnet_cidr = null
+    kind   = "subnet"
+    id     = null
+    subnet = { id = subnet_id, cidr = null }
   }]
 
   managed_private_ips = var.attach_managed_private_ip ? [{
     kind                  = "ip"
     id                    = viettelcloud_private_ip.managed[0].id
-    subnet_id             = null
-    subnet_cidr           = null
+    subnet                = null
     delete_on_termination = false
   }] : []
 
@@ -247,46 +266,48 @@ locals {
 }
 
 resource "viettelcloud_server" "server" {
-  name               = var.server_name == null ? "${var.name_prefix}-server" : var.server_name
-  description        = var.server_description
-  zone               = var.zone
-  bandwidth          = var.bandwidth
-  power_state        = var.power_state
-  user_data          = var.user_data
-  key_pair_id        = var.key_pair_id
-  placement_group_id = var.placement_group_id
-  security_group_ids = var.security_group_ids
+  name            = var.server_name == null ? "${var.name_prefix}-server" : var.server_name
+  description     = var.server_description
+  zone            = var.omit_preserved_references ? null : { name = var.zone }
+  bandwidth       = var.bandwidth
+  power_state     = var.power_state
+  user_data       = var.user_data
+  key_pair        = var.omit_preserved_references || var.key_pair_id == null ? null : { id = var.key_pair_id }
+  placement_group = var.omit_preserved_references || var.placement_group_id == null ? null : { id = var.placement_group_id }
+  security_groups = var.omit_preserved_references || var.security_group_ids == null ? null : [for id in var.security_group_ids : { id = id }]
 
   flavor = local.flavor
 
   boot = {
     boot_type             = "image"
-    image                 = var.image
-    volume_type           = var.volume_type
+    image                 = var.image_selector != null ? var.image_selector : { name = var.image }
+    volume_type           = var.volume_type_selector != null ? var.volume_type_selector : var.volume_type
     volume_size           = var.boot_volume_size
     iops                  = var.boot_iops
     delete_on_termination = var.boot_delete_on_termination
   }
 
   data_volumes = concat(
-    [{
-      volume_type           = var.volume_type
+    var.include_data_volume ? [{
+      id                    = var.data_volume_id
+      volume_type           = var.data_volume_type_selector != null ? var.data_volume_type_selector : (var.volume_type_selector != null ? var.volume_type_selector : var.volume_type)
       volume_size           = var.data_volume_size
       delete_on_termination = var.data_volume_delete_on_termination
-    }],
+    }] : [],
     var.second_data_volume_size == null ? [] : [{
-      volume_type           = var.volume_type
+      id                    = var.second_data_volume_id
+      volume_type           = var.data_volume_type_selector != null ? var.data_volume_type_selector : (var.volume_type_selector != null ? var.volume_type_selector : var.volume_type)
       volume_size           = var.second_data_volume_size
       delete_on_termination = var.data_volume_delete_on_termination
     }],
   )
 
-  private_ips = concat(
+  private_ips = var.omit_preserved_references ? null : concat(
     var.reverse_private_ips ? reverse(local.subnet_private_ips) : local.subnet_private_ips,
     local.managed_private_ips,
   )
 
-  elastic_ips = [for index in range(var.elastic_ip_count) : {
+  elastic_ips = var.omit_preserved_references ? null : [for index in range(var.elastic_ip_count) : {
     kind        = "new"
     enable_ipv4 = true
   }]
@@ -297,7 +318,7 @@ output "server_id" {
 }
 
 output "key_pair_id" {
-  value = viettelcloud_server.server.key_pair_id
+  value = try(viettelcloud_server.server.key_pair.id, null)
 }
 
 output "key_pair_name" {
@@ -305,7 +326,7 @@ output "key_pair_name" {
 }
 
 output "placement_group_id" {
-  value = viettelcloud_server.server.placement_group_id
+  value = try(viettelcloud_server.server.placement_group.id, null)
 }
 
 output "placement_group_name" {
@@ -313,7 +334,7 @@ output "placement_group_name" {
 }
 
 output "security_group_ids" {
-  value = viettelcloud_server.server.security_group_ids
+  value = toset(viettelcloud_server.server.security_groups[*].id)
 }
 
 output "private_ip_id" {
@@ -341,4 +362,43 @@ output "data_volume_ids" {
 # element kept the volume it was created with.
 output "data_volume_element_ids" {
   value = viettelcloud_server.server.data_volumes[*].id
+}
+
+output "server_references" {
+  value = {
+    zone            = viettelcloud_server.server.zone
+    key_pair        = viettelcloud_server.server.key_pair
+    placement_group = viettelcloud_server.server.placement_group
+    security_groups = viettelcloud_server.server.security_groups
+    private_ips     = viettelcloud_server.server.private_ips
+    elastic_ips     = viettelcloud_server.server.elastic_ips
+    status          = viettelcloud_server.server.status
+  }
+}
+
+variable "image_selector" {
+  type    = object({ name = optional(string), os = optional(string), version = optional(string), type = optional(string) })
+  default = null
+}
+
+variable "volume_type_selector" {
+  type    = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
+  default = null
+}
+
+variable "data_volume_type_selector" {
+  type    = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
+  default = null
+}
+
+output "server_created_at" {
+  value = viettelcloud_server.server.created_at
+}
+
+output "data_volume_selectors" {
+  value = viettelcloud_server.server.data_volumes[*].volume_type
+}
+
+output "data_volume_state" {
+  value = viettelcloud_server.server.data_volumes
 }

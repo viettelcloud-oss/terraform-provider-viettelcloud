@@ -11,8 +11,8 @@ provider "viettelcloud" {
 }
 
 variables {
-  volume_type = "Ceph_HDD_1A_10K"
   zone        = "vn-central-1a"
+  volume_type = { name = "hdd_st1", encryption_key_size = "0", multiattach = false }
 }
 
 run "querySupportedFilters_isolatedVolumeFleet_matchingObjectsAndConfiguredValuesReturned" {
@@ -56,7 +56,7 @@ run "querySupportedFilters_isolatedVolumeFleet_matchingObjectsAndConfiguredValue
           data.viettelcloud_volume.by_id[key].status == volume.status &&
           data.viettelcloud_volume.by_id[key].bootable == volume.bootable &&
           data.viettelcloud_volume.by_id[key].encrypted == volume.encrypted &&
-          data.viettelcloud_volume.by_id[key].zone == volume.zone &&
+          data.viettelcloud_volume.by_id[key].zone == volume.zone.name &&
           data.viettelcloud_volume.by_id[key].zone_id == volume.zone_id &&
           data.viettelcloud_volume.by_id[key].volume_type == volume.volume_type &&
           data.viettelcloud_volume.by_id[key].iops == volume.iops &&
@@ -101,7 +101,7 @@ run "querySupportedFilters_isolatedVolumeFleet_matchingObjectsAndConfiguredValue
       data.viettelcloud_volume.by_all_filters.id == upper(viettelcloud_volume.volume["target"].id) &&
       data.viettelcloud_volume.by_all_filters.name == " ${viettelcloud_volume.volume["target"].name} " &&
       data.viettelcloud_volume.by_all_filters.status == " ${viettelcloud_volume.volume["target"].status} " &&
-      data.viettelcloud_volume.by_all_filters.zone == " ${viettelcloud_volume.volume["target"].zone} "
+      data.viettelcloud_volume.by_all_filters.zone == " ${viettelcloud_volume.volume["target"].zone.name} "
     )
     error_message = "Combined lookup did not select the target or preserve equivalent configured representations."
   }

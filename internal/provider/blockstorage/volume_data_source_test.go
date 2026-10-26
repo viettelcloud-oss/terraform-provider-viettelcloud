@@ -81,8 +81,8 @@ func TestVolumeDataSourceDirectIDAndFilteredPaths(t *testing.T) {
 	}
 
 	volume, diags = d.getVolume(context.Background(), VolumeDataSourceModel{VolumeModel: VolumeModel{
-		Name: types.StringValue(" data "), Zone: types.StringValue(" zone-a "),
-	}})
+		Name: types.StringValue(" data "),
+	}, Zone: types.StringValue(" zone-a ")})
 	if diags.HasError() || volume == nil || listCalls != 1 || getCalls != 2 {
 		t.Fatalf("unexpected filtered result: volume=%#v list=%d get=%d diags=%v", volume, listCalls, getCalls, diags)
 	}
@@ -182,8 +182,8 @@ func TestPreserveVolumeConfiguredValues(t *testing.T) {
 	t.Parallel()
 	volume := sampleVolumeDetail()
 	config := VolumeDataSourceModel{VolumeModel: VolumeModel{
-		ID: volumeIDUpper(volume.Id), Name: types.StringValue("  data  "), Status: types.StringValue(" available "), Zone: types.StringValue(" zone-a "),
-	}}
+		ID: volumeIDUpper(volume.Id), Name: types.StringValue("  data  "), Status: types.StringValue(" available "),
+	}, Zone: types.StringValue(" zone-a ")}
 	var state VolumeDataSourceModel
 	populateVolumeDataSourceState(volume, &state)
 	preserveVolumeConfiguredValues(volume, &config, &state)

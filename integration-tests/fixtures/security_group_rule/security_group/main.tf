@@ -3,11 +3,11 @@
 #
 # The setup run owns the group so teardown removes it after every rule chain.
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -22,7 +22,7 @@ variable "region" {
 
 resource "viettelcloud_security_group" "shared" {
   name   = var.name
-  region = var.region
+  region = { name = var.region }
 }
 
 output "security_group_id" {

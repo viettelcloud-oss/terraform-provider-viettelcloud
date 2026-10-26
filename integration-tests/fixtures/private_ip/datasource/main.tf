@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -35,25 +35,25 @@ variable "private_ip_address" {
 resource "viettelcloud_vpc" "test" {
   name   = var.vpc_name
   cidr   = var.vpc_cidr
-  region = var.region
+  region = { name = var.region }
 }
 
 resource "viettelcloud_subnet" "test" {
-  name   = var.subnet_name
-  cidr   = var.subnet_cidr
-  vpc_id = viettelcloud_vpc.test.id
+  name = var.subnet_name
+  cidr = var.subnet_cidr
+  vpc  = { id = viettelcloud_vpc.test.id }
 }
 
 resource "viettelcloud_private_ip" "vip" {
-  subnet_id   = viettelcloud_subnet.test.id
+  subnet      = { id = viettelcloud_subnet.test.id }
   description = "Allowed VIP for Private IP data source integration tests"
 }
 
 resource "viettelcloud_private_ip" "target" {
-  subnet_id       = viettelcloud_subnet.test.id
-  description     = "Private IP for data source integration tests"
-  ip_address      = var.private_ip_address
-  allowed_vip_ids = [viettelcloud_private_ip.vip.id]
+  subnet       = { id = viettelcloud_subnet.test.id }
+  description  = "Private IP for data source integration tests"
+  ip_address   = var.private_ip_address
+  allowed_vips = [{ id = viettelcloud_private_ip.vip.id }]
 }
 
 data "viettelcloud_private_ip" "by_id" {

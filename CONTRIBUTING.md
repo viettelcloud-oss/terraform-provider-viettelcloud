@@ -22,8 +22,8 @@
 
 - [Provider Design Decisions](#provider-design-decisions) — attribute
   configurability, plan modifiers
-- [References and Lookups](#references-and-lookups) — human-readable
-  references, the finder pattern, data-source filtering
+- [References and Lookups](#references-and-lookups) — reference objects,
+  human-readable references, the finder pattern, data-source filtering
 - [Request and Lifecycle Semantics](#request-and-lifecycle-semantics) —
   create/update bodies, [lifecycle waiters](#lifecycle-waiters)
 - [Resource Implementation Practices](#resource-implementation-practices)
@@ -40,7 +40,7 @@
 ## Prerequisites
 
 - Go >= 1.26
-- Terraform >= 1.12
+- Terraform >= 1.16
 - pre-commit (optional but recommended)
 - golangci-lint (installed via `make tools`)
 
@@ -75,6 +75,8 @@ internal/
 ├── parse/                         # Value conversion
 ├── wait/                          # Asynchronous polling
 ├── finder/                        # Shared finder mechanics
+├── reference/                     # Reference object schemas and values
+├── selector/                      # Catalog selector logic
 └── provider/
     ├── provider.go                # Configuration and registration
     ├── providerdata/              # SDK clients and project context
@@ -82,6 +84,7 @@ internal/
     │   └── lookup/                # Region, zone, and project finders
     └── <service>/
         ├── lookup/                # Finders for service-owned entities
+        ├── selector/              # Catalog selectors for service-owned entities
         ├── <entity>_model.go      # Models and response-to-state mapping
         ├── <entity>_resource.go   # Managed resource
         └── <entity>_data_source.go
@@ -102,8 +105,8 @@ may import `internal/finder`, but no other package from this repository. This
 keeps lookups independent of Terraform code and prevents import cycles.
 `make lint` enforces the rule.
 
-In a service package, alias every lookup import by service, even in a file
-that imports only one:
+In a service package, alias every lookup and selector import by service, even
+in a file that imports only one:
 
 ```go
 import (
@@ -192,7 +195,7 @@ non-standard file includes an ownership comment.
 
 Before implementing Framework-dependent logic in a resource or data source,
 check the Framework API and the helper packages under `internal/`
-(`compare`, `parse`, `wait`) for an existing solution. This
+(`compare`, `parse`, `reference`, `wait`) for an existing solution. This
 is especially important for:
 
 - checking Framework value states such as `null` and `unknown`;
@@ -205,7 +208,8 @@ when the Framework has no equivalent and the same
 service-independent behavior is needed by at least two provider entities.
 Organize helpers by purpose, one package each, and open every package with a doc
 comment saying what it owns: `compare` for normalized comparison, `parse` for
-parsing and conversion, `wait` for lifecycle polling.
+parsing and conversion, `reference` for reference objects, `wait` for
+lifecycle polling.
 Keep CRUD orchestration, API calls, service-specific request construction, and
 resource state mapping in their owning provider packages.
 
@@ -349,8 +353,40 @@ more descriptive as the distance between its declaration and use grows.
 
 | Type | Pattern | Example |
 |------|---------|---------|
-| Resource | `<provider>_<resource>` | `viettelcloud_vpc` |
-| Data source | `data.<provider>_<resource>` | `data.viettelcloud_vpc` |
+| Resource | `viettelcloud_<prefix>_<resource>` | `viettelcloud_lb_listener` |
+| Data source | `data.viettelcloud_<prefix>_<resource>` | `data.viettelcloud_lb_listener` |
+| Core resource | `viettelcloud_<resource>` | `viettelcloud_subnet` |
+
+`<prefix>` names the service and `<resource>` names the entity within it. A
+resource and its data source share one type name.
+
+- Write `<prefix>` as one lowercase token with no underscore, so the first
+  token after `viettelcloud_` always names the service. Use the product
+  acronym when the service has one, such as `vke` or `kms`. Otherwise use one
+  short word, such as `autoscaling` or `baremetal`.
+- Write `<resource>` in snake_case and spell each word out:
+  `snapshot_policy`, `node_pool`, `certificate`. Keep established acronyms such
+  as `l7` and `rrset`.
+- Always put a resource name after the prefix, even when it repeats the
+  service: `viettelcloud_lb_loadbalancer`, `viettelcloud_vke_cluster`.
+- Network, server, and block storage resources are core and take no prefix:
+  `viettelcloud_vpc`, `viettelcloud_security_group`, `viettelcloud_server`,
+  `viettelcloud_volume_snapshot`. A core resource name must not start with a
+  service prefix.
+
+| Service | Prefix | Package | Example |
+|---------|--------|---------|---------|
+| Network | Core | `internal/provider/network` | `viettelcloud_security_group_rule` |
+| Server | Core | `internal/provider/server` | `viettelcloud_placement_group` |
+| Block Storage | Core | `internal/provider/blockstorage` | `viettelcloud_volume_snapshot` |
+| Load Balancing | `lb` | `internal/provider/loadbalancer` | `viettelcloud_lb_server_group` |
+
+Add a row in the same change that adds a service's first resource. Choose the
+prefix once: renaming a type is a breaking change for every user's state.
+
+File names and Go identifiers drop the prefix, because the package already
+names the service: `viettelcloud_lb_listener` lives in
+`internal/provider/loadbalancer/listener_resource.go` as `ListenerResource`.
 
 ## Comments
 
@@ -417,6 +453,15 @@ Define whether removing configuration preserves, defaults, or clears the field,
 and test that lifecycle explicitly. For data sources, make lookup arguments
 `Required` or `Optional` and API-only results `Computed` by default.
 
+Make every descendant of an `Optional` and `Computed` nested attribute
+`Computed` too when omission preserves its prior value. Otherwise, Terraform
+can propose null for the omitted attribute and leave runtime outputs unknown
+on every plan. Enforce required inner values with a validator or in
+`ValidateConfig`. For inputs whose omission selects a default, copy the
+configured value in a plan modifier, as `preserveElasticIPState` does.
+`TestProviderSchemaOmittedNestedAttributesKeepPriorValue` enforces this rule
+for every resource.
+
 ### Common Plan Modifiers
 
 Plan modifiers shape Terraform's proposed plan; CRUD must implement the same
@@ -424,7 +469,7 @@ lifecycle contract. Use the typed package matching the attribute.
 
 | Modifier | Plan behavior | Use case |
 | --- | --- | --- |
-| `RequiresReplace()` | `state A -> plan B/null/unknown`: replace | Every change to an immutable attribute creates a new object, including VPC `cidr`, subnet `vpc_id`, or private IP `subnet_id`. |
+| `RequiresReplace()` | `state A -> plan B/null/unknown`: replace | Every change to an immutable attribute creates a new object, including VPC `cidr`, subnet `vpc`, or private IP `subnet`. |
 | `RequiresReplaceIfConfigured()` | `configured A -> configured B`: replace; `configured A -> omitted/null`: no replacement | An immutable `Optional` and `Computed` value is allocated or preserved when omitted, such as private IP `ip_address` and `mac_address`. |
 | `RequiresReplaceIf(...)` | `state A -> plan B` and predicate `true`: replace; predicate `false`: update in place | Replacement depends on provider-defined, deterministic conditions. |
 | `UseStateForUnknown()` | `state A + plan unknown -> plan A` | A computed value is guaranteed not to change during the operation, such as `id` or `created_at`. Do not use it for values that can change or must be recomputed during replacement. |
@@ -441,6 +486,46 @@ a separate file, follow [Non-standard files](#non-standard-files). Custom
 modifiers are not part of the Framework entry-point order.
 
 ## References and Lookups
+
+### Reference Objects
+
+Model every practitioner-supplied reference to another object as a nested
+object of criteria, never as a plain string. This rule applies to a single
+reference and to each element of a set of references:
+
+```hcl
+vpc             = { id = viettelcloud_vpc.example.id }
+zone            = { name = "vn-central-1a" }
+security_groups = [{ id = viettelcloud_security_group.example.id }]
+```
+
+Name the attribute after the referenced object, without an `_id` or `_name`
+suffix. Name each criterion after the attribute of the referenced object that
+it matches, such as `id`, `name`, or `cidr`.
+
+A later release can then add a criterion as a new attribute in the object.
+Existing configurations stay valid, and Terraform decodes existing state with
+the new attribute null, so the change is not breaking. A change from a plain
+string to an object breaks every configuration and every state that uses the
+attribute.
+
+Build reference schemas and values with `internal/reference`. Put plan
+modifiers on the object, not on the criterion. When a reference accepts more
+than one criterion, make each criterion `Optional` and validate that exactly
+one is configured. For an `Optional` and `Computed` reference, use
+`reference.PreservedAttributes`. Its validator requires the criterion when
+the reference is configured.
+
+Catalog selectors are the exception to `internal/reference` and to the
+exactly-one-criterion rule. The `image` and `volume_type` references of
+servers and volumes match all configured criteria together, so
+`{ os = "Ubuntu", version = "22.04" }` selects the image that matches both.
+See [Catalog Selectors](#catalog-selectors).
+
+The rule covers resource arguments. Data-source lookup arguments and computed
+outputs about a referenced object stay flat; see
+[Data Source Design and Filtering Conventions](#data-source-design-and-filtering-conventions)
+and [Computed Outputs for Referenced Resources](#computed-outputs-for-referenced-resources).
 
 ### Human-readable References and Stable Identity
 
@@ -484,11 +569,59 @@ Preserve the configured representation in state when it is semantically equal
 to a backend-normalized value. Do not suppress a difference that identifies a
 different object or hides real drift.
 
+### Catalog Selectors
+
+A catalog selector references a catalog entry, such as an image or a volume
+type, by a combination of criteria. Selector code has two layers:
+
+- `internal/selector` holds the logic that every selector shares: the schema
+  builder, criteria validation and equality, identity decisions, and refresh.
+- The service that owns the entry defines its selector in
+  `<service>/selector/<entity>.go`: the criteria schema, the lookup filter,
+  and the resolve call.
+
+Each selector records the selected catalog entry in a computed `id`. The
+provider decides rebuild, replacement, and retype from that ID only, and
+tracks catalog identity, not catalog metadata. A resource that uses a
+selector must:
+
+- call selector planning in `ModifyPlan` before any guard that requires fully
+  known configuration, so that an unrelated unknown input cannot hide the
+  replacement of an immutable selector;
+- keep the current ID when it still matches changed criteria, and otherwise
+  leave the planned ID unknown and resolve it at apply;
+- at apply, trust a known ID without a catalog lookup, and compare a newly
+  resolved ID with the current ID before a mutation;
+- record resolved IDs in state before any later step that can fail; and
+- refresh from the entry ID in the resource response without catalog
+  requests, keep the criteria when the ID matches, and reset the selector to
+  the reported name and ID when it differs.
+
+The selector `id` has three states:
+
+- A known ID is the selected entry.
+- An unknown ID is a pending selection. The plan changed the entry, and apply
+  resolves it.
+- A null ID means that the backend response does not identify the entry, for
+  example after an image leaves the catalog. Only state written before
+  selectors recorded IDs has a null ID, because refresh never replaces a
+  known ID with null.
+
+Detect a pending selection with `selector.Pending`, not by the absence of a
+known ID, so that a null ID never triggers a rebuild, replacement, or retype.
+When the fallback read of the current entry finds no identity, return an
+error that wraps `selector.ErrNoIdentity`. `selector.Decide` then keeps the
+entry while the criteria are unchanged, and the plan keeps the null ID, which
+refresh cannot contradict.
+
+Import starts with a name and ID selector, so an import configuration that
+selects the same ID by other criteria plans no change.
+
 ### Computed Outputs for Referenced Resources
 
 Represent computed information about a referenced or parent resource as flat,
-top-level attributes. For example, a subnet exposes its referenced VPC as
-`vpc_id` and `vpc_name`, not as a computed nested object. Keep these outputs
+top-level attributes. For example, a private IP exposes its referenced subnet
+as `subnet_name` and `subnet_cidr`, not as a computed nested object. Keep these outputs
 minimal—usually the stable ID and/or human-readable name needed by the child
 contract. Users who need other parent details should reference the managed
 parent directly or use its data source. Reserve nested objects for structured
@@ -779,7 +912,8 @@ func (r *<Resource>Resource) waitUntilReady(
   - Unit tests using mock HTTP responses
   - If tests need mock objects, define them in `test_helpers_test.go`
 
-- [ ] 5. Create `examples/resources/<provider>_<resource>/resource.tf`:
+- [ ] 5. Create `examples/resources/<type>/resource.tf`, where `<type>` is the
+  full type name from [Terraform Types](#terraform-types):
   - Minimal working example that `tfplugindocs` can use
 
 - [ ] 6. Register in `internal/provider/provider.go`:
@@ -816,7 +950,8 @@ Similar to a resource, but simpler (read-only):
 
 - [ ] 2. Create `internal/provider/<service>/<resource>_data_source_test.go`
 
-- [ ] 3. Create `examples/data-sources/<provider>_<resource>/data-source.tf`
+- [ ] 3. Create `examples/data-sources/<type>/data-source.tf`, where `<type>`
+  is the full type name from [Terraform Types](#terraform-types)
 
 - [ ] 4. Register in `provider.go` → `DataSources()` method
 
@@ -906,11 +1041,10 @@ Real CRUD and Terraform lifecycle behavior is tested with native
 - Cover import with a dedicated fixture module at
   `integration-tests/fixtures/<entity>/import/` that holds the `import` block,
   and reach it from a run with `command = plan` under its own `state_key`.
-  Terraform accepts `import` blocks only in a root module and a run's `module`
-  block replaces that run's root module, so the block belongs in the fixture;
-  an `import` block written inside a `run` block is rejected as an unsupported
-  block type. A plan-only run also leaves the object with the single owner that
-  created it, which keeps teardown from deleting it twice. Create the object the
+  Terraform 1.16 supports `import` blocks in modules loaded by test runs.
+  Keep the block in the fixture because a `run` block cannot contain an
+  `import` block. A plan-only run leaves the object with the state that
+  created it. This prevents duplicate deletion during teardown. Create the object the
   run imports in the import chain itself instead of borrowing one another chain
   owns, so a failure stays inside one chain. Configure only the attributes whose
   omission would plan a change, and feed them from the creating run's state
@@ -1033,7 +1167,7 @@ Run the standard checks from the repository root:
 
 ```bash
 make fmt lint test build
-VIETTELCLOUD_PROVIDER_ADDRESS=registry.terraform.io/viettelcloud/viettelcloud make docs-check
+VIETTELCLOUD_PROVIDER_ADDRESS=registry.terraform.io/viettelcloud-oss/viettelcloud make docs-check
 ```
 
 When credentials are available, run the affected real-API test explicitly:
@@ -1060,6 +1194,21 @@ terraform -chdir=integration-tests test \
 - Use `types.String`, `types.Int64`, etc. from Terraform Plugin Framework (never raw Go types in models)
 
 ## PR Checklist
+
+When you create a GitLab merge request, select `default` from the description
+templates. The template is
+[`.gitlab/merge_request_templates/default.md`](.gitlab/merge_request_templates/default.md).
+Use the template as an outline.
+Expand applicable sections to describe the change and its tests.
+Delete sections that do not apply.
+For tests that did not run, record the reason.
+
+The description has four parts: a summary of what the MR does, the rationale
+for the change and its approach, notes that a reviewer needs, and a test plan.
+It shows only the latest state of the MR. Record changes made during review in
+the discussions, not in the description. Do not include your own assessment
+of compatibility or rule compliance, because the reviewer makes that
+assessment.
 
 Before submitting a merge request:
 

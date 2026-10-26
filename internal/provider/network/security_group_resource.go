@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -20,6 +21,7 @@ import (
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -71,11 +73,12 @@ func (r *SecurityGroupResource) Schema(_ context.Context, _ resource.SchemaReque
 				Computed:    true,
 				Description: "Whether this is the project's default security group.",
 			},
-			"region": schema.StringAttribute{
+			"region": schema.SingleNestedAttribute{
 				Required:    true,
-				Description: "Project region name where the security group is created. Changing it replaces the security group because the update operation cannot move one between regions.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+				Description: "Project region where the security group is created. Changing it replaces the security group because the update operation cannot move one between regions.",
+				Attributes:  reference.Attributes(reference.Name, "Region name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
 			},
 			"region_id": schema.StringAttribute{
@@ -246,20 +249,14 @@ func buildSecurityGroupCreateBody(
 		diags.AddError("Missing name", "name must be configured and known.")
 		return body, diags
 	}
-	if plan.Region.IsNull() || plan.Region.IsUnknown() || strings.TrimSpace(plan.Region.ValueString()) == "" {
-		diags.AddError("Missing region", "region must be configured and known.")
-		return body, diags
-	}
-
-	regionName := plan.Region.ValueString()
-	region, err := resolveRegion(ctx, projectlookup.RegionFilter{Name: &regionName})
-	if err != nil {
-		diags.AddError("Unable to resolve region", "region: "+err.Error())
+	regionID, regionDiags := resolveRegionReference(ctx, plan.Region, resolveRegion)
+	diags.Append(regionDiags...)
+	if diags.HasError() {
 		return body, diags
 	}
 
 	body.Name = plan.Name.ValueString()
-	body.RegionId = region.Region.Id
+	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
 		value := plan.Description.ValueString()
 		body.Description = &value

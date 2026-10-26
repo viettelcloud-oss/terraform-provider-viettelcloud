@@ -118,7 +118,9 @@ func TestVPCDataSourceReadDirectID(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		ID: types.StringValue(vpcID.String()),
+		VPCModel: VPCModel{
+			ID: types.StringValue(vpcID.String()),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -168,7 +170,9 @@ func TestVPCDataSourceReadDirectIDNotFound(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		ID: types.StringValue(core.UUID{9}.String()),
+		VPCModel: VPCModel{
+			ID: types.StringValue(core.UUID{9}.String()),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -191,7 +195,9 @@ func TestVPCDataSourceReadRejectsInvalidID(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		ID: types.StringValue("invalid-uuid"),
+		VPCModel: VPCModel{
+			ID: types.StringValue("invalid-uuid"),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -214,9 +220,11 @@ func TestVPCDataSourceReadRequiresFilter(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		ID:     types.StringNull(),
-		Name:   types.StringNull(),
-		CIDR:   types.StringNull(),
+		VPCModel: VPCModel{
+			ID:   types.StringNull(),
+			Name: types.StringNull(),
+			CIDR: types.StringNull(),
+		},
 		Region: types.StringNull(),
 	})
 	if diags.HasError() {
@@ -236,8 +244,8 @@ func TestVPCDataSourceReadRejectsEmptyFilters(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]VPCDataSourceModel{
-		"name":   {Name: types.StringValue(" ")},
-		"cidr":   {CIDR: types.StringValue(" ")},
+		"name":   {VPCModel: VPCModel{Name: types.StringValue(" ")}},
+		"cidr":   {VPCModel: VPCModel{CIDR: types.StringValue(" ")}},
 		"region": {Region: types.StringValue(" ")},
 	}
 	for name, data := range tests {
@@ -305,7 +313,9 @@ func TestVPCDataSourceReadFilterByName(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		Name: types.StringValue("filtered-vpc"),
+		VPCModel: VPCModel{
+			Name: types.StringValue("filtered-vpc"),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -400,7 +410,9 @@ func TestVPCDataSourceReadFilterByCIDRAndRegion(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		CIDR:   types.StringValue("10.50.0.0/16"),
+		VPCModel: VPCModel{
+			CIDR: types.StringValue("10.50.0.0/16"),
+		},
 		Region: types.StringValue("vn-central"),
 	})
 	if diags.HasError() {
@@ -480,7 +492,9 @@ func TestVPCDataSourceReadMultipleMatchesError(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		Name: types.StringValue("dup-vpc"),
+		VPCModel: VPCModel{
+			Name: types.StringValue("dup-vpc"),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -526,7 +540,9 @@ func TestVPCDataSourceReadZeroMatchesError(t *testing.T) {
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
-		Name: types.StringValue("non-existent-vpc"),
+		VPCModel: VPCModel{
+			Name: types.StringValue("non-existent-vpc"),
+		},
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -546,7 +562,7 @@ func TestPreserveConfiguredValuesPreservesCIDRWhenBackendTrimsWhitespace(t *test
 	t.Parallel()
 
 	vpc := mockVPC()
-	config := VPCDataSourceModel{CIDR: types.StringValue("  10.0.0.0/16  ")}
+	config := VPCDataSourceModel{VPCModel: VPCModel{CIDR: types.StringValue("  10.0.0.0/16  ")}}
 	var state VPCDataSourceModel
 	populateVPCDataSourceState(vpc, &state)
 	preserveConfiguredValues(vpc, config, &state)
@@ -560,7 +576,7 @@ func TestPreserveConfiguredValuesUsesChangedBackendCIDR(t *testing.T) {
 	t.Parallel()
 
 	vpc := mockVPC()
-	config := VPCDataSourceModel{CIDR: types.StringValue("10.1.0.0/16")}
+	config := VPCDataSourceModel{VPCModel: VPCModel{CIDR: types.StringValue("10.1.0.0/16")}}
 	var state VPCDataSourceModel
 	populateVPCDataSourceState(vpc, &state)
 	preserveConfiguredValues(vpc, config, &state)

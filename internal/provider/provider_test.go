@@ -232,6 +232,35 @@ func TestProviderSchema(t *testing.T) {
 	}
 }
 
+// Terraform plans an omitted Optional and Computed nested attribute as null,
+// not as its prior value, when that prior value holds a non-Computed nested
+// attribute. The framework then marks every Computed attribute unknown, so the
+// plan never becomes empty.
+func TestProviderSchemaOmittedNestedAttributesKeepPriorValue(t *testing.T) {
+	t.Parallel()
+
+	server := providerserver.NewProtocol6(New("test")())()
+	response, err := server.GetProviderSchema(context.Background(), &tfprotov6.GetProviderSchemaRequest{})
+	if err != nil {
+		t.Fatalf("get provider schema: %v", err)
+	}
+	var walk func(path string, attributes []*tfprotov6.SchemaAttribute, insideOptionalComputed bool)
+	walk = func(path string, attributes []*tfprotov6.SchemaAttribute, insideOptionalComputed bool) {
+		for _, attribute := range attributes {
+			attributePath := path + "." + attribute.Name
+			if insideOptionalComputed && !attribute.Computed {
+				t.Errorf("%s must be Computed because an enclosing nested attribute is Optional and Computed", attributePath)
+			}
+			if attribute.NestedType != nil {
+				walk(attributePath, attribute.NestedType.Attributes, insideOptionalComputed || attribute.Optional && attribute.Computed)
+			}
+		}
+	}
+	for typeName, schema := range response.ResourceSchemas {
+		walk(typeName, schema.Block.Attributes, false)
+	}
+}
+
 func testProviderConfig(t *testing.T, p *ViettelCloudProvider, endpoint, token, projectID tftypes.Value) tfsdk.Config {
 	t.Helper()
 	var schemaResp frameworkprovider.SchemaResponse

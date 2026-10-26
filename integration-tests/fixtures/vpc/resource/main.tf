@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -29,7 +29,7 @@ resource "viettelcloud_vpc" "vpc" {
   name        = var.name
   description = var.description
   cidr        = var.cidr
-  region      = var.region
+  region      = { name = var.region }
 }
 
 data "viettelcloud_vpc" "vpc" {

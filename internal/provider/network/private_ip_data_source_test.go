@@ -527,11 +527,13 @@ func privateIPDataSourceSchema(t *testing.T) datasourceschema.Schema {
 }
 
 func nullPrivateIPDataSourceModel() PrivateIPDataSourceModel {
-	return PrivateIPDataSourceModel{PrivateIPModel: PrivateIPModel{
-		AllowedCIDRs:  types.SetNull(types.StringType),
+	return PrivateIPDataSourceModel{
+		PrivateIPModel: PrivateIPModel{
+			AllowedCIDRs: types.SetNull(types.StringType),
+			AttachedVIPs: types.SetNull(types.ObjectType{AttrTypes: privateIPAttachedVIPAttributeTypes}),
+		},
 		AllowedVIPIDs: types.SetNull(types.StringType),
-		AttachedVIPs:  types.SetNull(types.ObjectType{AttrTypes: privateIPAttachedVIPAttributeTypes}),
-	}}
+	}
 }
 
 func privateIPDataSourceModelWithString(field, value string) PrivateIPDataSourceModel {

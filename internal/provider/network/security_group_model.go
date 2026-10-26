@@ -14,19 +14,22 @@ type SecurityGroupModel struct {
 	DisplayName types.String `tfsdk:"display_name"`
 	Description types.String `tfsdk:"description"`
 	IsDefault   types.Bool   `tfsdk:"is_default"`
-	Region      types.String `tfsdk:"region"`
 	RegionID    types.String `tfsdk:"region_id"`
 	ProjectID   types.String `tfsdk:"project_id"`
 	CreatedAt   types.String `tfsdk:"created_at"`
 	UpdatedAt   types.String `tfsdk:"updated_at"`
 }
 
+// SecurityGroupResourceModel references its region as an object, while the
+// data source keeps the region name as a plain lookup argument.
 type SecurityGroupResourceModel struct {
 	SecurityGroupModel
+	Region types.Object `tfsdk:"region"`
 }
 
 type SecurityGroupDataSourceModel struct {
 	SecurityGroupModel
+	Region types.String `tfsdk:"region"`
 }
 
 func populateSecurityGroupModel(sg *networksdk.SecurityGroupSchema, m *SecurityGroupModel) {
@@ -38,7 +41,6 @@ func populateSecurityGroupModel(sg *networksdk.SecurityGroupSchema, m *SecurityG
 	m.Name = types.StringValue(sg.Name)
 	m.DisplayName = types.StringValue(sg.DisplayName)
 	m.IsDefault = types.BoolValue(sg.IsDefault)
-	m.Region = types.StringValue(sg.Region.Name)
 	m.RegionID = types.StringValue(sg.Region.Id.String())
 	m.ProjectID = types.StringValue(sg.Project.Id.String())
 	m.CreatedAt = types.StringValue(sg.CreatedAt.Format(time.RFC3339))
@@ -57,20 +59,22 @@ func populateSecurityGroupResourceState(sg *networksdk.SecurityGroupSchema, stat
 	}
 
 	configuredName := state.Name
-	configuredRegion := state.Region
 	populateSecurityGroupModel(sg, &state.SecurityGroupModel)
 	// Keep the configured representation when the backend only trims outer
 	// whitespace, otherwise Terraform reports an inconsistent result.
 	if keepConfiguredSecurityGroupValue(configuredName, sg.Name) {
 		state.Name = configuredName
 	}
-	if keepConfiguredSecurityGroupValue(configuredRegion, sg.Region.Name) {
-		state.Region = configuredRegion
-	}
+	state.Region = regionReferenceState(state.Region, sg.Region.Name)
 }
 
 func populateSecurityGroupDataSourceState(sg *networksdk.SecurityGroupSchema, state *SecurityGroupDataSourceModel) {
+	if sg == nil {
+		return
+	}
+
 	populateSecurityGroupModel(sg, &state.SecurityGroupModel)
+	state.Region = types.StringValue(sg.Region.Name)
 }
 
 func keepConfiguredSecurityGroupValue(configured types.String, backend string) bool {

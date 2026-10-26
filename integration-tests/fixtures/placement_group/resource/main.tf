@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -29,7 +29,9 @@ resource "viettelcloud_placement_group" "pg" {
   name        = var.name
   description = var.description
   policy      = var.policy
-  region      = var.region
+  region = {
+    name = var.region
+  }
 }
 
 output "placement_group_id" {
@@ -49,7 +51,7 @@ output "placement_group_policy" {
 }
 
 output "placement_group_region" {
-  value = viettelcloud_placement_group.pg.region
+  value = viettelcloud_placement_group.pg.region.name
 }
 
 output "placement_group_region_id" {
