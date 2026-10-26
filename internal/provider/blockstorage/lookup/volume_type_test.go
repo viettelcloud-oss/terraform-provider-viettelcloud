@@ -72,7 +72,7 @@ func TestVolumeTypeFinderSupportsServerAndVolumeCriteria(t *testing.T) {
 
 	withoutZone := &fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{testVolumeType(wantID, "Premium", "ceph-ssd", zoneID, true, 500)}}
 	if _, err := NewVolumeTypeFinder(withoutZone).ResolveForCreate(
-		context.Background(), VolumeTypeResolveRequest{Name: name, RequestedSize: 100},
+		context.Background(), VolumeTypeResolveRequest{Filter: VolumeTypeFilter{Name: &name}, RequestedSize: 100},
 	); err != nil {
 		t.Fatalf("resolve volume type without zone: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestVolumeTypeFinderCreateValidation(t *testing.T) {
 				requestName = "   "
 			}
 			_, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{values: tt.values}).ResolveForCreate(
-				context.Background(), VolumeTypeResolveRequest{Name: requestName, RequestedSize: tt.size},
+				context.Background(), VolumeTypeResolveRequest{Filter: VolumeTypeFilter{Name: &requestName}, RequestedSize: tt.size},
 			)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("expected %q error, got %v", tt.want, err)
@@ -116,5 +116,57 @@ func TestVolumeTypeFinderCreateValidation(t *testing.T) {
 	_, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{err: wantErr}).Find(context.Background(), VolumeTypeFilter{})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected list error, got %v", err)
+	}
+}
+
+func TestVolumeTypeFinderCombinesTypedCriteriaWithoutName(t *testing.T) {
+	t.Parallel()
+	zoneID := core.UUID{8}
+	want := testVolumeType(core.UUID{1}, "fast", "ceph", zoneID, true, 500)
+	want.DiskType = blockstoragesdk.LabeledVolumeTypeDiskType{Value: blockstoragesdk.VolumeTypeDiskTypeSsd, Label: new("SSD label")}
+	want.Speed.Value = blockstoragesdk.VolumeTypeSpeed("10k")
+	want.EncryptionKeySize.Value = blockstoragesdk.VolumeTypeEncryptKeySizeN0
+	filter := VolumeTypeFilter{DiskType: new(blockstoragesdk.VolumeTypeDiskType(" ssd ")), Speed: new(blockstoragesdk.VolumeTypeSpeed(" 10k ")), Multiattach: new(false), EncryptionKeySize: new(blockstoragesdk.VolumeTypeEncryptKeySize(" 0 "))}
+	wrongDisk, wrongSpeed, wrongAttach, wrongKey := want, want, want, want
+	wrongDisk.DiskType.Value = blockstoragesdk.VolumeTypeDiskTypeHdd
+	wrongSpeed.Speed.Value = blockstoragesdk.VolumeTypeSpeed("50k")
+	wrongAttach.Multiattach = true
+	wrongKey.EncryptionKeySize.Value = blockstoragesdk.VolumeTypeEncryptKeySizeN256
+	lister := &fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{wrongDisk, wrongSpeed, wrongAttach, wrongKey, want}}
+	got, err := NewVolumeTypeFinder(lister).ResolveForCreate(context.Background(), VolumeTypeResolveRequest{Filter: filter, ZoneID: &zoneID, RequestedSize: 30})
+	if err != nil || got.Id != want.Id {
+		t.Fatalf("resolve criteria: %#v, %v", got, err)
+	}
+	params := lister.params
+	if params.Name != nil || *params.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || string(*params.Speed) != "10k" || params.Multiattach == nil || *params.Multiattach || *params.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || *params.ZoneId != zoneID {
+		t.Fatalf("wrong backend criteria: %#v", params)
+	}
+	for _, criterion := range []string{"disk_type=", "speed=", "multiattach=false", "encryption_key_size="} {
+		if !strings.Contains(filter.String(), criterion) {
+			t.Fatalf("missing criterion %s: %s", criterion, filter.String())
+		}
+	}
+	for _, candidate := range []blockstoragesdk.VolumeTypeSchema{wrongDisk, wrongSpeed, wrongAttach, wrongKey} {
+		if filter.matches(&candidate) {
+			t.Fatalf("mismatching candidate passed: %#v", candidate)
+		}
+	}
+	filter.Name = new("another-name")
+	if filter.matches(&want) {
+		t.Fatal("name criterion was ignored")
+	}
+	filter.Name = nil
+	for _, candidates := range [][]blockstoragesdk.VolumeTypeSchema{nil, {want, want}} {
+		if _, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{values: candidates}).ResolveForCreate(context.Background(), VolumeTypeResolveRequest{Filter: filter, RequestedSize: 30}); err == nil {
+			t.Fatal("expected cardinality error")
+		}
+	}
+	unavailable := want
+	unavailable.State.Value = blockstoragesdk.VolumeTypeStateDown
+	if _, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{unavailable}}).ResolveForCreate(context.Background(), VolumeTypeResolveRequest{Filter: filter, RequestedSize: 30}); err == nil || !strings.Contains(err.Error(), "no enabled, up candidate") {
+		t.Fatalf("unavailable criterion: %v", err)
+	}
+	if _, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{want}}).ResolveForCreate(context.Background(), VolumeTypeResolveRequest{Filter: filter, RequestedSize: 1000}); err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("oversize criterion: %v", err)
 	}
 }

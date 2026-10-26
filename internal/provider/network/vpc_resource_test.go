@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
+
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -14,6 +16,8 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var vpcTestUUID = core.UUID{1}
@@ -24,7 +28,7 @@ func TestVPCModelsMatchSchemas(t *testing.T) {
 	var resourceSchemaResponse resource.SchemaResponse
 	(&VPCResource{}).Schema(context.Background(), resource.SchemaRequest{}, &resourceSchemaResponse)
 	resourcePlan := tfsdk.Plan{Schema: resourceSchemaResponse.Schema}
-	if diags := resourcePlan.Set(context.Background(), &VPCResourceModel{}); diags.HasError() {
+	if diags := resourcePlan.Set(context.Background(), &VPCResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 
@@ -42,10 +46,12 @@ func TestBuildVPCCreateBodyResolvesExactRegionAndNormalizesName(t *testing.T) {
 	regionID := core.UUID{7}
 	calls := 0
 	body, diags := buildVPCCreateBody(context.Background(), VPCResourceModel{
-		Name:        types.StringValue("  production  "),
-		Description: types.StringValue("primary network"),
-		CIDR:        types.StringValue("10.0.0.0/16"),
-		Region:      types.StringValue("vn-central"),
+		VPCModel: VPCModel{
+			Name:        types.StringValue("  production  "),
+			Description: types.StringValue("primary network"),
+			CIDR:        types.StringValue("10.0.0.0/16"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		calls++
 		if filter.Name == nil || *filter.Name != "vn-central" {
@@ -70,9 +76,11 @@ func TestBuildVPCCreateBodyDoesNotNormalizeRegion(t *testing.T) {
 	regionID := core.UUID{7}
 	calls := 0
 	body, diags := buildVPCCreateBody(context.Background(), VPCResourceModel{
-		Name:   types.StringValue("production"),
-		CIDR:   types.StringValue("10.0.0.0/16"),
-		Region: types.StringValue("  vn-central  "),
+		VPCModel: VPCModel{
+			Name: types.StringValue("production"),
+			CIDR: types.StringValue("10.0.0.0/16"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("  vn-central  ")),
 	}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		calls++
 		if filter.Name == nil || *filter.Name != "  vn-central  " {
@@ -94,8 +102,10 @@ func TestBuildVPCUpdateBodyNormalizesName(t *testing.T) {
 	t.Parallel()
 
 	body := buildVPCUpdateBody(VPCResourceModel{
-		Name:        types.StringValue("  VPC 1  "),
-		Description: types.StringValue("network"),
+		VPCModel: VPCModel{
+			Name:        types.StringValue("  VPC 1  "),
+			Description: types.StringValue("network"),
+		},
 	})
 	if body.Name != "VPC 1" || body.Description == nil || *body.Description != "network" {
 		t.Fatalf("unexpected update body: %#v", body)
@@ -118,8 +128,8 @@ func TestPopulateVPCState(t *testing.T) {
 	if state.CIDR.ValueString() != vpc.Cidr {
 		t.Errorf("expected CIDR %s, got %s", vpc.Cidr, state.CIDR.ValueString())
 	}
-	if state.Region.ValueString() != vpc.Region.Name {
-		t.Errorf("expected Region %s, got %s", vpc.Region.Name, state.Region.ValueString())
+	if reference.Get(state.Region, reference.Name).ValueString() != vpc.Region.Name {
+		t.Errorf("expected Region %s, got %s", vpc.Region.Name, reference.Get(state.Region, reference.Name).ValueString())
 	}
 	if state.DisplayName.ValueString() != vpc.DisplayName {
 		t.Errorf("expected DisplayName %s, got %s", vpc.DisplayName, state.DisplayName.ValueString())
@@ -134,15 +144,17 @@ func TestPopulateVPCResourceStatePreservesConfiguredValuesWhenBackendTrimsWhites
 
 	vpc := mockVPC()
 	state := VPCResourceModel{
-		Name:   types.StringValue("  test-vpc  "),
-		Region: types.StringValue("  region-1  "),
+		VPCModel: VPCModel{
+			Name: types.StringValue("  test-vpc  "),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("  region-1  ")),
 	}
 	populateVPCResourceState(vpc, &state)
 	if state.Name.ValueString() != "  test-vpc  " {
 		t.Fatalf("expected configured name representation to be preserved, got %q", state.Name.ValueString())
 	}
-	if state.Region.ValueString() != "  region-1  " {
-		t.Fatalf("expected configured region representation to be preserved, got %q", state.Region.ValueString())
+	if reference.Get(state.Region, reference.Name).ValueString() != "  region-1  " {
+		t.Fatalf("expected configured region representation to be preserved, got %q", reference.Get(state.Region, reference.Name).ValueString())
 	}
 }
 
@@ -151,15 +163,17 @@ func TestPopulateVPCResourceStateUsesChangedBackendValues(t *testing.T) {
 
 	vpc := mockVPC()
 	state := VPCResourceModel{
-		Name:   types.StringValue("different-vpc"),
-		Region: types.StringValue("different-region"),
+		VPCModel: VPCModel{
+			Name: types.StringValue("different-vpc"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("different-region")),
 	}
 	populateVPCResourceState(vpc, &state)
 	if state.Name.ValueString() != vpc.Name {
 		t.Fatalf("expected backend name %q, got %q", vpc.Name, state.Name.ValueString())
 	}
-	if state.Region.ValueString() != vpc.Region.Name {
-		t.Fatalf("expected backend region %q, got %q", vpc.Region.Name, state.Region.ValueString())
+	if reference.Get(state.Region, reference.Name).ValueString() != vpc.Region.Name {
+		t.Fatalf("expected backend region %q, got %q", vpc.Region.Name, reference.Get(state.Region, reference.Name).ValueString())
 	}
 }
 
@@ -184,6 +198,23 @@ func TestPopulateVPCStateNil(t *testing.T) {
 
 	if !state.ID.IsNull() {
 		t.Errorf("expected null ID, got %s", state.ID.ValueString())
+	}
+}
+
+func TestVPCReadAfterImportFillsRegionReference(t *testing.T) {
+	t.Parallel()
+
+	vpc := mockVPC()
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &VPCResource{client: client, projectID: vpcTestUUID}
+	}, vpc.Id.String(), vpc)
+
+	var region types.Object
+	if diags := state.GetAttribute(context.Background(), path.Root("region"), &region); diags.HasError() {
+		t.Fatalf("read region: %v", diags)
+	}
+	if want := reference.Value(reference.Name, types.StringValue(vpc.Region.Name)); !region.Equal(want) {
+		t.Fatalf("imported region = %s, want %s", region, want)
 	}
 }
 

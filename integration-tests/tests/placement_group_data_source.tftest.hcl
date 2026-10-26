@@ -43,7 +43,7 @@ run "lookupPlacementGroup_subjectCreated_allSelectorsReturnSameState" {
       data.viettelcloud_placement_group.by_id.id == viettelcloud_placement_group.subject.id &&
       data.viettelcloud_placement_group.by_id.name == viettelcloud_placement_group.subject.name &&
       data.viettelcloud_placement_group.by_id.policy == viettelcloud_placement_group.subject.policy &&
-      data.viettelcloud_placement_group.by_id.region == viettelcloud_placement_group.subject.region &&
+      data.viettelcloud_placement_group.by_id.region == viettelcloud_placement_group.subject.region.name &&
       data.viettelcloud_placement_group.by_id.description == viettelcloud_placement_group.subject.description &&
       length(data.viettelcloud_placement_group.by_id.region_id) > 0 &&
       length(data.viettelcloud_placement_group.by_id.project) > 0 &&
@@ -103,7 +103,7 @@ run "lookupPlacementGroup_subjectCreated_allSelectorsReturnSameState" {
       data.viettelcloud_placement_group.by_all_filters.id == upper(viettelcloud_placement_group.subject.id) &&
       data.viettelcloud_placement_group.by_all_filters.name == " ${viettelcloud_placement_group.subject.name} " &&
       data.viettelcloud_placement_group.by_all_filters.policy == " ${viettelcloud_placement_group.subject.policy} " &&
-      data.viettelcloud_placement_group.by_all_filters.region == " ${viettelcloud_placement_group.subject.region} " &&
+      data.viettelcloud_placement_group.by_all_filters.region == " ${viettelcloud_placement_group.subject.region.name} " &&
       data.viettelcloud_placement_group.by_all_filters.region_id == data.viettelcloud_placement_group.by_id.region_id
     )
     error_message = "Combined lookup did not select the target or preserve equivalent configured representations."

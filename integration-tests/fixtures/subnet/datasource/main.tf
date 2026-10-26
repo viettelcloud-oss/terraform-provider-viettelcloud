@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -35,14 +35,14 @@ variable "subnet_cidr" {
 resource "viettelcloud_vpc" "vpc" {
   name   = var.vpc_name
   cidr   = var.vpc_cidr
-  region = var.region
+  region = { name = var.region }
 }
 
 resource "viettelcloud_subnet" "subnet" {
   name        = var.subnet_name
   description = var.subnet_description
   cidr        = var.subnet_cidr
-  vpc_id      = viettelcloud_vpc.vpc.id
+  vpc         = { id = viettelcloud_vpc.vpc.id }
 }
 
 data "viettelcloud_subnet" "by_id" {
@@ -58,7 +58,7 @@ data "viettelcloud_subnet" "by_cidr" {
 }
 
 data "viettelcloud_subnet" "by_vpc_id" {
-  vpc_id = viettelcloud_subnet.subnet.vpc_id
+  vpc_id = viettelcloud_subnet.subnet.vpc.id
 }
 
 data "viettelcloud_subnet" "by_vpc_name" {

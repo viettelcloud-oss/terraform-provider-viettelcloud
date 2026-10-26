@@ -7,11 +7,11 @@
 # owner would delete it twice at teardown.
 
 terraform {
-  required_version = ">= 1.10"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -32,9 +32,8 @@ variable "protocol" {
   type = string
 }
 
-# Terraform accepts an import block only in a root module, and a run's module
-# block replaces that run's root module. Writing the import inside the run
-# block itself fails as an unsupported block type.
+# The run loads this fixture through its module block. Keep the import here
+# because an import block inside a run block is unsupported.
 import {
   to = viettelcloud_security_group_rule.imported
   id = var.security_group_rule_id
@@ -45,9 +44,9 @@ import {
 # remote_ip_prefix are optional and computed, so leaving them unset keeps
 # whatever the import refresh read. Every remaining attribute is computed.
 resource "viettelcloud_security_group_rule" "imported" {
-  security_group_id = var.security_group_id
-  direction         = var.direction
-  protocol          = var.protocol
+  security_group = { id = var.security_group_id }
+  direction      = var.direction
+  protocol       = var.protocol
 }
 
 output "rule_id" {

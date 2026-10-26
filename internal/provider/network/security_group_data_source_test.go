@@ -228,9 +228,9 @@ func TestSecurityGroupDataSourceReadRequiresFilter(t *testing.T) {
 			ID:          types.StringNull(),
 			Name:        types.StringNull(),
 			Description: types.StringNull(),
-			Region:      types.StringNull(),
 			IsDefault:   types.BoolNull(),
 		},
+		Region: types.StringNull(),
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)
@@ -250,7 +250,7 @@ func TestSecurityGroupDataSourceReadRejectsEmptyFilters(t *testing.T) {
 
 	tests := map[string]SecurityGroupDataSourceModel{
 		"name":   {SecurityGroupModel: SecurityGroupModel{Name: types.StringValue(" ")}},
-		"region": {SecurityGroupModel: SecurityGroupModel{Region: types.StringValue(" ")}},
+		"region": {Region: types.StringValue(" ")},
 	}
 	for name, data := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -423,9 +423,9 @@ func TestSecurityGroupDataSourceReadFilterByRegionAndIsDefault(t *testing.T) {
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &SecurityGroupDataSourceModel{
 		SecurityGroupModel: SecurityGroupModel{
-			Region:    types.StringValue("vn-central"),
 			IsDefault: types.BoolValue(true),
 		},
+		Region: types.StringValue("vn-central"),
 	})
 	if diags.HasError() {
 		t.Fatalf("failed to set config: %v", diags)

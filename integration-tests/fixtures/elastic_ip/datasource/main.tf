@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -27,12 +27,12 @@ variable "ipv4_only_description" {
 resource "viettelcloud_elastic_ip" "dual_stack" {
   description = var.dual_stack_description
   enable_ipv6 = true
-  region      = var.region
+  region      = { name = var.region }
 }
 
 resource "viettelcloud_elastic_ip" "ipv4_only" {
   description = var.ipv4_only_description
-  region      = var.region
+  region      = { name = var.region }
 }
 
 data "viettelcloud_elastic_ip" "by_id" {

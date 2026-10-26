@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	resourceschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -20,6 +19,8 @@ import (
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -85,14 +86,13 @@ func TestPrivateIPReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	resourceSchema := privateIPSchema(t)
-	for _, name := range []string{"subnet_id", "ip_address", "mac_address"} {
+	for _, name := range []string{"ip_address", "mac_address"} {
 		attribute, ok := resourceSchema.Attributes[name].(resourceschema.StringAttribute)
 		if !ok {
 			t.Fatalf("%s is not a string attribute", name)
 		}
 		modifier := attribute.PlanModifiers[len(attribute.PlanModifiers)-1]
 		stateModel := nullPrivateIPResourceModel()
-		stateModel.SubnetID = types.StringValue("before")
 		stateModel.IPAddress = types.StringValue("before")
 		stateModel.MACAddress = types.StringValue("before")
 		state := tfsdk.State{Schema: resourceSchema}
@@ -100,7 +100,6 @@ func TestPrivateIPReplacementAttributes(t *testing.T) {
 			t.Fatalf("set modifier state: %v", diags)
 		}
 		planModel := stateModel
-		planModel.SubnetID = types.StringValue("after")
 		planModel.IPAddress = types.StringValue("after")
 		planModel.MACAddress = types.StringValue("after")
 		plan := tfsdk.Plan{Schema: resourceSchema}
@@ -137,15 +136,57 @@ func TestPrivateIPReplacementAttributes(t *testing.T) {
 	}
 }
 
+func TestPrivateIPSubnetReferenceSchemaAndReplacement(t *testing.T) {
+	t.Parallel()
+
+	resourceSchema := privateIPSchema(t)
+	subnet := requiredReferenceAttribute(t, resourceSchema, "subnet", reference.ID)
+	before := reference.Value(reference.ID, types.StringValue(privateIPTestSubnetID.String()))
+	tests := map[string]struct {
+		plan types.Object
+		want bool
+	}{
+		"same id updates in place": {plan: before},
+		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x99}.String())), want: true},
+		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := referenceRequiresReplace(t, resourceSchema, subnet, before, test.plan); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPrivateIPAllowedVIPsSchema(t *testing.T) {
+	t.Parallel()
+
+	attribute, ok := privateIPSchema(t).Attributes["allowed_vips"].(resourceschema.SetNestedAttribute)
+	if !ok {
+		t.Fatal("allowed_vips is not a set nested attribute")
+	}
+	if !attribute.Optional || !attribute.Computed || attribute.Required || len(attribute.PlanModifiers) != 0 {
+		t.Fatalf("allowed_vips must be optional and computed without plan modifiers, got %#v", attribute)
+	}
+	id, ok := attribute.NestedObject.Attributes[reference.ID].(resourceschema.StringAttribute)
+	if len(attribute.NestedObject.Attributes) != 1 || !ok || !id.Optional || !id.Computed || len(id.Validators) != 1 {
+		t.Fatalf("allowed_vips elements = %#v, want one optional, computed, validated id", attribute.NestedObject.Attributes)
+	}
+}
+
 func TestBuildPrivateIPCreateBody(t *testing.T) {
 	t.Parallel()
 
-	body, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{PrivateIPModel: PrivateIPModel{
-		SubnetID:    types.StringValue(strings.ToUpper(privateIPTestSubnetID.String())),
-		Description: types.StringValue("application address"),
-		IPAddress:   types.StringValue("10.0.1.10"),
-		MACAddress:  types.StringValue("aa:bb:cc:dd:ee:ff"),
-	}})
+	body, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{
+		PrivateIPModel: PrivateIPModel{
+			Description: types.StringValue("application address"),
+			IPAddress:   types.StringValue("10.0.1.10"),
+			MACAddress:  types.StringValue("aa:bb:cc:dd:ee:ff"),
+		},
+		Subnet: reference.Value(reference.ID, types.StringValue(strings.ToUpper(privateIPTestSubnetID.String()))),
+	})
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
@@ -158,12 +199,14 @@ func TestBuildPrivateIPCreateBody(t *testing.T) {
 func TestBuildPrivateIPCreateBodyOmitsOptionalValues(t *testing.T) {
 	t.Parallel()
 
-	body, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{PrivateIPModel: PrivateIPModel{
-		SubnetID:    types.StringValue(privateIPTestSubnetID.String()),
-		Description: types.StringNull(),
-		IPAddress:   types.StringUnknown(),
-		MACAddress:  types.StringNull(),
-	}})
+	body, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{
+		PrivateIPModel: PrivateIPModel{
+			Description: types.StringNull(),
+			IPAddress:   types.StringUnknown(),
+			MACAddress:  types.StringNull(),
+		},
+		Subnet: reference.Value(reference.ID, types.StringValue(privateIPTestSubnetID.String())),
+	})
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
@@ -175,10 +218,15 @@ func TestBuildPrivateIPCreateBodyOmitsOptionalValues(t *testing.T) {
 func TestBuildPrivateIPCreateBodyRejectsInvalidSubnet(t *testing.T) {
 	t.Parallel()
 
-	for _, subnetID := range []types.String{types.StringNull(), types.StringUnknown(), types.StringValue("invalid")} {
-		_, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{PrivateIPModel: PrivateIPModel{SubnetID: subnetID}})
-		if !diags.HasError() {
-			t.Errorf("expected invalid subnet diagnostic for %v", subnetID)
+	for _, subnet := range []types.Object{
+		types.ObjectNull(reference.AttributeTypes(reference.ID)),
+		types.ObjectUnknown(reference.AttributeTypes(reference.ID)),
+		reference.Value(reference.ID, types.StringUnknown()),
+		reference.Value(reference.ID, types.StringValue("invalid")),
+	} {
+		_, diags := buildPrivateIPCreateBody(PrivateIPResourceModel{Subnet: subnet})
+		if !diags.HasError() || !strings.Contains(diags.Errors()[0].Detail(), "subnet.id") {
+			t.Errorf("expected invalid subnet.id diagnostic for %v, got %v", subnet, diags)
 		}
 	}
 }
@@ -212,29 +260,29 @@ func TestBuildPrivateIPUpdateBody(t *testing.T) {
 func TestBuildPrivateIPAllowedVIPsBodies(t *testing.T) {
 	t.Parallel()
 
-	configured := types.SetValueMust(types.StringType, []attr.Value{
-		types.StringValue(strings.ToUpper(privateIPTestVIPID.String())),
-	})
+	configured := reference.Set(reference.ID, []string{strings.ToUpper(privateIPTestVIPID.String())})
 	body, present, diags := buildPrivateIPAllowedVIPsBody(configured)
 	if diags.HasError() || !present || len(body.AllowedVipIds) != 1 || body.AllowedVipIds[0] != privateIPTestVIPID {
 		t.Fatalf("unexpected configured allowed VIP body: present=%v body=%#v diagnostics=%v", present, body, diags)
 	}
 
-	empty := types.SetValueMust(types.StringType, nil)
+	empty := reference.Set(reference.ID, nil)
 	body, present, diags = buildPrivateIPAllowedVIPsBody(empty)
 	if diags.HasError() || !present || body.AllowedVipIds == nil || len(body.AllowedVipIds) != 0 {
 		t.Fatalf("expected explicit empty set body: present=%v body=%#v diagnostics=%v", present, body, diags)
 	}
 
-	_, present, diags = buildPrivateIPAllowedVIPsBody(types.SetNull(types.StringType))
-	if diags.HasError() || present {
-		t.Fatalf("expected omitted set to be absent: present=%v diagnostics=%v", present, diags)
+	for _, omitted := range []types.Set{types.SetNull(reference.ObjectType(reference.ID)), types.SetUnknown(reference.ObjectType(reference.ID))} {
+		_, present, diags = buildPrivateIPAllowedVIPsBody(omitted)
+		if diags.HasError() || present {
+			t.Fatalf("expected omitted set %v to be absent: present=%v diagnostics=%v", omitted, present, diags)
+		}
 	}
 
-	invalid := types.SetValueMust(types.StringType, []attr.Value{types.StringValue("invalid")})
+	invalid := reference.Set(reference.ID, []string{"invalid"})
 	_, _, diags = buildPrivateIPAllowedVIPsBody(invalid)
-	if !diags.HasError() {
-		t.Fatal("expected invalid allowed VIP ID diagnostic")
+	if !diags.HasError() || !strings.Contains(diags.Errors()[0].Detail(), "allowed_vips[0].id") {
+		t.Fatalf("expected invalid allowed_vips[0].id diagnostic, got %v", diags)
 	}
 }
 
@@ -244,16 +292,18 @@ func TestPopulatePrivateIPResourceState(t *testing.T) {
 	privateIP := mockPrivateIP("before")
 	configuredSubnetID := strings.ToUpper(privateIPTestSubnetID.String())
 	configuredMAC := "AA-BB-CC-DD-EE-FF"
-	state := PrivateIPResourceModel{PrivateIPModel: PrivateIPModel{
-		SubnetID:   types.StringValue(configuredSubnetID),
-		IPAddress:  types.StringValue("10.0.1.10"),
-		MACAddress: types.StringValue(configuredMAC),
-	}}
+	state := PrivateIPResourceModel{
+		PrivateIPModel: PrivateIPModel{
+			IPAddress:  types.StringValue("10.0.1.10"),
+			MACAddress: types.StringValue(configuredMAC),
+		},
+		Subnet: reference.Value(reference.ID, types.StringValue(configuredSubnetID)),
+	}
 	populatePrivateIPResourceState(privateIP, &state)
 
 	if state.ID.ValueString() != privateIPTestID.String() || state.Description.ValueString() != "before" ||
 		state.IPAddress.ValueString() != "10.0.1.10" || state.MACAddress.ValueString() != configuredMAC ||
-		state.SubnetID.ValueString() != configuredSubnetID || state.SubnetName.ValueString() != "application" ||
+		reference.Get(state.Subnet, reference.ID).ValueString() != configuredSubnetID || state.SubnetName.ValueString() != "application" ||
 		state.SubnetCIDR.ValueString() != "10.0.1.0/24" || state.VPCID.ValueString() != privateIPTestVPCID.String() ||
 		state.VPCName.ValueString() != "production" || state.Region.ValueString() != "vn-central-1" ||
 		state.ServerID.ValueString() != privateIPTestServerID.String() || state.ServerName.ValueString() != "app-server" ||
@@ -267,8 +317,8 @@ func TestPopulatePrivateIPResourceState(t *testing.T) {
 	if len(state.AllowedCIDRs.Elements()) != 2 || len(state.AttachedVIPs.Elements()) != 1 {
 		t.Fatalf("unexpected collection mapping: allowed=%v attached=%v", state.AllowedCIDRs, state.AttachedVIPs)
 	}
-	if len(state.AllowedVIPIDs.Elements()) != 1 {
-		t.Fatalf("unexpected allowed VIP ID mapping: %v", state.AllowedVIPIDs)
+	if len(state.AllowedVIPs.Elements()) != 1 {
+		t.Fatalf("unexpected allowed VIP ID mapping: %v", state.AllowedVIPs)
 	}
 }
 
@@ -286,7 +336,7 @@ func TestPopulatePrivateIPResourceStateMapsNullableFields(t *testing.T) {
 	populatePrivateIPResourceState(privateIP, &state)
 	if !state.Description.IsNull() || !state.IPAddress.IsNull() || !state.MACAddress.IsNull() ||
 		!state.ServerID.IsNull() || !state.ServerName.IsNull() || !state.AllowedCIDRs.IsNull() ||
-		!state.AllowedVIPIDs.IsNull() || !state.AttachedVIPs.IsNull() {
+		!state.AllowedVIPs.IsNull() || !state.AttachedVIPs.IsNull() {
 		t.Fatalf("expected nullable fields to map to null: %#v", state)
 	}
 
@@ -329,9 +379,7 @@ func TestPrivateIPResourceUpdateAllowedVIPsUsesPublicSDK(t *testing.T) {
 		t.Fatalf("set state: %v", diags)
 	}
 	planModel := stateModel
-	planModel.AllowedVIPIDs = types.SetValueMust(types.StringType, []attr.Value{
-		types.StringValue(strings.ToUpper(privateIPTestVIPID.String())),
-	})
+	planModel.AllowedVIPs = reference.Set(reference.ID, []string{strings.ToUpper(privateIPTestVIPID.String())})
 	plan := tfsdk.Plan{Schema: resourceSchema}
 	if diags := plan.Set(context.Background(), &planModel); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
@@ -345,8 +393,8 @@ func TestPrivateIPResourceUpdateAllowedVIPsUsesPublicSDK(t *testing.T) {
 	if diags := response.State.Get(context.Background(), &got); diags.HasError() {
 		t.Fatalf("get updated state: %v", diags)
 	}
-	if len(got.AllowedVIPIDs.Elements()) != 1 {
-		t.Fatalf("expected one allowed VIP in state, got %v", got.AllowedVIPIDs)
+	if len(got.AllowedVIPs.Elements()) != 1 {
+		t.Fatalf("expected one allowed VIP in state, got %v", got.AllowedVIPs)
 	}
 }
 
@@ -413,7 +461,7 @@ func TestPrivateIPResourceLifecycleUsesPublicSDK(t *testing.T) {
 
 	createPlan := tfsdk.Plan{Schema: resourceSchema}
 	createModel := nullPrivateIPResourceModel()
-	createModel.SubnetID = types.StringValue(strings.ToUpper(privateIPTestSubnetID.String()))
+	createModel.Subnet = reference.Value(reference.ID, types.StringValue(strings.ToUpper(privateIPTestSubnetID.String())))
 	createModel.Description = types.StringValue("before")
 	if diags := createPlan.Set(ctx, &createModel); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
@@ -496,9 +544,9 @@ func TestPrivateIPResourceCreateConfiguresAllowedVIPs(t *testing.T) {
 	}
 	resourceSchema := privateIPSchema(t)
 	model := nullPrivateIPResourceModel()
-	model.SubnetID = types.StringValue(privateIPTestSubnetID.String())
+	model.Subnet = reference.Value(reference.ID, types.StringValue(privateIPTestSubnetID.String()))
 	configuredVIPID := strings.ToUpper(privateIPTestVIPID.String())
-	model.AllowedVIPIDs = types.SetValueMust(types.StringType, []attr.Value{types.StringValue(configuredVIPID)})
+	model.AllowedVIPs = reference.Set(reference.ID, []string{configuredVIPID})
 	plan := tfsdk.Plan{Schema: resourceSchema}
 	if diags := plan.Set(context.Background(), &model); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
@@ -514,9 +562,9 @@ func TestPrivateIPResourceCreateConfiguresAllowedVIPs(t *testing.T) {
 	if diags := response.State.Get(context.Background(), &state); diags.HasError() {
 		t.Fatalf("get state: %v", diags)
 	}
-	values := state.AllowedVIPIDs.Elements()
-	if requests != 2 || len(values) != 1 || values[0].(types.String).ValueString() != configuredVIPID {
-		t.Fatalf("unexpected configured allowed VIP state: requests=%d state=%v", requests, state.AllowedVIPIDs)
+	values := reference.Strings(state.AllowedVIPs, reference.ID)
+	if requests != 2 || len(values) != 1 || values[0].ValueString() != configuredVIPID {
+		t.Fatalf("unexpected configured allowed VIP state: requests=%d state=%v", requests, state.AllowedVIPs)
 	}
 }
 
@@ -570,7 +618,7 @@ func TestPrivateIPResourceReportsAPIErrors(t *testing.T) {
 
 	createPlan := tfsdk.Plan{Schema: resourceSchema}
 	createModel := nullPrivateIPResourceModel()
-	createModel.SubnetID = types.StringValue(privateIPTestSubnetID.String())
+	createModel.Subnet = reference.Value(reference.ID, types.StringValue(privateIPTestSubnetID.String()))
 	if diags := createPlan.Set(context.Background(), &createModel); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
@@ -649,6 +697,26 @@ func TestPrivateIPResourceImportState(t *testing.T) {
 	}
 }
 
+func TestPrivateIPReadAfterImportFillsReferences(t *testing.T) {
+	t.Parallel()
+
+	privateIP := mockPrivateIP("imported")
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &PrivateIPResource{client: client, projectID: privateIPTestProjectID}
+	}, privateIP.Id.String(), privateIP)
+
+	var got PrivateIPResourceModel
+	if diags := state.Get(context.Background(), &got); diags.HasError() {
+		t.Fatalf("read state: %v", diags)
+	}
+	if want := reference.Value(reference.ID, types.StringValue(privateIPTestSubnetID.String())); !got.Subnet.Equal(want) {
+		t.Fatalf("imported subnet = %s, want %s", got.Subnet, want)
+	}
+	if want := reference.Set(reference.ID, []string{privateIPTestVIPID.String()}); !got.AllowedVIPs.Equal(want) {
+		t.Fatalf("imported allowed_vips = %s, want %s", got.AllowedVIPs, want)
+	}
+}
+
 func privateIPSchema(t *testing.T) resourceschema.Schema {
 	t.Helper()
 	var response resource.SchemaResponse
@@ -660,11 +728,14 @@ func privateIPSchema(t *testing.T) resourceschema.Schema {
 }
 
 func nullPrivateIPResourceModel() PrivateIPResourceModel {
-	return PrivateIPResourceModel{PrivateIPModel: PrivateIPModel{
-		AllowedCIDRs:  types.SetNull(types.StringType),
-		AllowedVIPIDs: types.SetNull(types.StringType),
-		AttachedVIPs:  types.SetNull(types.ObjectType{AttrTypes: privateIPAttachedVIPAttributeTypes}),
-	}}
+	return PrivateIPResourceModel{
+		PrivateIPModel: PrivateIPModel{
+			AllowedCIDRs: types.SetNull(types.StringType),
+			AttachedVIPs: types.SetNull(types.ObjectType{AttrTypes: privateIPAttachedVIPAttributeTypes}),
+		},
+		Subnet:      types.ObjectNull(reference.AttributeTypes(reference.ID)),
+		AllowedVIPs: types.SetNull(reference.ObjectType(reference.ID)),
+	}
 }
 
 func mockPrivateIP(description string) *networksdk.PrivateIPSchema {

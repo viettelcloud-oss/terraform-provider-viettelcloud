@@ -38,7 +38,7 @@
 #   run "createSecurityGroupRule_importChainFixture_ruleCreated" {
 #   run "planImport_existingSecurityGroupRuleId_completeStateRestored" {
 #
-# security_group_id replacement is N/A: the suite creates one shared security
+# security_group.id replacement is N/A: the suite creates one shared security
 # group, and moving a rule between groups needs a second one.
 
 variable "token" {
@@ -118,7 +118,7 @@ run "createSecurityGroupRule_allAttributesConfigured_completeStateReturned" {
   assert {
     condition = (
       length(viettelcloud_security_group_rule.rule.id) > 0 &&
-      viettelcloud_security_group_rule.rule.security_group_id == run.createSecurityGroup_sharedFixture_securityGroupCreated.security_group_id &&
+      viettelcloud_security_group_rule.rule.security_group.id == run.createSecurityGroup_sharedFixture_securityGroupCreated.security_group_id &&
       viettelcloud_security_group_rule.rule.security_group_name == run.createSecurityGroup_sharedFixture_securityGroupCreated.security_group_name &&
       viettelcloud_security_group_rule.rule.direction == "ingress" &&
       viettelcloud_security_group_rule.rule.protocol == "tcp" &&
@@ -545,7 +545,7 @@ run "createSecurityGroupRule_importChainFixture_ruleCreated" {
 # a literal that could drift away from the object under test. The assertions
 # check the attributes that the import refresh alone supplies: description, the
 # port range, and remote_ip_prefix are unconfigured in the fixture, and the rest
-# are computed. security_group_id, direction, and protocol are configured, so
+# are computed. security_group, direction, and protocol are configured, so
 # their planned values come from configuration and cannot prove a refresh. What
 # keeps them honest is that any planned change at all makes every computed
 # attribute unknown and fails this run. Their per-attribute mapping is proven

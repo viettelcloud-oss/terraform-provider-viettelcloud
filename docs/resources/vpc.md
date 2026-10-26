@@ -16,7 +16,7 @@ Manage a Viettel Cloud VPC.
 resource "viettelcloud_vpc" "example" {
   name        = "my-vpc"
   cidr        = "10.0.0.0/16"
-  region      = "vn-central-1"
+  region      = { name = "vn-central-1" }
   description = "Example VPC"
 }
 ```
@@ -28,7 +28,7 @@ resource "viettelcloud_vpc" "example" {
 
 - `cidr` (String) IPv4 network CIDR, e.g. 10.0.0.0/16.
 - `name` (String) Name of the VPC.
-- `region` (String) Project region name where the VPC is created.
+- `region` (Attributes) Project region where the VPC is created. (see [below for nested schema](#nestedatt--region))
 
 ### Optional
 
@@ -40,3 +40,10 @@ resource "viettelcloud_vpc" "example" {
 - `display_name` (String) Display name assigned by the platform.
 - `id` (String) VPC ID (UUID).
 - `updated_at` (String) Timestamp when the VPC was last updated (RFC3339).
+
+<a id="nestedatt--region"></a>
+### Nested Schema for `region`
+
+Required:
+
+- `name` (String) Region name.

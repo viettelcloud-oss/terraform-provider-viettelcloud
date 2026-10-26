@@ -31,7 +31,7 @@ run "createElasticIp_ipv4OnlyConfig_ipv4AddressAllocated" {
     condition = (
       length(viettelcloud_elastic_ip.elastic_ip.id) > 0 &&
       viettelcloud_elastic_ip.elastic_ip.description == "Terraform integration test" &&
-      viettelcloud_elastic_ip.elastic_ip.region == "vn-central-1" &&
+      viettelcloud_elastic_ip.elastic_ip.region.name == "vn-central-1" &&
       viettelcloud_elastic_ip.elastic_ip.enable_ipv4 &&
       !viettelcloud_elastic_ip.elastic_ip.enable_ipv6 &&
       length(viettelcloud_elastic_ip.elastic_ip.ip_address) > 0 &&
@@ -60,7 +60,7 @@ run "refresh_existingElasticIp_statePreserved" {
     condition = (
       viettelcloud_elastic_ip.elastic_ip.id == run.createElasticIp_ipv4OnlyConfig_ipv4AddressAllocated.elastic_ip_id &&
       viettelcloud_elastic_ip.elastic_ip.description == "Terraform integration test" &&
-      viettelcloud_elastic_ip.elastic_ip.region == "vn-central-1" &&
+      viettelcloud_elastic_ip.elastic_ip.region.name == "vn-central-1" &&
       viettelcloud_elastic_ip.elastic_ip.enable_ipv4 &&
       !viettelcloud_elastic_ip.elastic_ip.enable_ipv6 &&
       length(viettelcloud_elastic_ip.elastic_ip.ip_address) > 0 &&

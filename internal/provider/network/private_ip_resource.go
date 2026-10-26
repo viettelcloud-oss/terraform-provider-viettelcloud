@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -19,6 +20,7 @@ import (
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -71,11 +73,12 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
-			"subnet_id": schema.StringAttribute{
+			"subnet": schema.SingleNestedAttribute{
 				Required:    true,
-				Description: "Subnet ID (UUID) where the private IP is allocated.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+				Description: "Subnet where the private IP is allocated.",
+				Attributes:  reference.Attributes(reference.ID, "Subnet ID (UUID)."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
 			},
 			"subnet_name": schema.StringAttribute{
@@ -123,11 +126,13 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				ElementType: types.StringType,
 				Description: "CIDRs currently allowed by the platform for this private IP.",
 			},
-			"allowed_vip_ids": schema.SetAttribute{
+			"allowed_vips": schema.SetNestedAttribute{
 				Optional:    true,
 				Computed:    true,
-				ElementType: types.StringType,
-				Description: "Full set of private IP IDs allowed as VIPs. Omitting it preserves the backend set; use an empty set to clear all allowed VIPs.",
+				Description: "Full set of private IPs allowed as VIPs. Omitting it preserves the backend set; use an empty set to clear all allowed VIPs.",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: reference.PreservedAttributes(reference.ID, "Allowed VIP private IP ID (UUID)."),
+				},
 			},
 			"attached_vips": schema.SetNestedAttribute{
 				Computed:    true,
@@ -185,7 +190,7 @@ func (r *PrivateIPResource) Create(ctx context.Context, req resource.CreateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	allowedVIPsBody, allowedVIPsConfigured, diags := buildPrivateIPAllowedVIPsBody(plan.AllowedVIPIDs)
+	allowedVIPsBody, allowedVIPsConfigured, diags := buildPrivateIPAllowedVIPsBody(plan.AllowedVIPs)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -335,7 +340,7 @@ func buildPrivateIPCreateBody(plan PrivateIPResourceModel) (networksdk.PrivateIP
 	var body networksdk.PrivateIPCreateSchema
 	var diags diag.Diagnostics
 
-	subnetID, subnetDiags := parse.UUIDString(plan.SubnetID, "subnet_id")
+	subnetID, subnetDiags := parse.UUIDString(reference.Get(plan.Subnet, reference.ID), "subnet.id")
 	diags.Append(subnetDiags...)
 	if diags.HasError() {
 		return body, diags
@@ -375,14 +380,10 @@ func buildPrivateIPAllowedVIPsBody(value types.Set) (networksdk.PrivateIPAllowed
 		return body, false, diags
 	}
 
-	body.AllowedVipIds = make([]core.UUID, 0, len(value.Elements()))
-	for i, element := range value.Elements() {
-		stringValue, ok := element.(types.String)
-		if !ok {
-			diags.AddError("Invalid allowed VIP ID", fmt.Sprintf("allowed_vip_ids element %d must be a string.", i))
-			continue
-		}
-		id, idDiags := parse.UUIDString(stringValue, fmt.Sprintf("allowed_vip_ids[%d]", i))
+	ids := reference.Strings(value, reference.ID)
+	body.AllowedVipIds = make([]core.UUID, 0, len(ids))
+	for i, stringValue := range ids {
+		id, idDiags := parse.UUIDString(stringValue, fmt.Sprintf("allowed_vips[%d].id", i))
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
 			body.AllowedVipIds = append(body.AllowedVipIds, id)
@@ -394,8 +395,8 @@ func buildPrivateIPAllowedVIPsBody(value types.Set) (networksdk.PrivateIPAllowed
 func buildPrivateIPAllowedVIPsUpdateBody(
 	plan, state PrivateIPResourceModel,
 ) (networksdk.PrivateIPAllowedVIPsUpdateSchema, bool, diag.Diagnostics) {
-	body, configured, diags := buildPrivateIPAllowedVIPsBody(plan.AllowedVIPIDs)
-	if diags.HasError() || !configured || compare.SameUUIDSet(plan.AllowedVIPIDs, state.AllowedVIPIDs) {
+	body, configured, diags := buildPrivateIPAllowedVIPsBody(plan.AllowedVIPs)
+	if diags.HasError() || !configured || compare.SameUUIDSet(privateIPAllowedVIPIDSet(plan.AllowedVIPs), privateIPAllowedVIPIDSet(state.AllowedVIPs)) {
 		return body, false, diags
 	}
 	return body, true, diags

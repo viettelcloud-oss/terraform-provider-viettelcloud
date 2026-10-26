@@ -16,7 +16,7 @@ Manage a Viettel Cloud security group.
 # Basic security group
 resource "viettelcloud_security_group" "example" {
   name        = "my-security-group"
-  region      = "vn-central-1"
+  region      = { name = "vn-central-1" }
   description = "Example security group"
 }
 ```
@@ -27,7 +27,7 @@ resource "viettelcloud_security_group" "example" {
 ### Required
 
 - `name` (String) Name of the security group.
-- `region` (String) Project region name where the security group is created. Changing it replaces the security group because the update operation cannot move one between regions.
+- `region` (Attributes) Project region where the security group is created. Changing it replaces the security group because the update operation cannot move one between regions. (see [below for nested schema](#nestedatt--region))
 
 ### Optional
 
@@ -42,6 +42,13 @@ resource "viettelcloud_security_group" "example" {
 - `project_id` (String) Project ID (UUID) that owns the security group.
 - `region_id` (String) Region ID (UUID) that owns the security group.
 - `updated_at` (String) Timestamp when the security group was last updated (RFC3339).
+
+<a id="nestedatt--region"></a>
+### Nested Schema for `region`
+
+Required:
+
+- `name` (String) Region name.
 
 ## Import
 

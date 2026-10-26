@@ -217,6 +217,7 @@ func volumeLookupCriteria(config VolumeDataSourceModel) (volumeCriteria, diag.Di
 
 func populateVolumeDataSourceState(volume *blockstoragesdk.VolumeDetailSchema, state *VolumeDataSourceModel) {
 	populateVolumeModel(volume, &state.VolumeModel)
+	state.Zone = types.StringValue(volume.Zone.Name)
 }
 
 func preserveVolumeConfiguredValues(volume *blockstoragesdk.VolumeDetailSchema, config, state *VolumeDataSourceModel) {

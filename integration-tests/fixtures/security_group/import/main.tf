@@ -7,11 +7,11 @@
 # a second owner would delete it twice at teardown.
 
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -28,9 +28,8 @@ variable "region" {
   type = string
 }
 
-# Terraform accepts an import block only in a root module, and a run's module
-# block replaces that run's root module. Writing the import inside the run
-# block itself fails as an unsupported block type.
+# The run loads this fixture through its module block. Keep the import here
+# because an import block inside a run block is unsupported.
 import {
   to = viettelcloud_security_group.imported
   id = var.security_group_id
@@ -42,7 +41,7 @@ import {
 # computed.
 resource "viettelcloud_security_group" "imported" {
   name   = var.name
-  region = var.region
+  region = { name = var.region }
 }
 
 output "security_group_id" {

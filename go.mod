@@ -6,7 +6,7 @@ require (
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 	github.com/hashicorp/terraform-plugin-go v0.31.0
 	github.com/hashicorp/terraform-plugin-log v0.10.0 // indirect
-	github.com/viettelcloud-oss/sdks/go v0.1.0
+	github.com/viettelcloud-oss/sdks/go v0.2.0
 )
 
 require (

@@ -16,19 +16,19 @@ Manage a Viettel Cloud private IP.
 resource "viettelcloud_vpc" "example" {
   name        = "my-vpc"
   cidr        = "10.0.0.0/16"
-  region      = "vn-central-1"
+  region      = { name = "vn-central-1" }
   description = "Example VPC"
 }
 
 resource "viettelcloud_subnet" "example" {
   name        = "my-subnet"
   cidr        = "10.0.1.0/24"
-  vpc_id      = viettelcloud_vpc.example.id
+  vpc         = { id = viettelcloud_vpc.example.id }
   description = "Example subnet"
 }
 
 resource "viettelcloud_private_ip" "example" {
-  subnet_id   = viettelcloud_subnet.example.id
+  subnet      = { id = viettelcloud_subnet.example.id }
   description = "Example private IP"
 }
 ```
@@ -38,11 +38,11 @@ resource "viettelcloud_private_ip" "example" {
 
 ### Required
 
-- `subnet_id` (String) Subnet ID (UUID) where the private IP is allocated.
+- `subnet` (Attributes) Subnet where the private IP is allocated. (see [below for nested schema](#nestedatt--subnet))
 
 ### Optional
 
-- `allowed_vip_ids` (Set of String) Full set of private IP IDs allowed as VIPs. Omitting it preserves the backend set; use an empty set to clear all allowed VIPs.
+- `allowed_vips` (Attributes Set) Full set of private IPs allowed as VIPs. Omitting it preserves the backend set; use an empty set to clear all allowed VIPs. (see [below for nested schema](#nestedatt--allowed_vips))
 - `description` (String) Optional description of the private IP. Omitting it preserves the backend value; set it to an empty string to clear it.
 - `ip_address` (String) Private IP address. When omitted during creation, the platform allocates an address from the subnet; removing it from configuration preserves the assigned address.
 - `mac_address` (String) MAC address. When omitted during creation, the platform allocates one; removing it from configuration preserves the assigned address.
@@ -64,6 +64,22 @@ resource "viettelcloud_private_ip" "example" {
 - `updated_at` (String) Timestamp when the private IP was last updated (RFC3339).
 - `vpc_id` (String) VPC ID (UUID) containing the private IP.
 - `vpc_name` (String) Name of the VPC containing the private IP.
+
+<a id="nestedatt--subnet"></a>
+### Nested Schema for `subnet`
+
+Required:
+
+- `id` (String) Subnet ID (UUID).
+
+
+<a id="nestedatt--allowed_vips"></a>
+### Nested Schema for `allowed_vips`
+
+Optional:
+
+- `id` (String) Allowed VIP private IP ID (UUID). Required when the reference is configured.
+
 
 <a id="nestedatt--attached_vips"></a>
 ### Nested Schema for `attached_vips`

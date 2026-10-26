@@ -155,6 +155,37 @@ func TestSameUUIDSet(t *testing.T) {
 	}
 }
 
+func TestSameJSON(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		configured types.String
+		backend    types.String
+		want       bool
+	}{
+		"key order and whitespace": {types.StringValue(`{ "b": "two", "a": "one" }`), types.StringValue(`{"a":"one","b":"two"}`), true},
+		"nested values":            {types.StringValue(`{"items":[true,null,{"n":1.0}]}`), types.StringValue(`{"items":[true,null,{"n":1}]}`), true},
+		"empty object":             {types.StringValue("{}"), types.StringValue("{}"), true},
+		"different value":          {types.StringValue(`{"a":"one"}`), types.StringValue(`{"a":"two"}`), false},
+		"different type":           {types.StringValue(`{"a":"1"}`), types.StringValue(`{"a":1}`), false},
+		"array order":              {types.StringValue(`[1,2]`), types.StringValue(`[2,1]`), false},
+		"invalid configured":       {types.StringValue(`{`), types.StringValue(`{}`), false},
+		"invalid backend":          {types.StringValue(`{}`), types.StringValue(`{`), false},
+		"trailing document":        {types.StringValue(`{} {}`), types.StringValue(`{}`), false},
+		"null configured":          {types.StringNull(), types.StringValue(`{}`), false},
+		"null backend":             {types.StringValue(`{}`), types.StringNull(), false},
+		"unknown configured":       {types.StringUnknown(), types.StringValue(`{}`), false},
+		"unknown backend":          {types.StringValue(`{}`), types.StringUnknown(), false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := SameJSON(tt.configured, tt.backend); got != tt.want {
+				t.Fatalf("SameJSON() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func mustParseUUID(t *testing.T, value string) core.UUID {
 	t.Helper()
 

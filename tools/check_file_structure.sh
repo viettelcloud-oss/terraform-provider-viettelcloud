@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Enforces the two navigation rules for service packages.
+# Enforces the leaf-package rules and the two navigation rules for service
+# packages.
 #
 # 1. Framework entry points appear in contract-first order, so a reader scrolling
 #    a resource always meets Metadata, Schema, Configure, then CRUD, then
@@ -44,6 +45,26 @@ for file in internal/provider/*/lookup/*.go; do
 		echo "$bad" | sed 's/^/    found: /' >&2
 		echo "    importing a service package here creates a cycle the moment that" >&2
 		echo "    service resolves one of this service's entities" >&2
+		fail=1
+	fi
+done
+
+# --- rule 0b: catalog selector packages stay leaves --------------------------
+# A <service>/selector package may import internal/selector and its own
+# service's lookup package, and nothing else from this repository. Server and
+# blockstorage each import the other's selector, so a service import here
+# would close a cycle.
+for file in internal/provider/*/selector/*.go; do
+	[ -e "$file" ] || continue
+	service=$(basename "$(dirname "$(dirname "$file")")")
+	bad=$(grep -oE '"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/[a-z/]*"' "$file" |
+		grep -v -e '"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/selector"' \
+			-e "\"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/$service/lookup\"" || true)
+	if [ -n "$bad" ]; then
+		echo "$file: a selector package may only import internal/selector and its own lookup" >&2
+		echo "$bad" | sed 's/^/    found: /' >&2
+		echo "    server and blockstorage import each other's selectors, so a service" >&2
+		echo "    import here creates a cycle" >&2
 		fail=1
 	fi
 done

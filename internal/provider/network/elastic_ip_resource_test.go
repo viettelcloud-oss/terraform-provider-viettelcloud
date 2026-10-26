@@ -12,6 +12,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
+
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -25,6 +27,8 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var elasticIPResourceTestUUID = core.UUID{1}
@@ -41,7 +45,7 @@ func TestElasticIPModelsMatchSchemas(t *testing.T) {
 	var resourceSchema resource.SchemaResponse
 	(&ElasticIPResource{}).Schema(context.Background(), resource.SchemaRequest{}, &resourceSchema)
 	plan := tfsdk.Plan{Schema: resourceSchema.Schema}
-	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -52,9 +56,8 @@ func TestElasticIPSchemaMutability(t *testing.T) {
 	var response resource.SchemaResponse
 	(&ElasticIPResource{}).Schema(context.Background(), resource.SchemaRequest{}, &response)
 
-	region, ok := response.Schema.Attributes["region"].(schema.StringAttribute)
-	if !ok || !region.Required || region.Computed || len(region.PlanModifiers) != 1 {
-		t.Fatalf("region must be required and create-only, got %#v", response.Schema.Attributes["region"])
+	if region := requiredReferenceAttribute(t, response.Schema, "region", reference.Name); len(region.PlanModifiers) != 1 {
+		t.Fatalf("region must be create-only, got %#v", region.PlanModifiers)
 	}
 	description, ok := response.Schema.Attributes["description"].(schema.StringAttribute)
 	if !ok || !description.Optional || !description.Computed || len(description.PlanModifiers) != 0 {
@@ -154,7 +157,7 @@ func elasticIPModifierState(t *testing.T, resourceSchema schema.Schema) tfsdk.St
 	t.Helper()
 
 	state := tfsdk.State{Schema: resourceSchema}
-	if diags := state.Set(context.Background(), &ElasticIPResourceModel{}); diags.HasError() {
+	if diags := state.Set(context.Background(), &ElasticIPResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("set modifier state: %v", diags)
 	}
 	return state
@@ -164,7 +167,7 @@ func elasticIPModifierPlan(t *testing.T, resourceSchema schema.Schema) tfsdk.Pla
 	t.Helper()
 
 	plan := tfsdk.Plan{Schema: resourceSchema}
-	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("set modifier plan: %v", diags)
 	}
 	return plan
@@ -176,11 +179,11 @@ func TestBuildElasticIPCreateBodyResolvesRegionName(t *testing.T) {
 	regionID := core.UUID{7}
 	body, diags := buildElasticIPCreateBody(context.Background(), ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			Description: types.StringValue("Managed by Terraform"),
 			EnableIPv4:  types.BoolValue(true),
 			EnableIPv6:  types.BoolValue(false),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		if filter.Name == nil || *filter.Name != "vn-central" {
 			t.Fatalf("unexpected region filter %#v", filter.Name)
@@ -221,7 +224,10 @@ func TestBuildElasticIPCreateBodyDescriptionPresence(t *testing.T) {
 			body, diags := buildElasticIPCreateBody(
 				context.Background(),
 				ElasticIPResourceModel{
-					ElasticIPModel: ElasticIPModel{Region: types.StringValue("vn-central"), Description: test.description},
+					ElasticIPModel: ElasticIPModel{
+						Description: test.description,
+					},
+					Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 				},
 				func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 					return projectsdk.ProjectRegionSchema{
@@ -247,7 +253,7 @@ func TestBuildElasticIPCreateBodyRejectsMissingOrUnresolvedRegion(t *testing.T) 
 
 	_, diags := buildElasticIPCreateBody(
 		context.Background(),
-		ElasticIPResourceModel{ElasticIPModel: ElasticIPModel{Region: types.StringValue(" ")}},
+		ElasticIPResourceModel{Region: reference.Value(reference.Name, types.StringValue(" "))},
 		func(context.Context, projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 			t.Fatal("resolver must not be called for an empty region")
 			return projectsdk.ProjectRegionSchema{}, nil
@@ -260,7 +266,7 @@ func TestBuildElasticIPCreateBodyRejectsMissingOrUnresolvedRegion(t *testing.T) 
 	expected := errors.New("region not found")
 	_, diags = buildElasticIPCreateBody(
 		context.Background(),
-		ElasticIPResourceModel{ElasticIPModel: ElasticIPModel{Region: types.StringValue("vn-central")}},
+		ElasticIPResourceModel{Region: reference.Value(reference.Name, types.StringValue("vn-central"))},
 		func(context.Context, projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 			return projectsdk.ProjectRegionSchema{}, expected
 		},
@@ -299,8 +305,8 @@ func TestPopulateElasticIPState(t *testing.T) {
 	if state.ID.ValueString() != eip.Id.String() {
 		t.Errorf("expected ID %s, got %s", eip.Id, state.ID.ValueString())
 	}
-	if state.Region.ValueString() != eip.Region.Name {
-		t.Errorf("expected region %s, got %s", eip.Region.Name, state.Region.ValueString())
+	if reference.Get(state.Region, reference.Name).ValueString() != eip.Region.Name {
+		t.Errorf("expected region %s, got %s", eip.Region.Name, reference.Get(state.Region, reference.Name).ValueString())
 	}
 	if state.Description.ValueString() != description {
 		t.Errorf("expected description %q, got %q", description, state.Description.ValueString())
@@ -323,6 +329,7 @@ func TestPopulateElasticIPResourceStateKeepsConfiguredRegion(t *testing.T) {
 	}{
 		{name: "untrimmed region is kept", configured: types.StringValue("  vn-central  "), want: "  vn-central  "},
 		{name: "unknown region takes the backend value", configured: types.StringUnknown(), want: "vn-central"},
+		{name: "imported null region takes the backend value", configured: types.StringNull(), want: "vn-central"},
 		{name: "another region takes the backend value", configured: types.StringValue("vn-north"), want: "vn-central"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -332,10 +339,10 @@ func TestPopulateElasticIPResourceStateKeepsConfiguredRegion(t *testing.T) {
 				Id:     elasticIPResourceTestUUID,
 				Region: networksdk.NestedRegionSchema{Id: core.UUID{9}, Name: "vn-central"},
 			}
-			state := ElasticIPResourceModel{ElasticIPModel: ElasticIPModel{Region: test.configured}}
+			state := ElasticIPResourceModel{Region: reference.Value(reference.Name, test.configured)}
 			populateElasticIPResourceState(eip, &state)
-			if state.Region.ValueString() != test.want {
-				t.Fatalf("expected region %q, got %q", test.want, state.Region.ValueString())
+			if reference.Get(state.Region, reference.Name).ValueString() != test.want {
+				t.Fatalf("expected region %q, got %q", test.want, reference.Get(state.Region, reference.Name).ValueString())
 			}
 		})
 	}
@@ -361,7 +368,6 @@ func TestPopulateElasticIPPendingState(t *testing.T) {
 
 	state := ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			ID:          types.StringUnknown(),
 			Description: types.StringValue("Managed by Terraform"),
 			EnableIPv4:  types.BoolValue(true),
@@ -372,6 +378,7 @@ func TestPopulateElasticIPPendingState(t *testing.T) {
 			CreatedAt:   types.StringUnknown(),
 			UpdatedAt:   types.StringUnknown(),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}
 	populateElasticIPPendingState(&state, elasticIPResourceTestUUID)
 
@@ -380,7 +387,7 @@ func TestPopulateElasticIPPendingState(t *testing.T) {
 	}
 	if state.Description.ValueString() != "Managed by Terraform" ||
 		!state.EnableIPv4.ValueBool() ||
-		state.Region.ValueString() != "vn-central" {
+		reference.Get(state.Region, reference.Name).ValueString() != "vn-central" {
 		t.Fatalf("expected configured values to be preserved, got %#v", state)
 	}
 	if !state.EnableIPv6.IsNull() ||
@@ -459,7 +466,6 @@ func TestElasticIPCreatePreservesIDWhenPollingFails(t *testing.T) {
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
 	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			ID:          types.StringUnknown(),
 			Description: types.StringUnknown(),
 			EnableIPv4:  types.BoolUnknown(),
@@ -470,6 +476,7 @@ func TestElasticIPCreatePreservesIDWhenPollingFails(t *testing.T) {
 			CreatedAt:   types.StringUnknown(),
 			UpdatedAt:   types.StringUnknown(),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
@@ -563,7 +570,6 @@ func TestElasticIPCreateUsesResolvedRegionAndRefreshesState(t *testing.T) {
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
 	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			ID:          types.StringUnknown(),
 			Description: types.StringValue("Managed by Terraform"),
 			EnableIPv4:  types.BoolValue(true),
@@ -574,6 +580,7 @@ func TestElasticIPCreateUsesResolvedRegionAndRefreshesState(t *testing.T) {
 			CreatedAt:   types.StringUnknown(),
 			UpdatedAt:   types.StringUnknown(),
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
@@ -592,7 +599,7 @@ func TestElasticIPCreateUsesResolvedRegionAndRefreshesState(t *testing.T) {
 		t.Fatalf("read state: %v", diags)
 	}
 	if state.ID.ValueString() != eipID.String() || state.Description.ValueString() != "Managed by Terraform" ||
-		state.Region.ValueString() != "vn-central" ||
+		reference.Get(state.Region, reference.Name).ValueString() != "vn-central" ||
 		state.IPAddress.ValueString() != "203.0.113.10" {
 		t.Fatalf("unexpected create state: %#v", state)
 	}
@@ -738,7 +745,7 @@ func TestElasticIPUpdatePatchesDescription(t *testing.T) {
 	if calls() != 1 {
 		t.Fatalf("expected a single update request, got %d", calls())
 	}
-	if newState.Description.ValueString() != "updated" || newState.Region.ValueString() != "vn-central" {
+	if newState.Description.ValueString() != "updated" || reference.Get(newState.Region, reference.Name).ValueString() != "vn-central" {
 		t.Fatalf("unexpected state after update: %#v", newState)
 	}
 }
@@ -796,7 +803,10 @@ func TestElasticIPUpdateRejectsInvalidStateID(t *testing.T) {
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	state := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := state.Set(context.Background(), &ElasticIPResourceModel{
-		ElasticIPModel: ElasticIPModel{Region: types.StringValue("vn-central"), ID: types.StringValue("not-a-uuid")},
+		ElasticIPModel: ElasticIPModel{
+			ID: types.StringValue("not-a-uuid"),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -957,7 +967,7 @@ func TestElasticIPImportState(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	response := resource.ImportStateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
-	if diags := response.State.Set(context.Background(), &ElasticIPResourceModel{}); diags.HasError() {
+	if diags := response.State.Set(context.Background(), &ElasticIPResourceModel{Region: types.ObjectNull(reference.AttributeTypes(reference.Name))}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 
@@ -976,6 +986,26 @@ func TestElasticIPImportState(t *testing.T) {
 	}
 	if state.ID.ValueString() != elasticIPResourceTestUUID.String() {
 		t.Fatalf("expected imported ID %s, got %s", elasticIPResourceTestUUID, state.ID.ValueString())
+	}
+}
+
+func TestElasticIPReadAfterImportFillsRegionReference(t *testing.T) {
+	t.Parallel()
+
+	eip := &networksdk.ElasticIPDetailSchema{
+		Id:     elasticIPResourceTestUUID,
+		Region: networksdk.NestedRegionSchema{Id: core.UUID{9}, Name: "vn-central"},
+	}
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &ElasticIPResource{client: client, projectID: elasticIPResourceTestUUID}
+	}, eip.Id.String(), eip)
+
+	var region types.Object
+	if diags := state.GetAttribute(context.Background(), path.Root("region"), &region); diags.HasError() {
+		t.Fatalf("read region: %v", diags)
+	}
+	if want := reference.Value(reference.Name, types.StringValue("vn-central")); !region.Equal(want) {
+		t.Fatalf("imported region = %s, want %s", region, want)
 	}
 }
 
@@ -1027,10 +1057,10 @@ func elasticIPUpdate(
 	state := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := state.Set(context.Background(), &ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			ID:          types.StringValue(elasticIPResourceTestUUID.String()),
 			Description: stateDescription,
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -1038,10 +1068,10 @@ func elasticIPUpdate(
 	planState := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := planState.Set(context.Background(), &ElasticIPResourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:      types.StringValue("vn-central"),
 			ID:          types.StringValue(elasticIPResourceTestUUID.String()),
 			Description: planDescription,
 		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set plan: %v", diags)
 	}
@@ -1088,7 +1118,10 @@ func elasticIPResourceTestState(t *testing.T, resourceUnderTest *ElasticIPResour
 	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	state := tfsdk.State{Schema: schemaResponse.Schema}
 	if diags := state.Set(context.Background(), &ElasticIPResourceModel{
-		ElasticIPModel: ElasticIPModel{Region: types.StringValue("vn-central"), ID: types.StringValue(elasticIPResourceTestUUID.String())},
+		ElasticIPModel: ElasticIPModel{
+			ID: types.StringValue(elasticIPResourceTestUUID.String()),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
 	}); diags.HasError() {
 		t.Fatalf("set resource state: %v", diags)
 	}

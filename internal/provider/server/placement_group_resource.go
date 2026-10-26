@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -19,6 +20,7 @@ import (
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -67,11 +69,12 @@ func (r *PlacementGroupResource) Schema(_ context.Context, _ resource.SchemaRequ
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
-			"region": schema.StringAttribute{
+			"region": schema.SingleNestedAttribute{
 				Required:    true,
-				Description: "Project region name where the Placement Group is created. Changing the region replaces the Placement Group.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+				Description: "Project region where the Placement Group is created. Changing the region replaces the Placement Group.",
+				Attributes:  reference.Attributes(reference.Name, "Region name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
 			},
 			"region_id": schema.StringAttribute{
@@ -257,8 +260,9 @@ func buildPlacementGroupCreateBody(
 	if plan.Policy.IsNull() || plan.Policy.IsUnknown() || strings.TrimSpace(plan.Policy.ValueString()) == "" {
 		diags.AddError("Missing Placement Group policy", "policy must be configured and known.")
 	}
-	if plan.Region.IsNull() || plan.Region.IsUnknown() || strings.TrimSpace(plan.Region.ValueString()) == "" {
-		diags.AddError("Missing Placement Group region", "region must be configured and known.")
+	planRegion := reference.Get(plan.Region, reference.Name)
+	if planRegion.IsNull() || planRegion.IsUnknown() || strings.TrimSpace(planRegion.ValueString()) == "" {
+		diags.AddError("Missing Placement Group region", "region.name must be configured and known.")
 	}
 	if diags.HasError() {
 		return body, diags
@@ -274,10 +278,10 @@ func buildPlacementGroupCreateBody(
 	}
 
 	name := strings.TrimSpace(plan.Name.ValueString())
-	regionName := strings.TrimSpace(plan.Region.ValueString())
+	regionName := strings.TrimSpace(planRegion.ValueString())
 	region, err := resolveRegion(ctx, projectlookup.RegionFilter{Name: &regionName})
 	if err != nil {
-		diags.AddError("Unable to resolve region", "region: "+err.Error())
+		diags.AddError("Unable to resolve region", "region.name: "+err.Error())
 		return body, diags
 	}
 

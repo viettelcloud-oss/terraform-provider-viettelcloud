@@ -150,10 +150,10 @@ func TestSubnetDataSourceReadRejectsInvalidVPCID(t *testing.T) {
 
 	dsSchema := subnetDataSourceSchema(t)
 	configState := tfsdk.State{Schema: dsSchema}
-	if diags := configState.Set(context.Background(), &SubnetDataSourceModel{SubnetModel: SubnetModel{
-		Name:  types.StringValue("application"),
-		VPCID: types.StringValue("invalid-uuid"),
-	}}); diags.HasError() {
+	if diags := configState.Set(context.Background(), &SubnetDataSourceModel{
+		SubnetModel: SubnetModel{Name: types.StringValue("application")},
+		VPCID:       types.StringValue("invalid-uuid"),
+	}); diags.HasError() {
 		t.Fatalf("set data source config: %v", diags)
 	}
 
@@ -334,13 +334,15 @@ func TestSubnetDataSourceReadByCombinedFilters(t *testing.T) {
 	configuredVPCID := strings.ToUpper(subnetTestVPCID.String())
 	configuredVPCName := " production "
 	configuredRegion := " vn-central-1 "
-	if diags := configState.Set(context.Background(), &SubnetDataSourceModel{SubnetModel: SubnetModel{
-		Name:    types.StringValue(configuredName),
-		CIDR:    types.StringValue(configuredCIDR),
-		VPCID:   types.StringValue(configuredVPCID),
-		VPCName: types.StringValue(configuredVPCName),
-		Region:  types.StringValue(configuredRegion),
-	}}); diags.HasError() {
+	if diags := configState.Set(context.Background(), &SubnetDataSourceModel{
+		SubnetModel: SubnetModel{
+			Name:    types.StringValue(configuredName),
+			CIDR:    types.StringValue(configuredCIDR),
+			VPCName: types.StringValue(configuredVPCName),
+			Region:  types.StringValue(configuredRegion),
+		},
+		VPCID: types.StringValue(configuredVPCID),
+	}); diags.HasError() {
 		t.Fatalf("set data source config: %v", diags)
 	}
 
@@ -442,13 +444,15 @@ func TestPreserveConfiguredSubnetValuesUsesChangedBackendValues(t *testing.T) {
 	}
 
 	subnet := mockSubnet("backend-name", "description")
-	config := SubnetDataSourceModel{SubnetModel: SubnetModel{
-		Name:    types.StringValue("configured-name"),
-		CIDR:    types.StringValue("10.9.0.0/24"),
-		VPCID:   types.StringValue(core.UUID{7}.String()),
-		VPCName: types.StringValue("configured-vpc"),
-		Region:  types.StringValue("configured-region"),
-	}}
+	config := SubnetDataSourceModel{
+		SubnetModel: SubnetModel{
+			Name:    types.StringValue("configured-name"),
+			CIDR:    types.StringValue("10.9.0.0/24"),
+			VPCName: types.StringValue("configured-vpc"),
+			Region:  types.StringValue("configured-region"),
+		},
+		VPCID: types.StringValue(core.UUID{7}.String()),
+	}
 	var state SubnetDataSourceModel
 	populateSubnetDataSourceState(subnet, &state)
 	preserveConfiguredSubnetValues(subnet, config, &state)

@@ -45,8 +45,8 @@ build-%:
 # Install into the local Terraform plugin directory for hand-testing
 .PHONY: install
 install: build
-	mkdir -p ~/.terraform.d/plugins/registry.terraform.io/viettelcloud/viettelcloud/$(VERSION)/$(shell go env GOOS)_$(shell go env GOARCH)
-	cp $(BINARY)$(GOEXE) ~/.terraform.d/plugins/registry.terraform.io/viettelcloud/viettelcloud/$(VERSION)/$(shell go env GOOS)_$(shell go env GOARCH)/
+	mkdir -p ~/.terraform.d/plugins/registry.terraform.io/viettelcloud-oss/viettelcloud/$(VERSION)/$(shell go env GOOS)_$(shell go env GOARCH)
+	cp $(BINARY)$(GOEXE) ~/.terraform.d/plugins/registry.terraform.io/viettelcloud-oss/viettelcloud/$(VERSION)/$(shell go env GOOS)_$(shell go env GOARCH)/
 
 # Unit tests
 .PHONY: test

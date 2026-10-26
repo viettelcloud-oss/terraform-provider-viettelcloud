@@ -6,7 +6,7 @@ resource "viettelcloud_volume" "empty" {
 
   create_from = {
     source_type = "empty"
-    volume_type = "Ceph_HDD_1A_10K"
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -16,8 +16,8 @@ resource "viettelcloud_volume" "image" {
 
   create_from = {
     source_type = "image"
-    image       = "Ubuntu 24.04"
-    volume_type = "Ceph_HDD_1A_10K"
+    image       = { os = "Ubuntu", version = "22.04" }
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -26,9 +26,9 @@ resource "viettelcloud_volume" "custom_image" {
   size = 30
 
   create_from = {
-    source_type     = "custom_image"
-    custom_image_id = "00000000-0000-0000-0000-000000000001"
-    volume_type     = "Ceph_HDD_1A_10K"
+    source_type  = "custom_image"
+    custom_image = { id = "00000000-0000-0000-0000-000000000001" }
+    volume_type  = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -37,7 +37,7 @@ resource "viettelcloud_volume" "snapshot" {
 
   create_from = {
     source_type = "snapshot"
-    snapshot_id = "00000000-0000-0000-0000-000000000002"
+    snapshot    = { id = "00000000-0000-0000-0000-000000000002" }
   }
 }
 
@@ -47,7 +47,7 @@ resource "viettelcloud_volume" "backup" {
 
   create_from = {
     source_type = "backup"
-    backup_id   = "00000000-0000-0000-0000-000000000003"
-    volume_type = "Ceph_HDD_1A_10K"
+    backup      = { id = "00000000-0000-0000-0000-000000000003" }
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }

@@ -184,6 +184,8 @@ func resolveConfiguredProject(
 func (p *ViettelCloudProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		blockstorageprovider.NewVolumeResource,
+		blockstorageprovider.NewVolumeBackupResource,
+		blockstorageprovider.NewVolumeSnapshotResource,
 		networkprovider.NewVPCResource,
 		networkprovider.NewSubnetResource,
 		networkprovider.NewElasticIPResource,
@@ -192,6 +194,7 @@ func (p *ViettelCloudProvider) Resources(_ context.Context) []func() resource.Re
 		networkprovider.NewSecurityGroupRuleResource,
 		serverprovider.NewServerResource,
 		serverprovider.NewPlacementGroupResource,
+		serverprovider.NewCustomImageResource,
 		serverprovider.NewKeyPairResource,
 	}
 }
@@ -199,11 +202,14 @@ func (p *ViettelCloudProvider) Resources(_ context.Context) []func() resource.Re
 func (p *ViettelCloudProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		blockstorageprovider.NewVolumeDataSource,
+		blockstorageprovider.NewVolumeBackupDataSource,
+		blockstorageprovider.NewVolumeSnapshotDataSource,
 		networkprovider.NewVPCDataSource,
 		networkprovider.NewSubnetDataSource,
 		networkprovider.NewElasticIPDataSource,
 		networkprovider.NewPrivateIPDataSource,
 		serverprovider.NewPlacementGroupDataSource,
+		serverprovider.NewCustomImageDataSource,
 		serverprovider.NewKeyPairDataSource,
 		networkprovider.NewSecurityGroupDataSource,
 	}

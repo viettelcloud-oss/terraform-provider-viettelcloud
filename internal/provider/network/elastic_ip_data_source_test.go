@@ -177,10 +177,10 @@ func TestElasticIPDataSourceReadByFilters(t *testing.T) {
 
 	state := readElasticIPDataSource(t, dataSource, ElasticIPDataSourceModel{
 		ElasticIPModel: ElasticIPModel{
-			Region:    types.StringValue("vn-central"),
 			IPAddress: types.StringValue("  203.0.113.10  "),
 			Status:    types.StringValue("active"),
 		},
+		Region:    types.StringValue("vn-central"),
 		Available: types.BoolValue(true),
 	})
 
@@ -258,7 +258,8 @@ func TestElasticIPDataSourceReadRejectsInvalidCriteria(t *testing.T) {
 		{
 			name: "blank region filter",
 			config: ElasticIPDataSourceModel{
-				ElasticIPModel: ElasticIPModel{Region: types.StringValue(" "), ID: types.StringValue(elasticIPDataSourceTestUUID.String())},
+				ElasticIPModel: ElasticIPModel{ID: types.StringValue(elasticIPDataSourceTestUUID.String())},
+				Region:         types.StringValue(" "),
 			},
 			expectedSummary: "Invalid Elastic IP region filter",
 		},

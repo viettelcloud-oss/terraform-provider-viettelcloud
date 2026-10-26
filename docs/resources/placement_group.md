@@ -29,7 +29,9 @@ resource "viettelcloud_placement_group" "example" {
   name        = "my-placement-group"
   description = "Example placement group"
   policy      = "affinity"
-  region      = var.region
+  region = {
+    name = var.region
+  }
 }
 
 # Changing region forces a new Placement Group.
@@ -37,7 +39,9 @@ resource "viettelcloud_placement_group" "replacement" {
   name        = "my-placement-group-replacement"
   description = "Replacement placement group after region change"
   policy      = "affinity"
-  region      = var.replacement_region
+  region = {
+    name = var.replacement_region
+  }
 }
 ```
 
@@ -48,7 +52,7 @@ resource "viettelcloud_placement_group" "replacement" {
 
 - `name` (String) Name of the Placement Group.
 - `policy` (String) Placement Group policy: one of affinity, anti-affinity, soft-affinity, or soft-anti-affinity. Changing the policy replaces the Placement Group.
-- `region` (String) Project region name where the Placement Group is created. Changing the region replaces the Placement Group.
+- `region` (Attributes) Project region where the Placement Group is created. Changing the region replaces the Placement Group. (see [below for nested schema](#nestedatt--region))
 
 ### Optional
 
@@ -62,3 +66,10 @@ resource "viettelcloud_placement_group" "replacement" {
 - `region_id` (String) Region ID (UUID) backing the configured region.
 - `server_count` (Number) Number of servers currently assigned to the Placement Group.
 - `updated_at` (String) Timestamp when the Placement Group was last updated (RFC3339).
+
+<a id="nestedatt--region"></a>
+### Nested Schema for `region`
+
+Required:
+
+- `name` (String) Region name.

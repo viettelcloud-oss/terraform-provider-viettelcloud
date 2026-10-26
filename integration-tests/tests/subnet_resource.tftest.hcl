@@ -39,7 +39,7 @@ run "createSubnet_descriptionOmitted_completeSubnetStateReturned" {
       viettelcloud_subnet.subnet.name == "tf-test-subnet-before" &&
       viettelcloud_subnet.subnet.description == "" &&
       viettelcloud_subnet.subnet.cidr == "10.70.1.0/24" &&
-      viettelcloud_subnet.subnet.vpc_id == viettelcloud_vpc.vpc.id &&
+      viettelcloud_subnet.subnet.vpc.id == viettelcloud_vpc.vpc.id &&
       viettelcloud_subnet.subnet.vpc_name == "tf-test-subnet-resource-vpc" &&
       viettelcloud_subnet.subnet.region == "vn-central-1" &&
       length(viettelcloud_subnet.subnet.display_name) > 0 &&
@@ -202,7 +202,7 @@ run "changeCidr_existingSubnet_subnetReplaced" {
     condition = (
       viettelcloud_subnet.subnet.id != run.createSubnet_descriptionOmitted_completeSubnetStateReturned.subnet_id &&
       viettelcloud_subnet.subnet.cidr == "10.70.2.0/24" &&
-      viettelcloud_subnet.subnet.vpc_id == run.createSubnet_descriptionOmitted_completeSubnetStateReturned.vpc_id
+      viettelcloud_subnet.subnet.vpc.id == run.createSubnet_descriptionOmitted_completeSubnetStateReturned.vpc_id
     )
     error_message = "Changing CIDR did not replace the subnet with the expected state."
   }
@@ -229,7 +229,7 @@ run "changeVpc_existingSubnet_subnetReplacedAndParentRefreshed" {
     condition = (
       viettelcloud_vpc.vpc.id != run.createSubnet_descriptionOmitted_completeSubnetStateReturned.vpc_id &&
       viettelcloud_subnet.subnet.id != run.changeCidr_existingSubnet_subnetReplaced.subnet_id &&
-      viettelcloud_subnet.subnet.vpc_id == viettelcloud_vpc.vpc.id &&
+      viettelcloud_subnet.subnet.vpc.id == viettelcloud_vpc.vpc.id &&
       viettelcloud_subnet.subnet.vpc_name == "tf-test-subnet-resource-vpc" &&
       viettelcloud_subnet.subnet.region == "vn-central-1"
     )

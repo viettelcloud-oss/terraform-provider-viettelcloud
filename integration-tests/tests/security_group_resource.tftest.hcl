@@ -53,7 +53,7 @@ run "createSecurityGroup_allAttributesConfigured_completeStateReturned" {
       length(viettelcloud_security_group.security_group.id) > 0 &&
       viettelcloud_security_group.security_group.name == "tf-int-sg-lifecycle" &&
       viettelcloud_security_group.security_group.description == "Terraform integration test" &&
-      viettelcloud_security_group.security_group.region == "vn-central-1" &&
+      viettelcloud_security_group.security_group.region.name == "vn-central-1" &&
       length(viettelcloud_security_group.security_group.region_id) > 0 &&
       length(viettelcloud_security_group.security_group.project_id) > 0 &&
       length(viettelcloud_security_group.security_group.display_name) > 0 &&
@@ -85,7 +85,7 @@ run "planAgain_allAttributesConfigured_stateStable" {
       viettelcloud_security_group.security_group.id == run.createSecurityGroup_allAttributesConfigured_completeStateReturned.security_group_id &&
       viettelcloud_security_group.security_group.name == "tf-int-sg-lifecycle" &&
       viettelcloud_security_group.security_group.description == "Terraform integration test" &&
-      viettelcloud_security_group.security_group.region == "vn-central-1"
+      viettelcloud_security_group.security_group.region.name == "vn-central-1"
     )
     error_message = "Security group state was not preserved during refresh."
   }
@@ -220,7 +220,7 @@ run "createSecurityGroup_descriptionOmitted_emptyDescriptionReturned" {
       length(viettelcloud_security_group.security_group.id) > 0 &&
       viettelcloud_security_group.security_group.name == "tf-int-sg-omitted-description" &&
       viettelcloud_security_group.security_group.description == "" &&
-      viettelcloud_security_group.security_group.region == "vn-central-1" &&
+      viettelcloud_security_group.security_group.region.name == "vn-central-1" &&
       !viettelcloud_security_group.security_group.is_default
     )
     error_message = "Creating a security group without a description did not leave the backend's empty description in state."

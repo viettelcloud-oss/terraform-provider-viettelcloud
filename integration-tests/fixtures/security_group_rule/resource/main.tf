@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.10"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -41,13 +41,13 @@ variable "remote_ip_prefix" {
 }
 
 resource "viettelcloud_security_group_rule" "rule" {
-  security_group_id = var.security_group_id
-  direction         = var.direction
-  protocol          = var.protocol
-  description       = var.description
-  port_range_min    = var.port_range_min
-  port_range_max    = var.port_range_max
-  remote_ip_prefix  = var.remote_ip_prefix
+  security_group   = { id = var.security_group_id }
+  direction        = var.direction
+  protocol         = var.protocol
+  description      = var.description
+  port_range_min   = var.port_range_min
+  port_range_max   = var.port_range_max
+  remote_ip_prefix = var.remote_ip_prefix
 }
 
 output "rule_id" {
@@ -55,7 +55,7 @@ output "rule_id" {
 }
 
 output "rule_security_group_id" {
-  value = viettelcloud_security_group_rule.rule.security_group_id
+  value = viettelcloud_security_group_rule.rule.security_group.id
 }
 
 output "rule_security_group_name" {

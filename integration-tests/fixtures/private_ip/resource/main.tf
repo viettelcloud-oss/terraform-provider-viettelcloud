@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -64,35 +64,37 @@ locals {
 resource "viettelcloud_vpc" "vpc" {
   name   = var.vpc_name
   cidr   = var.vpc_cidr
-  region = var.region
+  region = { name = var.region }
 }
 
 resource "viettelcloud_subnet" "subnet" {
-  count  = length(local.subnet_cidrs)
-  name   = local.subnet_names[count.index]
-  cidr   = local.subnet_cidrs[count.index]
-  vpc_id = viettelcloud_vpc.vpc.id
+  count = length(local.subnet_cidrs)
+  name  = local.subnet_names[count.index]
+  cidr  = local.subnet_cidrs[count.index]
+  vpc   = { id = viettelcloud_vpc.vpc.id }
 }
 
 resource "viettelcloud_private_ip" "private_ip" {
-  subnet_id   = var.use_uppercase_representations ? upper(viettelcloud_subnet.subnet[var.subnet_index].id) : viettelcloud_subnet.subnet[var.subnet_index].id
+  subnet = {
+    id = var.use_uppercase_representations ? upper(viettelcloud_subnet.subnet[var.subnet_index].id) : viettelcloud_subnet.subnet[var.subnet_index].id
+  }
   description = var.private_ip_description
   ip_address  = var.private_ip_address
   mac_address = var.private_ip_mac_address != null && var.use_uppercase_representations ? upper(var.private_ip_mac_address) : var.private_ip_mac_address
-  allowed_vip_ids = var.allowed_vips_mode == "omit" ? null : var.allowed_vips_mode == "fixture" ? [
-    var.use_uppercase_representations ? upper(viettelcloud_private_ip.vip.id) : viettelcloud_private_ip.vip.id
+  allowed_vips = var.allowed_vips_mode == "omit" ? null : var.allowed_vips_mode == "fixture" ? [
+    { id = var.use_uppercase_representations ? upper(viettelcloud_private_ip.vip.id) : viettelcloud_private_ip.vip.id }
   ] : []
 }
 
 resource "viettelcloud_private_ip" "vip" {
-  subnet_id   = viettelcloud_subnet.subnet[var.subnet_index].id
+  subnet      = { id = viettelcloud_subnet.subnet[var.subnet_index].id }
   description = "Private IP used as an allowed VIP integration fixture"
 }
 
 # Keep a second resource on the omitted create path while the primary resource
 # exercises the create-with-allowed-VIPs path.
 resource "viettelcloud_private_ip" "without_allowed_vips" {
-  subnet_id   = viettelcloud_subnet.subnet[0].id
+  subnet      = { id = viettelcloud_subnet.subnet[0].id }
   description = "Private IP with allowed VIPs omitted at creation"
 }
 

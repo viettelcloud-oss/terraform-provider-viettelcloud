@@ -6,6 +6,8 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 type PlacementGroupModel struct {
@@ -13,7 +15,6 @@ type PlacementGroupModel struct {
 	Name        types.String `tfsdk:"name"`
 	Description types.String `tfsdk:"description"`
 	Policy      types.String `tfsdk:"policy"`
-	Region      types.String `tfsdk:"region"`
 	RegionID    types.String `tfsdk:"region_id"`
 	Project     types.String `tfsdk:"project"`
 	ServerCount types.Int64  `tfsdk:"server_count"`
@@ -23,10 +24,12 @@ type PlacementGroupModel struct {
 
 type PlacementGroupResourceModel struct {
 	PlacementGroupModel
+	Region types.Object `tfsdk:"region"`
 }
 
 type PlacementGroupDataSourceModel struct {
 	PlacementGroupModel
+	Region types.String `tfsdk:"region"`
 }
 
 func populatePlacementGroupModel(pg *serversdk.PlacementGroupSchema, m *PlacementGroupModel) {
@@ -37,7 +40,6 @@ func populatePlacementGroupModel(pg *serversdk.PlacementGroupSchema, m *Placemen
 	m.ID = types.StringValue(pg.Id.String())
 	m.Name = types.StringValue(pg.Name)
 	m.Description = types.StringValue(pg.Description)
-	m.Region = types.StringValue(pg.Region.Name)
 	m.RegionID = types.StringValue(pg.Region.Id.String())
 	m.Project = types.StringValue(pg.Project.Name)
 	m.CreatedAt = types.StringValue(pg.CreatedAt.Format(time.RFC3339))
@@ -61,8 +63,9 @@ func populatePlacementGroupResourceState(pg *serversdk.PlacementGroupSchema, sta
 	}
 
 	configuredName := state.Name
-	configuredRegion := state.Region
+	configuredRegion := reference.Get(state.Region, reference.Name)
 	populatePlacementGroupModel(pg, &state.PlacementGroupModel)
+	state.Region = reference.Value(reference.Name, types.StringValue(pg.Region.Name))
 
 	// buildPlacementGroupCreateBody and buildPlacementGroupUpdateBody trim outer
 	// whitespace from name and region before every request, so the backend
@@ -74,7 +77,7 @@ func populatePlacementGroupResourceState(pg *serversdk.PlacementGroupSchema, sta
 	}
 	if !configuredRegion.IsNull() && !configuredRegion.IsUnknown() &&
 		strings.TrimSpace(configuredRegion.ValueString()) == pg.Region.Name {
-		state.Region = configuredRegion
+		state.Region = reference.Value(reference.Name, configuredRegion)
 	}
 }
 
@@ -84,4 +87,5 @@ func populatePlacementGroupDataSourceState(pg *serversdk.PlacementGroupSchema, s
 	}
 
 	populatePlacementGroupModel(pg, &state.PlacementGroupModel)
+	state.Region = types.StringValue(pg.Region.Name)
 }

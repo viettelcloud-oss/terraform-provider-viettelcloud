@@ -7,11 +7,11 @@
 # second owner would delete it twice at teardown.
 
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -37,7 +37,7 @@ variable "image" {
 }
 
 variable "volume_type" {
-  type = string
+  type = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
 }
 
 variable "boot_volume_size" {
@@ -82,21 +82,25 @@ variable "security_group_ids" {
   default = null
 }
 
-# Terraform accepts an import block only in a root module, and a run's module
-# block replaces that run's root module. Writing the import inside the run
-# block itself fails as an unsupported block type.
+# The run loads this fixture through its module block. Keep the import here
+# because an import block inside a run block is unsupported.
 import {
   to = viettelcloud_server.imported
   id = var.server_id
 }
 
-# Only the attributes whose omission would plan a change are configured. name,
-# flavor, and boot are required. data_volumes is optional but forces
-# replacement, so a null list would not match the imported one. Everything else
-# is computed and keeps whatever the refresh read.
+# Import keeps conservative ownership. Configure each attached volume by ID.
+variable "data_volumes" {
+  type = list(object({
+    kind                  = optional(string, "existing")
+    id                    = string
+    delete_on_termination = optional(bool, false)
+  }))
+}
+
 resource "viettelcloud_server" "imported" {
   name = var.server_name
-  zone = var.zone
+  zone = { name = var.zone }
 
   flavor = {
     kind   = var.flavor_kind
@@ -106,20 +110,18 @@ resource "viettelcloud_server" "imported" {
     ram    = null
   }
 
+  # Import records only the name and ID of the selected volume type. Other
+  # criteria would plan an in-place update and make computed values unknown.
+  # Matching criteria keep the imported ID without a catalog lookup, so the
+  # ambiguous name is safe here.
   boot = {
     boot_type   = "image"
-    image       = var.image
-    volume_type = var.volume_type
+    image       = { name = var.image }
+    volume_type = { name = var.volume_type.name }
     volume_size = var.boot_volume_size
   }
 
-  # iops and delete_on_termination are computed, so the import records whatever
-  # the backend allocated and the provider defaulted. Leaving them unset here
-  # keeps those values instead of planning a change.
-  data_volumes = [{
-    volume_type = var.volume_type
-    volume_size = var.data_volume_size
-  }]
+  data_volumes = var.data_volumes
 }
 
 output "server_id" {

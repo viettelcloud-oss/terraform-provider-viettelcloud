@@ -7,8 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
-	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
+	blockstorageselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/selector"
+	serverselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/selector"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/selector"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -16,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -25,10 +27,13 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	blockstoragelookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/lookup"
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/lookup"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
 var (
@@ -62,10 +67,9 @@ type volumeUpdatePlan struct {
 	body       blockstoragesdk.VolumePartialUpdateSchema
 	patch      bool
 	extendSize *int
-	// retypeName is the volume type the volume must end up on, empty when it is
-	// unchanged. It travels through the retype action for the same reason a
-	// resize travels through extend.
-	retypeName string
+	// retypeSelector holds changed criteria, or null when the type is unchanged.
+	// The backend applies a retype through its own action, like a resize.
+	retypeSelector types.Object
 }
 
 func NewVolumeResource() resource.Resource {
@@ -78,7 +82,14 @@ func (r *VolumeResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	requiresReplace := []planmodifier.String{stringplanmodifier.RequiresReplace()}
+	replaceReference := []planmodifier.Object{objectplanmodifier.RequiresReplace()}
 	useStateForUnknown := []planmodifier.String{stringplanmodifier.UseStateForUnknown()}
+	imageSelector := serverselector.ImageAttribute()
+	imageSelector.Description += " Valid only for image sources. Selecting a different image replaces the volume."
+
+	volumeTypeSelector := blockstorageselector.VolumeTypeAttribute()
+	volumeTypeSelector.Description += " Required except for snapshot sources. Selecting a different type retypes the volume in place."
+
 	resp.Schema = schema.Schema{
 		Description: "Manage a Viettel Cloud Block Storage volume.",
 		Attributes: map[string]schema.Attribute{
@@ -123,13 +134,14 @@ func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Description:   "Whether the volume is encrypted.",
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
-			"zone": schema.StringAttribute{
+			"zone": schema.SingleNestedAttribute{
 				Optional:    true,
 				Computed:    true,
 				Description: "Zone where the volume is created. Changing it replaces the volume. Removing it keeps the current zone. Do not set it for snapshot sources.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+				Attributes:  reference.PreservedAttributes(reference.Name, "Zone name."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+					objectplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"zone_id": schema.StringAttribute{
@@ -158,32 +170,28 @@ func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 						Description:   "Source type: empty, image, custom_image, snapshot, or backup.",
 						PlanModifiers: requiresReplace,
 					},
-					"image": schema.StringAttribute{
+					"image": imageSelector,
+					"custom_image": schema.SingleNestedAttribute{
 						Optional:      true,
-						Description:   "Unique exact image name; valid only for an image source.",
-						PlanModifiers: requiresReplace,
+						Description:   "Source custom image; valid only for a custom_image source.",
+						Attributes:    reference.Attributes(reference.ID, "Custom image ID (UUID)."),
+						PlanModifiers: replaceReference,
 					},
-					"custom_image_id": schema.StringAttribute{
+					"snapshot": schema.SingleNestedAttribute{
 						Optional:      true,
-						Description:   "Custom image ID (UUID); valid only for a custom_image source.",
-						PlanModifiers: requiresReplace,
+						Description:   "Source snapshot; valid only for a snapshot source.",
+						Attributes:    reference.Attributes(reference.ID, "Snapshot ID (UUID)."),
+						PlanModifiers: replaceReference,
 					},
-					"snapshot_id": schema.StringAttribute{
+					"backup": schema.SingleNestedAttribute{
 						Optional:      true,
-						Description:   "Snapshot ID (UUID); valid only for a snapshot source.",
-						PlanModifiers: requiresReplace,
-					},
-					"backup_id": schema.StringAttribute{
-						Optional:      true,
-						Description:   "Backup ID (UUID); valid only for a backup source.",
-						PlanModifiers: requiresReplace,
+						Description:   "Source backup; valid only for a backup source.",
+						Attributes:    reference.Attributes(reference.ID, "Backup ID (UUID)."),
+						PlanModifiers: replaceReference,
 					},
 					// The backend retypes a volume in place, so changing this
-					// name updates the volume instead of replacing it.
-					"volume_type": schema.StringAttribute{
-						Optional:    true,
-						Description: "Unique exact ready volume type name. Required except for a snapshot source, which takes its type from the snapshot. Changing it retypes the volume in place.",
-					},
+					// selector updates the volume instead of replacing it.
+					"volume_type": volumeTypeSelector,
 				},
 			},
 		},
@@ -215,11 +223,11 @@ func (r *VolumeResource) ValidateConfig(ctx context.Context, req resource.Valida
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == "" {
 		resp.Diagnostics.AddError("Missing volume name", "name must be configured, known, and non-empty.")
 	}
-	// Rejecting surrounding whitespace keeps zone comparable as a plain string,
-	// so RequiresReplaceIfConfigured cannot replace a volume over padding.
-	if !config.Zone.IsNull() && !config.Zone.IsUnknown() {
-		if zone := config.Zone.ValueString(); strings.TrimSpace(zone) == "" || strings.TrimSpace(zone) != zone {
-			resp.Diagnostics.AddError("Invalid volume zone", "zone must be non-empty and have no leading or trailing whitespace when configured.")
+	// Rejecting surrounding whitespace keeps zone.name comparable as a plain
+	// string, so RequiresReplaceIfConfigured cannot replace a volume over padding.
+	if zone := reference.Get(config.Zone, reference.Name); !zone.IsNull() && !zone.IsUnknown() {
+		if name := zone.ValueString(); strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
+			resp.Diagnostics.AddAttributeError(path.Root("zone").AtName(reference.Name), "Invalid volume zone", "zone.name must be non-empty and have no leading or trailing whitespace when configured.")
 		}
 	}
 	resp.Diagnostics.Append(validateVolumeCreateFromConfig(ctx, config.CreateFrom, config.Size)...)
@@ -287,7 +295,7 @@ func (r *VolumeResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 			return
 		}
 		if config.Zone.IsNull() {
-			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone"), types.StringUnknown())...)
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone"), types.ObjectUnknown(reference.AttributeTypes(reference.Name)))...)
 		}
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone_id"), types.StringUnknown())...)
 		return
@@ -303,16 +311,31 @@ func (r *VolumeResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		return
 	}
 
+	imageChanged, typeChanged := r.planSelectors(ctx, req, resp, plan, state, config.Zone)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if imageChanged {
+		validateCreate()
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if config.Zone.IsNull() {
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone"), types.ObjectUnknown(reference.AttributeTypes(reference.Name)))...)
+		}
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone_id"), types.StringUnknown())...)
+		return
+	}
 	// A retype is the one in-place path that can move a value the schema
 	// otherwise freezes with UseStateForUnknown. Leaving the prior zone or
 	// encryption flag in the plan would fail the apply with an inconsistent
 	// result after the volume has already been retyped. The plan therefore
 	// stops claiming to know them.
-	if volumeRetypePossible(planned, current) {
+	if typeChanged {
 		// A configured zone stays in the plan because Terraform cannot turn a
 		// configured value into an unknown one. Retype lookup uses its zone ID.
 		if config.Zone.IsNull() {
-			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone"), types.StringUnknown())...)
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone"), types.ObjectUnknown(reference.AttributeTypes(reference.Name)))...)
 		}
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone_id"), types.StringUnknown())...)
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("encrypted"), types.BoolUnknown())...)
@@ -339,7 +362,7 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	var configuredZone types.String
+	var configuredZone types.Object
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("zone"), &configuredZone)...)
 	if configuredZone.IsUnknown() {
 		configuredZone = plan.Zone
@@ -363,6 +386,10 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	resp.Diagnostics.Append(recordVolumeSelectorIDs(ctx, body, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	volume, err := r.client.CreateVolume(ctx, blockstoragesdk.CreateVolumeParams{ProjectID: r.projectID}, body)
 	if err != nil {
 		resp.Diagnostics.AddError("Error creating volume", err.Error())
@@ -455,8 +482,8 @@ func (r *VolumeResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	// The retype is resolved against the size the volume ends up with, so a type
 	// too small for the planned growth is reported before anything is changed.
-	if update.retypeName != "" {
-		var configuredZone types.String
+	if !update.retypeSelector.IsNull() {
+		var configuredZone types.Object
 		resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("zone"), &configuredZone)...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -470,7 +497,15 @@ func (r *VolumeResource) Update(ctx context.Context, req resource.UpdateRequest,
 			}
 			zoneID = &id
 		}
-		resp.Diagnostics.Append(r.retype(ctx, volumeID, update.retypeName, volumeTargetSize(plan, state), zoneID)...)
+		resolved, typeDiags := r.retype(ctx, volumeID, update.retypeSelector, volumeTargetSize(plan, state), zoneID, state.CreateFrom)
+		resp.Diagnostics.Append(typeDiags...)
+		if !typeDiags.HasError() {
+			source, sourceDiags := volumeCreateFromModel(ctx, plan.CreateFrom)
+			resp.Diagnostics.Append(sourceDiags...)
+			if !sourceDiags.HasError() {
+				resp.Diagnostics.Append(setVolumeSelectors(ctx, &plan.CreateFrom, source.Image, resolved)...)
+			}
+		}
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -557,15 +592,11 @@ func (r *VolumeResource) ImportState(ctx context.Context, req resource.ImportSta
 		)
 		return
 	}
-	attributeTypes := volumeCreateFromAttributeTypes()
-	createFrom, diags := types.ObjectValue(attributeTypes, map[string]attr.Value{
-		"source_type":     types.StringValue(sourceType),
-		"image":           types.StringNull(),
-		"custom_image_id": types.StringNull(),
-		"snapshot_id":     types.StringNull(),
-		"backup_id":       types.StringNull(),
-		"volume_type":     types.StringNull(),
-	})
+	createFrom, diags := volumeCreateFromObject(
+		map[string]types.String{"source_type": types.StringValue(sourceType)},
+		types.ObjectNull(serverselector.ImageAttributeTypes()),
+		types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes()),
+	)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -573,6 +604,87 @@ func (r *VolumeResource) ImportState(ctx context.Context, req resource.ImportSta
 	// Read fills in the rest of create_from from the response; source_type only
 	// has to be present so it can pick the matching origin.
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("create_from"), createFrom)...)
+}
+
+// planSelectors decides replacement and retype from catalog identity.
+func (r *VolumeResource) planSelectors(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, plan, state VolumeResourceModel, configuredZone types.Object) (bool, bool) {
+	planned, diags := volumeCreateFromModel(ctx, plan.CreateFrom)
+	resp.Diagnostics.Append(diags...)
+	prior, diags := volumeCreateFromModel(ctx, state.CreateFrom)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return false, false
+	}
+	decide := func(planned, prior types.Object, field string, image bool) bool {
+		if planned.IsNull() && prior.IsNull() {
+			return false
+		}
+		p := path.Root("create_from").AtName(field)
+		find := func(ctx context.Context) ([]core.UUID, error) {
+			var ids []core.UUID
+			if image {
+				filter, diags := serverselector.ImageFilter(ctx, planned, p.String())
+				if diags.HasError() {
+					return nil, fmt.Errorf("%v", diags)
+				}
+				candidates, err := serverlookup.NewImageFinder(r.server, r.projectID).Find(ctx, filter)
+				for _, candidate := range candidates {
+					ids = append(ids, candidate.Id)
+				}
+				return ids, err
+			}
+			filter, diags := blockstorageselector.VolumeTypeFilter(ctx, planned, p.String())
+			if diags.HasError() {
+				return nil, fmt.Errorf("%v", diags)
+			}
+			zoneID, diags := r.resolveZoneID(ctx, configuredZone)
+			if diags.HasError() {
+				return nil, fmt.Errorf("%v", diags)
+			}
+			filter.ZoneID = zoneID
+			candidates, err := blockstoragelookup.NewVolumeTypeFinder(r.client).Find(ctx, filter)
+			for _, candidate := range candidates {
+				ids = append(ids, candidate.Id)
+			}
+			return ids, err
+		}
+		current := func(ctx context.Context) (core.UUID, error) {
+			id, err := core.ParseUUID(state.ID.ValueString())
+			if err != nil {
+				return core.UUID{}, err
+			}
+			volume, err := r.get(ctx, id)
+			if err != nil {
+				return core.UUID{}, err
+			}
+			if volume != nil {
+				if image && volume.CreateFrom.Image != nil {
+					return volume.CreateFrom.Image.Id, nil
+				}
+				if !image && volume.CreateFrom.VolumeType != nil {
+					return volume.CreateFrom.VolumeType.Id, nil
+				}
+			}
+			return core.UUID{}, fmt.Errorf("volume %s: %w", field, selector.ErrNoIdentity)
+		}
+		decision, id, diags := selector.Decide(ctx, planned, prior, p.String(), find, current)
+		resp.Diagnostics.Append(diags...)
+		if image && decision != selector.Same {
+			resp.RequiresReplace = append(resp.RequiresReplace, p)
+		}
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, p, selector.WithID(planned, id))...)
+		return decision != selector.Same
+	}
+	if plan.CreateFrom.IsUnknown() {
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("create_from").AtName("image"))
+		return true, true
+	}
+	imageChanged := decide(planned.Image, prior.Image, "image", true)
+	if resp.Diagnostics.HasError() {
+		return imageChanged, false
+	}
+	typeChanged := decide(planned.VolumeType, prior.VolumeType, "volume_type", false)
+	return imageChanged, typeChanged
 }
 
 func (r *VolumeResource) get(ctx context.Context, id core.UUID) (*blockstoragesdk.VolumeDetailSchema, error) {
@@ -583,18 +695,19 @@ func (r *VolumeResource) get(ctx context.Context, id core.UUID) (*blockstoragesd
 // create_from.volume_type name that exists in more than one zone can be
 // narrowed to the zone the volume is meant to land in. A volume with no
 // configured zone resolves its type across every zone, as before.
-func (r *VolumeResource) resolveZoneID(ctx context.Context, zone types.String) (*core.UUID, diag.Diagnostics) {
+func (r *VolumeResource) resolveZoneID(ctx context.Context, zone types.Object) (*core.UUID, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	if zone.IsNull() || zone.IsUnknown() {
+	zoneName := reference.Get(zone, reference.Name)
+	if zoneName.IsNull() || zoneName.IsUnknown() {
 		return nil, diags
 	}
-	name := strings.TrimSpace(zone.ValueString())
+	name := strings.TrimSpace(zoneName.ValueString())
 	if name == "" {
 		return nil, diags
 	}
 	resolved, err := projectlookup.NewZoneFinder(r.projectClient, r.projectID).Resolve(ctx, projectlookup.ZoneFilter{Name: &name})
 	if err != nil {
-		diags.AddError("Unable to resolve zone", fmt.Sprintf("zone: %s", err))
+		diags.AddError("Unable to resolve zone", fmt.Sprintf("zone.name: %s", err))
 		return nil, diags
 	}
 	return &resolved.Id, diags
@@ -603,9 +716,9 @@ func (r *VolumeResource) resolveZoneID(ctx context.Context, zone types.String) (
 // validateVolumeCreatePlacement checks a configured zone and its volume type
 // before Terraform destroys a volume for replacement. Create resolves them
 // again because the catalogue can change between plan and apply.
-func (r *VolumeResource) validateVolumeCreatePlacement(ctx context.Context, plan VolumeResourceModel, zone types.String) diag.Diagnostics {
+func (r *VolumeResource) validateVolumeCreatePlacement(ctx context.Context, plan VolumeResourceModel, zone types.Object) diag.Diagnostics {
 	var diags diag.Diagnostics
-	if zone.IsNull() || zone.IsUnknown() || strings.TrimSpace(zone.ValueString()) == "" {
+	if zoneName := reference.Get(zone, reference.Name); zoneName.IsNull() || zoneName.IsUnknown() || strings.TrimSpace(zoneName.ValueString()) == "" {
 		return diags
 	}
 	source, sourceDiags := volumeCreateFromModel(ctx, plan.CreateFrom)
@@ -619,42 +732,53 @@ func (r *VolumeResource) validateVolumeCreatePlacement(ctx context.Context, plan
 	if diags.HasError() {
 		return diags
 	}
-	if source.VolumeType.IsNull() || source.VolumeType.IsUnknown() || plan.Size.IsNull() || plan.Size.IsUnknown() {
+	if source.VolumeType.IsNull() || selector.HasUnknown(source.VolumeType) || plan.Size.IsNull() || plan.Size.IsUnknown() {
 		return diags
 	}
-	_, err := blockstoragelookup.NewVolumeTypeFinder(r.client).ResolveForCreate(ctx, blockstoragelookup.VolumeTypeResolveRequest{
-		Name: source.VolumeType.ValueString(), ZoneID: zoneID, RequestedSize: int(plan.Size.ValueInt64()),
-	})
-	if err != nil {
-		diags.AddError("Unable to resolve volume type", fmt.Sprintf("create_from.volume_type: %s", err))
-	}
+	_, typeDiags := blockstorageselector.ResolveVolumeType(ctx, source.VolumeType, "create_from.volume_type", zoneID, int(plan.Size.ValueInt64()), blockstoragelookup.NewVolumeTypeFinder(r.client).ResolveForCreate)
+	diags.Append(typeDiags...)
 	return diags
 }
 
-// retype moves the volume onto the volume type named by name. The backend
-// exposes retype as its own action, so a changed create_from.volume_type does
-// not have to destroy a volume that holds data. A configured zone narrows an
-// ambiguous type name; an omitted zone keeps the prior lookup behavior.
-func (r *VolumeResource) retype(ctx context.Context, volumeID core.UUID, name string, size int, zoneID *core.UUID) diag.Diagnostics {
-	var diags diag.Diagnostics
-	volumeType, err := blockstoragelookup.NewVolumeTypeFinder(r.client).ResolveForCreate(ctx, blockstoragelookup.VolumeTypeResolveRequest{
-		Name:          name,
-		ZoneID:        zoneID,
-		RequestedSize: size,
-	})
-	if err != nil {
-		diags.AddError("Unable to resolve volume type", fmt.Sprintf("create_from.volume_type: %s", err))
-		return diags
+// retype changes the volume type through the dedicated backend action.
+// The configured criteria and zone select the target without replacing the
+// volume that holds the data.
+func (r *VolumeResource) retype(ctx context.Context, volumeID core.UUID, value types.Object, size int, zoneID *core.UUID, prior types.Object) (types.Object, diag.Diagnostics) {
+	volumeType, diags := blockstorageselector.ResolveVolumeType(ctx, value, "create_from.volume_type", zoneID, size, blockstoragelookup.NewVolumeTypeFinder(r.client).ResolveForCreate)
+	if diags.HasError() {
+		return value, diags
+	}
+	source, sourceDiags := volumeCreateFromModel(ctx, prior)
+	diags.Append(sourceDiags...)
+	if diags.HasError() {
+		return value, diags
+	}
+	currentID, known := selector.ID(source.VolumeType)
+	if !known {
+		volume, err := r.get(ctx, volumeID)
+		if err != nil {
+			diags.AddError("Unable to read volume type identity", err.Error())
+			return value, diags
+		}
+		if volume == nil || volume.CreateFrom.VolumeType == nil {
+			diags.AddError("Unable to read volume type identity", "The volume response does not identify its volume type.")
+			return value, diags
+		}
+		currentID = volume.CreateFrom.VolumeType.Id
+	}
+	value = selector.WithID(value, types.StringValue(volumeType.Id.String()))
+	if currentID == volumeType.Id {
+		return value, diags
 	}
 	body := blockstoragesdk.VolumeRetypeSchema{VolumeTypeId: volumeType.Id}
 	if err := r.client.RetypeVolume(ctx, volumeID, blockstoragesdk.RetypeVolumeParams{ProjectID: r.projectID}, body); err != nil {
 		diags.AddError("Error retyping volume", err.Error())
-		return diags
+		return value, diags
 	}
-	if err := r.waitUntilRetyped(ctx, volumeID, volumeType.Name); err != nil {
+	if err := r.waitUntilRetyped(ctx, volumeID, volumeType.Id); err != nil {
 		diags.AddError("Error waiting for volume retype", err.Error())
 	}
-	return diags
+	return value, diags
 }
 
 func (r *VolumeResource) waitUntilReady(ctx context.Context, id core.UUID) error {
@@ -708,25 +832,25 @@ func (r *VolumeResource) waitUntilPatched(ctx context.Context, id core.UUID, bod
 // waitUntilRetyped waits until the volume reports the new volume type. Like
 // the extend action, retype only returns "accepted", so the effective volume
 // type is the observable that settles rather than the status.
-func (r *VolumeResource) waitUntilRetyped(ctx context.Context, id core.UUID, name string) error {
+func (r *VolumeResource) waitUntilRetyped(ctx context.Context, id core.UUID, typeID core.UUID) error {
 	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
 		volume, err := r.get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("poll volume %s: %w", id, err)
 		}
-		if volumeStatusReady(volume.Status) && volume.CreateFrom.VolumeType != nil && volume.CreateFrom.VolumeType.Name == name {
+		if volumeStatusReady(volume.Status) && volume.CreateFrom.VolumeType != nil && volume.CreateFrom.VolumeType.Id == typeID {
 			return volume, nil
 		}
 		if volumeStatusFailed(volume.Status) {
-			return nil, fmt.Errorf("volume %s entered terminal status %q while retyping to %q", id, volume.Status, name)
+			return nil, fmt.Errorf("volume %s entered terminal status %q while retyping to %q", id, volume.Status, typeID)
 		}
 		current := ""
 		if volume.CreateFrom.VolumeType != nil {
-			current = volume.CreateFrom.VolumeType.Name
+			current = volume.CreateFrom.VolumeType.Id.String()
 		}
 		return nil, fmt.Errorf("status=%s, volume_type=%q: %w", volume.Status, current, wait.ErrNotReady)
 	})
-	return volumeWaitError(err, id, fmt.Sprintf("become volume type %q", name))
+	return volumeWaitError(err, id, fmt.Sprintf("become volume type %s", typeID))
 }
 
 // waitUntilResized waits until the volume reports the new size. A ready status
@@ -802,6 +926,55 @@ func volumeWaitError(err error, id core.UUID, action string) error {
 	return fmt.Errorf("waiting for volume %s to %s: %w", id, action, err)
 }
 
+// recordVolumeSelectorIDs records resolved create identities before refresh.
+func recordVolumeSelectorIDs(ctx context.Context, body blockstoragesdk.VolumeCreateSchema, plan *VolumeResourceModel) diag.Diagnostics {
+	source, diags := volumeCreateFromModel(ctx, plan.CreateFrom)
+	if diags.HasError() {
+		return diags
+	}
+	value, err := body.CreateFrom.ValueByDiscriminator()
+	if err != nil {
+		diags.AddError("Unable to read resolved volume source", err.Error())
+		return diags
+	}
+	var imageID, volumeTypeID *core.UUID
+	switch value := value.(type) {
+	case blockstoragesdk.VolumeCreateFromImageSchema:
+		imageID, volumeTypeID = &value.ImageId, &value.VolumeTypeId
+	case blockstoragesdk.VolumeCreateFromCustomImageSchema:
+		volumeTypeID = &value.VolumeTypeId
+	case blockstoragesdk.VolumeCreateFromBackupSchema:
+		volumeTypeID = &value.VolumeTypeId
+	case blockstoragesdk.VolumeCreateEmptySchema:
+		volumeTypeID = &value.VolumeTypeId
+	}
+	if imageID != nil {
+		source.Image = selector.WithID(source.Image, types.StringValue(imageID.String()))
+	}
+	if volumeTypeID != nil {
+		source.VolumeType = selector.WithID(source.VolumeType, types.StringValue(volumeTypeID.String()))
+	}
+	diags.Append(setVolumeSelectors(ctx, &plan.CreateFrom, source.Image, source.VolumeType)...)
+	return diags
+}
+
+// setVolumeSelectors replaces the image and volume type selectors in
+// createFrom and keeps its other attributes.
+func setVolumeSelectors(ctx context.Context, createFrom *types.Object, image, volumeType types.Object) diag.Diagnostics {
+	var model VolumeCreateFromModel
+	diags := createFrom.As(ctx, &model, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return diags
+	}
+	model.Image, model.VolumeType = image, volumeType
+	value, valueDiags := types.ObjectValueFrom(ctx, volumeCreateFromAttributeTypes(), model)
+	diags.Append(valueDiags...)
+	if !diags.HasError() {
+		*createFrom = value
+	}
+	return diags
+}
+
 func buildVolumeCreateBody(
 	ctx context.Context,
 	plan VolumeResourceModel,
@@ -845,12 +1018,17 @@ func buildVolumeUpdatePlan(ctx context.Context, plan, state VolumeResourceModel)
 	}
 	planned, plannedDiags := volumeCreateFromModel(ctx, plan.CreateFrom)
 	diags.Append(plannedDiags...)
-	current, currentDiags := volumeCreateFromModel(ctx, state.CreateFrom)
-	diags.Append(currentDiags...)
 	if diags.HasError() {
 		return volumeUpdatePlan{}, diags
 	}
-	update.retypeName = volumeRetypeName(planned, current)
+	if !planned.VolumeType.IsNull() {
+		_, selectorDiags := blockstorageselector.VolumeTypeFilter(ctx, planned.VolumeType, "create_from.volume_type")
+		diags.Append(selectorDiags...)
+		if diags.HasError() {
+			return volumeUpdatePlan{}, diags
+		}
+	}
+	update.retypeSelector = volumeRetypeSelector(planned)
 	if !plan.Name.Equal(state.Name) {
 		value := strings.TrimSpace(plan.Name.ValueString())
 		update.body.Name = &value
@@ -924,7 +1102,7 @@ func populateVolumePendingState(state *VolumeResourceModel, id core.UUID) {
 	state.Bootable = types.BoolNull()
 	state.Encrypted = types.BoolNull()
 	if state.Zone.IsUnknown() {
-		state.Zone = types.StringNull()
+		state.Zone = types.ObjectNull(reference.AttributeTypes(reference.Name))
 	}
 	state.ZoneID = types.StringNull()
 	state.VolumeType = types.StringNull()
@@ -951,22 +1129,34 @@ func volumeStatusFailed(status blockstoragesdk.VolumeStatus) bool {
 	}
 }
 
-// volumeCreateFromModel decodes the create_from object into its model. A null
-// or unknown create_from yields the zero model, whose fields are all null, so
-// callers can read it without repeating the presence check.
-func volumeCreateFromModel(ctx context.Context, createFrom types.Object) (VolumeCreateFromModel, diag.Diagnostics) {
-	var source VolumeCreateFromModel
+// volumeCreateFromModel decodes the create_from object and reduces each
+// reference to its criterion. A null or unknown create_from yields the zero
+// source, whose fields are all null, so callers can read it without repeating
+// the presence check. A null or unknown reference yields a null or unknown
+// criterion to match.
+func volumeCreateFromModel(ctx context.Context, createFrom types.Object) (volumeSource, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	if createFrom.IsNull() || createFrom.IsUnknown() {
-		return source, diags
+		return volumeSource{}, diags
 	}
-	diags.Append(createFrom.As(ctx, &source, basetypes.ObjectAsOptions{})...)
-	return source, diags
+	var model VolumeCreateFromModel
+	diags.Append(createFrom.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return volumeSource{}, diags
+	}
+	return volumeSource{
+		SourceType:    model.SourceType,
+		Image:         model.Image,
+		CustomImageID: reference.Get(model.CustomImage, reference.ID),
+		SnapshotID:    reference.Get(model.Snapshot, reference.ID),
+		BackupID:      reference.Get(model.Backup, reference.ID),
+		VolumeType:    model.VolumeType,
+	}, diags
 }
 
 // validateVolumeSnapshotZone rejects a zone that the snapshot creation request
 // cannot honor. The SDK accepts only a snapshot ID for that source.
-func validateVolumeSnapshotZone(ctx context.Context, zone types.String, createFrom types.Object) diag.Diagnostics {
+func validateVolumeSnapshotZone(ctx context.Context, zone, createFrom types.Object) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if zone.IsNull() || zone.IsUnknown() {
 		return diags
@@ -995,37 +1185,23 @@ func validVolumeSourceType(sourceType string) bool {
 // that requires replacement. The comparison mirrors what those attribute plan
 // modifiers do — a plain inequality between plan and state. The resource and
 // the modifiers therefore cannot disagree about what counts as a replacement.
-// create_from.volume_type is excluded on purpose: it retypes in place.
-func volumeSourceReplaced(planned, current VolumeCreateFromModel) bool {
+// Image replacement and volume type retype use selector identity separately.
+func volumeSourceReplaced(planned, current volumeSource) bool {
 	return !planned.SourceType.Equal(current.SourceType) ||
-		!planned.Image.Equal(current.Image) ||
 		!planned.CustomImageID.Equal(current.CustomImageID) ||
 		!planned.SnapshotID.Equal(current.SnapshotID) ||
 		!planned.BackupID.Equal(current.BackupID)
 }
 
-// volumeRetypeName is the volume type the plan asks the volume to end up on, or
-// "" when it is unchanged. An omitted volume type is not a request to change it,
-// so only a configured name that differs from the effective one retypes the
-// volume. ModifyPlan and Update share this so the plan's view of a retype cannot
-// drift from the work the update performs.
-func volumeRetypeName(planned, current VolumeCreateFromModel) string {
-	if planned.VolumeType.IsUnknown() {
-		return ""
+// volumeRetypeSelector returns criteria that still need an identity decision.
+func volumeRetypeSelector(planned volumeSource) types.Object {
+	if planned.VolumeType.IsNull() || planned.VolumeType.IsUnknown() {
+		return types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())
 	}
-	name := strings.TrimSpace(planned.VolumeType.ValueString())
-	if name == "" || name == strings.TrimSpace(current.VolumeType.ValueString()) {
-		return ""
+	if !selector.Pending(planned.VolumeType) {
+		return types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())
 	}
-	return name
-}
-
-// volumeRetypePossible reports whether the plan may retype the volume. An
-// unknown volume type counts, because the plan cannot rule a retype out yet.
-// The values a retype moves have to be withdrawn while the plan is still being
-// shaped, not after the apply has already retyped the volume.
-func volumeRetypePossible(planned, current VolumeCreateFromModel) bool {
-	return planned.VolumeType.IsUnknown() || volumeRetypeName(planned, current) != ""
+	return planned.VolumeType
 }
 
 // validateVolumeCreateSize enforces the size rules that only apply when the
@@ -1048,7 +1224,7 @@ func validateVolumeCreateSize(ctx context.Context, createFrom types.Object, size
 	diags.AddError(
 		"Invalid size for snapshot source",
 		"size must be omitted because the snapshot determines it. A volume created from a snapshot can be grown afterwards, "+
-			"but the grown size cannot be carried into a new volume: remove size before changing create_from.snapshot_id.",
+			"but the grown size cannot be carried into a new volume: remove size before changing create_from.snapshot.",
 	)
 	return diags
 }
@@ -1063,8 +1239,8 @@ func validateVolumeCreateFromConfig(ctx context.Context, createFrom types.Object
 		return diags
 	}
 
-	var source VolumeCreateFromModel
-	diags.Append(createFrom.As(ctx, &source, basetypes.ObjectAsOptions{})...)
+	source, sourceDiags := volumeCreateFromModel(ctx, createFrom)
+	diags.Append(sourceDiags...)
 	if diags.HasError() {
 		return diags
 	}
@@ -1089,14 +1265,6 @@ func validateVolumeCreateFromConfig(ctx context.Context, createFrom types.Object
 		)
 	}
 
-	validateRequiredString := func(value types.String, field, summary string) {
-		if value.IsUnknown() {
-			return
-		}
-		if value.IsNull() || strings.TrimSpace(value.ValueString()) == "" {
-			diags.AddError(summary, fmt.Sprintf("%s must be configured and non-empty for source_type %q.", field, sourceType))
-		}
-	}
 	validateUUID := func(value types.String, field string) {
 		if value.IsUnknown() {
 			return
@@ -1107,13 +1275,13 @@ func validateVolumeCreateFromConfig(ctx context.Context, createFrom types.Object
 
 	switch sourceType {
 	case volumeSourceTypeImage:
-		validateRequiredString(source.Image, "create_from.image", "Missing image")
+		diags.Append(selector.Validate(source.Image, "create_from.image", false)...)
 	case volumeSourceTypeCustomImage:
-		validateUUID(source.CustomImageID, "create_from.custom_image_id")
+		validateUUID(source.CustomImageID, "create_from.custom_image.id")
 	case volumeSourceTypeSnapshot:
-		validateUUID(source.SnapshotID, "create_from.snapshot_id")
+		validateUUID(source.SnapshotID, "create_from.snapshot.id")
 	case volumeSourceTypeBackup:
-		validateUUID(source.BackupID, "create_from.backup_id")
+		validateUUID(source.BackupID, "create_from.backup.id")
 	}
 
 	// A snapshot determines the initial size, but the backend still accepts a
@@ -1123,7 +1291,7 @@ func validateVolumeCreateFromConfig(ctx context.Context, createFrom types.Object
 		return diags
 	}
 
-	validateRequiredString(source.VolumeType, "create_from.volume_type", "Missing volume type")
+	diags.Append(selector.Validate(source.VolumeType, "create_from.volume_type", false)...)
 	if size.IsNull() {
 		diags.AddError("Missing volume size", fmt.Sprintf("size is required for create_from.source_type %q.", sourceType))
 	} else if !size.IsUnknown() && size.ValueInt64() < 1 {
@@ -1147,8 +1315,8 @@ func buildVolumeCreateFrom(
 		return result, diags
 	}
 
-	var source VolumeCreateFromModel
-	diags.Append(createFrom.As(ctx, &source, basetypes.ObjectAsOptions{})...)
+	source, sourceDiags := volumeCreateFromModel(ctx, createFrom)
+	diags.Append(sourceDiags...)
 	if diags.HasError() {
 		return result, diags
 	}
@@ -1178,17 +1346,9 @@ func buildVolumeCreateFrom(
 		return int(size.ValueInt64()), true
 	}
 	resolveType := func(size int) (blockstoragesdk.VolumeTypeSchema, bool) {
-		if source.VolumeType.IsNull() || source.VolumeType.IsUnknown() || strings.TrimSpace(source.VolumeType.ValueString()) == "" {
-			diags.AddError("Missing volume type", fmt.Sprintf("create_from.volume_type is required for source_type %q.", sourceType))
-			return blockstoragesdk.VolumeTypeSchema{}, false
-		}
-		volumeType, err := resolveVolumeType(ctx, blockstoragelookup.VolumeTypeResolveRequest{
-			Name:          source.VolumeType.ValueString(),
-			ZoneID:        zoneID,
-			RequestedSize: size,
-		})
-		if err != nil {
-			diags.AddError("Unable to resolve volume type", fmt.Sprintf("create_from.volume_type: %s", err))
+		volumeType, typeDiags := blockstorageselector.ResolveVolumeType(ctx, source.VolumeType, "create_from.volume_type", zoneID, size, resolveVolumeType)
+		diags.Append(typeDiags...)
+		if typeDiags.HasError() {
 			return blockstoragesdk.VolumeTypeSchema{}, false
 		}
 		return volumeType, true
@@ -1212,14 +1372,9 @@ func buildVolumeCreateFrom(
 		if !ok {
 			return result, diags
 		}
-		if source.Image.IsNull() || source.Image.IsUnknown() || strings.TrimSpace(source.Image.ValueString()) == "" {
-			diags.AddError("Missing image", "create_from.image must be configured, known, and non-empty for an image source.")
-			return result, diags
-		}
-		imageName := source.Image.ValueString()
-		image, err := resolveImage(ctx, serverlookup.ImageFilter{Name: &imageName})
-		if err != nil {
-			diags.AddError("Unable to resolve image", fmt.Sprintf("create_from.image: %s", err))
+		image, imageDiags := serverselector.ResolveImage(ctx, source.Image, "create_from.image", resolveImage)
+		diags.Append(imageDiags...)
+		if imageDiags.HasError() {
 			return result, diags
 		}
 		if image.MinVolumeSize != nil && size < *image.MinVolumeSize {
@@ -1238,7 +1393,7 @@ func buildVolumeCreateFrom(
 		if !ok {
 			return result, diags
 		}
-		imageID, idDiags := parse.UUIDString(source.CustomImageID, "create_from.custom_image_id")
+		imageID, idDiags := parse.UUIDString(source.CustomImageID, "create_from.custom_image.id")
 		diags.Append(idDiags...)
 		volumeType, typeOK := resolveType(size)
 		if diags.HasError() || !typeOK {
@@ -1252,7 +1407,7 @@ func buildVolumeCreateFrom(
 			diags.AddError("Invalid size for snapshot source", "size must be omitted because the snapshot determines it.")
 			return result, diags
 		}
-		snapshotID, idDiags := parse.UUIDString(source.SnapshotID, "create_from.snapshot_id")
+		snapshotID, idDiags := parse.UUIDString(source.SnapshotID, "create_from.snapshot.id")
 		diags.Append(idDiags...)
 		if diags.HasError() {
 			return result, diags
@@ -1263,7 +1418,7 @@ func buildVolumeCreateFrom(
 		if !ok {
 			return result, diags
 		}
-		backupID, idDiags := parse.UUIDString(source.BackupID, "create_from.backup_id")
+		backupID, idDiags := parse.UUIDString(source.BackupID, "create_from.backup.id")
 		diags.Append(idDiags...)
 		volumeType, typeOK := resolveType(size)
 		if diags.HasError() || !typeOK {
@@ -1282,19 +1437,19 @@ func buildVolumeCreateFrom(
 // cannot use. includeUnknown selects the caller's stance on an unknown value:
 // ValidateConfig defers it to apply, while the create path has a fully known
 // plan and treats it as configured.
-func conflictingVolumeSourceFields(source VolumeCreateFromModel, sourceType string, includeUnknown bool) []string {
-	configured := func(value types.String) bool {
+func conflictingVolumeSourceFields(source volumeSource, sourceType string, includeUnknown bool) []string {
+	configured := func(value attr.Value) bool {
 		return !value.IsNull() && (includeUnknown || !value.IsUnknown())
 	}
 	fields := []struct {
 		name    string
-		value   types.String
+		value   attr.Value
 		forType string
 	}{
 		{name: "image", value: source.Image, forType: volumeSourceTypeImage},
-		{name: "custom_image_id", value: source.CustomImageID, forType: volumeSourceTypeCustomImage},
-		{name: "snapshot_id", value: source.SnapshotID, forType: volumeSourceTypeSnapshot},
-		{name: "backup_id", value: source.BackupID, forType: volumeSourceTypeBackup},
+		{name: "custom_image", value: source.CustomImageID, forType: volumeSourceTypeCustomImage},
+		{name: "snapshot", value: source.SnapshotID, forType: volumeSourceTypeSnapshot},
+		{name: "backup", value: source.BackupID, forType: volumeSourceTypeBackup},
 	}
 	var invalid []string
 	for _, field := range fields {

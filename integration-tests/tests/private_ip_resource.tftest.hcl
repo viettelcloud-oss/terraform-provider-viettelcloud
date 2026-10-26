@@ -4,6 +4,7 @@
 # Chain lifecycle (shared fixture state):
 #   run "createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured" {
 #   run "omitAllowedVips_attachedVips_attachmentsPreservedInPlace" {
+#   run "plan_allowedVipsOmitted_stateStable" {
 #   run "clearAllowedVips_attachedVips_attachmentsEmptyInPlace" {
 #   run "updateDescriptionAndVips_clearedVips_descriptionAndVipsUpdatedInPlace" {
 #   run "clearAllowedVips_updatedVips_attachmentsEmptyInPlace" {
@@ -44,7 +45,7 @@ run "createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured" {
       try(length(viettelcloud_private_ip.private_ip.description), 0) == 0 &&
       length(viettelcloud_private_ip.private_ip.ip_address) > 0 &&
       length(viettelcloud_private_ip.private_ip.mac_address) > 0 &&
-      viettelcloud_private_ip.private_ip.subnet_id == viettelcloud_subnet.subnet[0].id &&
+      viettelcloud_private_ip.private_ip.subnet.id == viettelcloud_subnet.subnet[0].id &&
       viettelcloud_private_ip.private_ip.subnet_name == "tf-test-private-ip-subnet-a" &&
       viettelcloud_private_ip.private_ip.subnet_cidr == "10.80.1.0/24" &&
       viettelcloud_private_ip.private_ip.vpc_id == viettelcloud_vpc.vpc.id &&
@@ -56,7 +57,7 @@ run "createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured" {
       length(viettelcloud_private_ip.private_ip.display_name) > 0 &&
       viettelcloud_private_ip.private_ip.port_security &&
       (viettelcloud_private_ip.private_ip.allowed_cidrs == null || can(toset(viettelcloud_private_ip.private_ip.allowed_cidrs))) &&
-      viettelcloud_private_ip.private_ip.allowed_vip_ids == toset([viettelcloud_private_ip.vip.id]) &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([viettelcloud_private_ip.vip.id]) &&
       try(length(viettelcloud_private_ip.private_ip.attached_vips), 0) == 1 &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].id == viettelcloud_private_ip.vip.id &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].ip_address == viettelcloud_private_ip.vip.ip_address &&
@@ -69,7 +70,7 @@ run "createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured" {
   assert {
     condition = (
       length(viettelcloud_private_ip.without_allowed_vips.id) > 0 &&
-      try(length(viettelcloud_private_ip.without_allowed_vips.allowed_vip_ids), 0) == 0 &&
+      try(length(viettelcloud_private_ip.without_allowed_vips.allowed_vips), 0) == 0 &&
       try(length(viettelcloud_private_ip.without_allowed_vips.attached_vips), 0) == 0
     )
     error_message = "The omitted allowed VIP create path unexpectedly configured an attachment."
@@ -93,11 +94,36 @@ run "omitAllowedVips_attachedVips_attachmentsPreservedInPlace" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured.private_ip_id &&
-      viettelcloud_private_ip.private_ip.allowed_vip_ids == toset([viettelcloud_private_ip.vip.id]) &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([viettelcloud_private_ip.vip.id]) &&
       length(viettelcloud_private_ip.private_ip.attached_vips) == 1 &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].id == viettelcloud_private_ip.vip.id
     )
     error_message = "Omitting allowed VIPs changed the backend set or replaced the private IP."
+  }
+}
+
+# Omitted allowed VIPs keep their prior set in the next plan. Any planned change
+# makes attached_vips unknown, so this plan-only run fails on a perpetual diff.
+run "plan_allowedVipsOmitted_stateStable" {
+  command = plan
+
+  module {
+    source = "./fixtures/private_ip/resource"
+  }
+
+  variables {
+    region   = "vn-central-1"
+    vpc_name = "tf-test-private-ip-resource-vpc"
+    vpc_cidr = "10.80.0.0/16"
+  }
+
+  assert {
+    condition = (
+      viettelcloud_private_ip.private_ip.id == run.createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured.private_ip_id &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([viettelcloud_private_ip.vip.id]) &&
+      length(viettelcloud_private_ip.private_ip.attached_vips) == 1
+    )
+    error_message = "Re-planning with allowed VIPs omitted proposed a change."
   }
 }
 
@@ -119,7 +145,7 @@ run "clearAllowedVips_attachedVips_attachmentsEmptyInPlace" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured.private_ip_id &&
-      try(length(viettelcloud_private_ip.private_ip.allowed_vip_ids), 0) == 0 &&
+      try(length(viettelcloud_private_ip.private_ip.allowed_vips), 0) == 0 &&
       try(length(viettelcloud_private_ip.private_ip.attached_vips), 0) == 0
     )
     error_message = "Explicitly clearing allowed VIPs replaced the private IP or retained an attachment."
@@ -146,7 +172,7 @@ run "updateDescriptionAndVips_clearedVips_descriptionAndVipsUpdatedInPlace" {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured.private_ip_id &&
       try(length(viettelcloud_private_ip.private_ip.description), 0) == 0 &&
-      viettelcloud_private_ip.private_ip.allowed_vip_ids == toset([viettelcloud_private_ip.vip.id]) &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([viettelcloud_private_ip.vip.id]) &&
       try(length(viettelcloud_private_ip.private_ip.attached_vips), 0) == 1 &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].id == viettelcloud_private_ip.vip.id &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].ip_address == viettelcloud_private_ip.vip.ip_address
@@ -173,7 +199,7 @@ run "clearAllowedVips_updatedVips_attachmentsEmptyInPlace" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.createPrivateIp_ipAndMacOmitted_addressesAllocatedAndVipsConfigured.private_ip_id &&
-      try(length(viettelcloud_private_ip.private_ip.allowed_vip_ids), 0) == 0 &&
+      try(length(viettelcloud_private_ip.private_ip.allowed_vips), 0) == 0 &&
       try(length(viettelcloud_private_ip.private_ip.attached_vips), 0) == 0
     )
     error_message = "Allowed VIPs were not cleared after the combined update."
@@ -297,7 +323,7 @@ run "configureMacAddress_existingPrivateIp_privateIpReplaced" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id != run.configureIpAddress_allocatedPrivateIp_privateIpReplaced.private_ip_id &&
-      viettelcloud_private_ip.private_ip.subnet_id == upper(viettelcloud_subnet.subnet[0].id) &&
+      viettelcloud_private_ip.private_ip.subnet.id == upper(viettelcloud_subnet.subnet[0].id) &&
       viettelcloud_private_ip.private_ip.mac_address == "02:AB:CD:00:80:10"
     )
     error_message = "Changing the configured MAC address did not replace the private IP."
@@ -325,7 +351,7 @@ run "plan_equivalentSubnetIdAndMacAddress_stateStable" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.configureMacAddress_existingPrivateIp_privateIpReplaced.private_ip_id &&
-      viettelcloud_private_ip.private_ip.subnet_id == upper(viettelcloud_subnet.subnet[0].id) &&
+      viettelcloud_private_ip.private_ip.subnet.id == upper(viettelcloud_subnet.subnet[0].id) &&
       viettelcloud_private_ip.private_ip.mac_address == "02:AB:CD:00:80:10"
     )
     error_message = "Equivalent UUID or MAC representations caused drift."
@@ -352,7 +378,7 @@ run "changeSubnet_existingPrivateIp_privateIpReplacedAndParentsRefreshed" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id != run.configureMacAddress_existingPrivateIp_privateIpReplaced.private_ip_id &&
-      viettelcloud_private_ip.private_ip.subnet_id == upper(viettelcloud_subnet.subnet[1].id) &&
+      viettelcloud_private_ip.private_ip.subnet.id == upper(viettelcloud_subnet.subnet[1].id) &&
       viettelcloud_private_ip.private_ip.subnet_name == "tf-test-private-ip-subnet-b" &&
       viettelcloud_private_ip.private_ip.subnet_cidr == "10.80.2.0/24" &&
       viettelcloud_private_ip.private_ip.vpc_id == viettelcloud_vpc.vpc.id &&
@@ -384,7 +410,7 @@ run "attachVipWithNormalizedId_existingPrivateIp_vipIdAndAddressPreserved" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.changeSubnet_existingPrivateIp_privateIpReplacedAndParentsRefreshed.private_ip_id &&
-      viettelcloud_private_ip.private_ip.allowed_vip_ids == toset([upper(viettelcloud_private_ip.vip.id)]) &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([upper(viettelcloud_private_ip.vip.id)]) &&
       try(length(viettelcloud_private_ip.private_ip.attached_vips), 0) == 1 &&
       tolist(viettelcloud_private_ip.private_ip.attached_vips)[0].ip_address == viettelcloud_private_ip.vip.ip_address
     )
@@ -412,8 +438,8 @@ run "plan_equivalentSubnetAndVipIds_stateStable" {
   assert {
     condition = (
       viettelcloud_private_ip.private_ip.id == run.changeSubnet_existingPrivateIp_privateIpReplacedAndParentsRefreshed.private_ip_id &&
-      viettelcloud_private_ip.private_ip.subnet_id == upper(viettelcloud_subnet.subnet[1].id) &&
-      viettelcloud_private_ip.private_ip.allowed_vip_ids == toset([upper(viettelcloud_private_ip.vip.id)])
+      viettelcloud_private_ip.private_ip.subnet.id == upper(viettelcloud_subnet.subnet[1].id) &&
+      toset(viettelcloud_private_ip.private_ip.allowed_vips[*].id) == toset([upper(viettelcloud_private_ip.vip.id)])
     )
     error_message = "Equivalent subnet or allowed VIP UUID representations caused drift."
   }

@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -17,24 +17,25 @@ variable "volumes" {
     size = optional(number)
     iops = optional(number)
     create_from = optional(object({
-      source_type     = optional(string, "empty")
-      image           = optional(string)
-      custom_image_id = optional(string)
-      snapshot_id     = optional(string)
-      backup_id       = optional(string)
-      # Per-volume override of var.volume_type. The backend retypes in place, so
-      # changing it for one fleet member exercises the update path without
+      source_type  = optional(string, "empty")
+      image        = optional(object({ name = optional(string), os = optional(string), version = optional(string), type = optional(string) }))
+      custom_image = optional(object({ id = string }))
+      snapshot     = optional(object({ id = string }))
+      backup       = optional(object({ id = string }))
+      # Per-volume override of var.volume_type. The backend retypes in place,
+      # so changing it for one fleet member exercises the update path without
       # touching the rest of the fleet.
-      volume_type = optional(string)
+      volume_type = optional(object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) }))
     }), {})
   }))
 }
 
 variable "volume_type" {
-  type = string
+  type = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
 }
 
-# Disambiguates volume_type when the same name exists in more than one zone.
+# Narrows var.volume_type to one zone, because the same criteria can match a
+# volume type in another zone.
 variable "zone" {
   type    = string
   default = null
@@ -52,19 +53,22 @@ resource "viettelcloud_volume" "volume" {
   size        = each.value.size
   iops        = each.value.iops
   # A snapshot determines the new volume's zone.
-  zone = each.value.create_from.source_type == "snapshot" ? null : var.zone
+  zone = (each.value.create_from.source_type == "snapshot" || var.zone == null
+    ? null
+    : { name = var.zone }
+  )
 
   create_from = {
-    source_type     = each.value.create_from.source_type
-    image           = each.value.create_from.image
-    custom_image_id = each.value.create_from.custom_image_id
-    snapshot_id     = each.value.create_from.snapshot_id
-    backup_id       = each.value.create_from.backup_id
+    source_type  = each.value.create_from.source_type
+    image        = each.value.create_from.image
+    custom_image = each.value.create_from.custom_image
+    snapshot     = each.value.create_from.snapshot
+    backup       = each.value.create_from.backup
     # A snapshot carries its own volume type, so the provider rejects the
     # attribute for that source.
     volume_type = (each.value.create_from.source_type == "snapshot"
       ? null
-      : coalesce(each.value.create_from.volume_type, var.volume_type)
+      : (each.value.create_from.volume_type != null ? each.value.create_from.volume_type : var.volume_type)
     )
   }
 }
@@ -77,24 +81,24 @@ output "volume_ids" {
 # updated_at is deliberately excluded: the backend may bump it on its own.
 output "volumes" {
   value = { for key, volume in viettelcloud_volume.volume : key => {
-    id                     = volume.id
-    name                   = volume.name
-    description            = volume.description
-    size                   = volume.size
-    iops                   = volume.iops
-    status                 = volume.status
-    bootable               = volume.bootable
-    encrypted              = volume.encrypted
-    zone                   = volume.zone
-    zone_id                = volume.zone_id
-    volume_type            = volume.volume_type
-    project_id             = volume.project_id
-    created_at             = volume.created_at
-    source_type            = volume.create_from.source_type
-    source_image           = volume.create_from.image
-    source_custom_image_id = volume.create_from.custom_image_id
-    source_snapshot_id     = volume.create_from.snapshot_id
-    source_backup_id       = volume.create_from.backup_id
-    source_volume_type     = volume.create_from.volume_type
+    id                  = volume.id
+    name                = volume.name
+    description         = volume.description
+    size                = volume.size
+    iops                = volume.iops
+    status              = volume.status
+    bootable            = volume.bootable
+    encrypted           = volume.encrypted
+    zone                = volume.zone
+    zone_id             = volume.zone_id
+    volume_type         = volume.volume_type
+    project_id          = volume.project_id
+    created_at          = volume.created_at
+    source_type         = volume.create_from.source_type
+    source_image        = volume.create_from.image
+    source_custom_image = volume.create_from.custom_image
+    source_snapshot     = volume.create_from.snapshot
+    source_backup       = volume.create_from.backup
+    source_volume_type  = volume.create_from.volume_type
   } }
 }

@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -21,10 +21,11 @@ variable "lookup_key" {
 }
 
 variable "volume_type" {
-  type = string
+  type = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
 }
 
-# Disambiguates volume_type when the same name exists in more than one zone.
+# Narrows var.volume_type to one zone, because the same criteria can match a
+# volume type in another zone.
 variable "zone" {
   type    = string
   default = null
@@ -36,7 +37,7 @@ resource "viettelcloud_volume" "volume" {
   name        = each.value.name
   description = each.value.description
   size        = each.value.size
-  zone        = var.zone
+  zone        = var.zone == null ? null : { name = var.zone }
 
   create_from = {
     source_type = "empty"
@@ -73,7 +74,7 @@ data "viettelcloud_volume" "by_bootable" {
 
 data "viettelcloud_volume" "by_zone" {
   name = viettelcloud_volume.volume[var.lookup_key].name
-  zone = viettelcloud_volume.volume[var.lookup_key].zone
+  zone = viettelcloud_volume.volume[var.lookup_key].zone.name
 }
 
 data "viettelcloud_volume" "by_all_filters" {
@@ -82,5 +83,5 @@ data "viettelcloud_volume" "by_all_filters" {
   size     = viettelcloud_volume.volume[var.lookup_key].size
   status   = " ${viettelcloud_volume.volume[var.lookup_key].status} "
   bootable = viettelcloud_volume.volume[var.lookup_key].bootable
-  zone     = " ${viettelcloud_volume.volume[var.lookup_key].zone} "
+  zone     = " ${viettelcloud_volume.volume[var.lookup_key].zone.name} "
 }

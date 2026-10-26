@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -64,11 +66,12 @@ func (r *SecurityGroupRuleResource) Schema(_ context.Context, _ resource.SchemaR
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"security_group_id": schema.StringAttribute{
+			"security_group": schema.SingleNestedAttribute{
 				Required:    true,
-				Description: "Security group ID (UUID) owning the rule.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+				Description: "Security group owning the rule.",
+				Attributes:  reference.Attributes(reference.ID, "Security group ID (UUID)."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
 			},
 			"security_group_name": schema.StringAttribute{
@@ -337,7 +340,7 @@ func buildSecurityGroupRuleCreateBody(plan SecurityGroupRuleResourceModel) (netw
 	var body networksdk.SecurityGroupRuleCreateSchema
 	var diags diag.Diagnostics
 
-	securityGroupID, parseDiags := parse.UUIDString(plan.SecurityGroupID, "security_group_id")
+	securityGroupID, parseDiags := parse.UUIDString(reference.Get(plan.SecurityGroup, reference.ID), "security_group.id")
 	diags.Append(parseDiags...)
 	if diags.HasError() {
 		return body, diags

@@ -21,7 +21,7 @@ resource "viettelcloud_volume" "empty" {
 
   create_from = {
     source_type = "empty"
-    volume_type = "Ceph_HDD_1A_10K"
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -31,8 +31,8 @@ resource "viettelcloud_volume" "image" {
 
   create_from = {
     source_type = "image"
-    image       = "Ubuntu 24.04"
-    volume_type = "Ceph_HDD_1A_10K"
+    image       = { os = "Ubuntu", version = "22.04" }
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -41,9 +41,9 @@ resource "viettelcloud_volume" "custom_image" {
   size = 30
 
   create_from = {
-    source_type     = "custom_image"
-    custom_image_id = "00000000-0000-0000-0000-000000000001"
-    volume_type     = "Ceph_HDD_1A_10K"
+    source_type  = "custom_image"
+    custom_image = { id = "00000000-0000-0000-0000-000000000001" }
+    volume_type  = { name = "Ceph_HDD_1A_10K" }
   }
 }
 
@@ -52,7 +52,7 @@ resource "viettelcloud_volume" "snapshot" {
 
   create_from = {
     source_type = "snapshot"
-    snapshot_id = "00000000-0000-0000-0000-000000000002"
+    snapshot    = { id = "00000000-0000-0000-0000-000000000002" }
   }
 }
 
@@ -62,8 +62,8 @@ resource "viettelcloud_volume" "backup" {
 
   create_from = {
     source_type = "backup"
-    backup_id   = "00000000-0000-0000-0000-000000000003"
-    volume_type = "Ceph_HDD_1A_10K"
+    backup      = { id = "00000000-0000-0000-0000-000000000003" }
+    volume_type = { name = "Ceph_HDD_1A_10K" }
   }
 }
 ```
@@ -81,7 +81,7 @@ resource "viettelcloud_volume" "backup" {
 - `description` (String) Optional volume description. Omitting it preserves the backend value; set it to an empty string to clear it.
 - `iops` (Number) Provisioned IOPS. Omitting it preserves the backend value.
 - `size` (Number) Volume size in GiB. Required except for snapshot sources; it can only be increased after creation.
-- `zone` (String) Zone where the volume is created. Changing it replaces the volume. Removing it keeps the current zone. Do not set it for snapshot sources.
+- `zone` (Attributes) Zone where the volume is created. Changing it replaces the volume. Removing it keeps the current zone. Do not set it for snapshot sources. (see [below for nested schema](#nestedatt--zone))
 
 ### Read-Only
 
@@ -104,11 +104,74 @@ Required:
 
 Optional:
 
-- `backup_id` (String) Backup ID (UUID); valid only for a backup source.
-- `custom_image_id` (String) Custom image ID (UUID); valid only for a custom_image source.
-- `image` (String) Unique exact image name; valid only for an image source.
-- `snapshot_id` (String) Snapshot ID (UUID); valid only for a snapshot source.
-- `volume_type` (String) Unique exact ready volume type name. Required except for a snapshot source, which takes its type from the snapshot. Changing it retypes the volume in place.
+- `backup` (Attributes) Source backup; valid only for a backup source. (see [below for nested schema](#nestedatt--create_from--backup))
+- `custom_image` (Attributes) Source custom image; valid only for a custom_image source. (see [below for nested schema](#nestedatt--create_from--custom_image))
+- `image` (Attributes) Image selector. Supply at least one criterion. Creation requires exactly one image. Changed criteria keep the current image when it still matches. Valid only for image sources. Selecting a different image replaces the volume. (see [below for nested schema](#nestedatt--create_from--image))
+- `snapshot` (Attributes) Source snapshot; valid only for a snapshot source. (see [below for nested schema](#nestedatt--create_from--snapshot))
+- `volume_type` (Attributes) Volume type selector. Supply at least one criterion. New selections require exactly one enabled, up volume type in the requested zone. Changed criteria keep the current type when it still matches. Required except for snapshot sources. Selecting a different type retypes the volume in place. (see [below for nested schema](#nestedatt--create_from--volume_type))
+
+<a id="nestedatt--create_from--backup"></a>
+### Nested Schema for `create_from.backup`
+
+Required:
+
+- `id` (String) Backup ID (UUID).
+
+
+<a id="nestedatt--create_from--custom_image"></a>
+### Nested Schema for `create_from.custom_image`
+
+Required:
+
+- `id` (String) Custom image ID (UUID).
+
+
+<a id="nestedatt--create_from--image"></a>
+### Nested Schema for `create_from.image`
+
+Optional:
+
+- `name` (String) Exact image name.
+- `os` (String) Exact operating system name.
+- `type` (String) Image type value from the SDK.
+- `version` (String) Exact operating system version. The provider filters this value locally.
+
+Read-Only:
+
+- `id` (String) ID of the selected catalog entry.
+
+
+<a id="nestedatt--create_from--snapshot"></a>
+### Nested Schema for `create_from.snapshot`
+
+Required:
+
+- `id` (String) Snapshot ID (UUID).
+
+
+<a id="nestedatt--create_from--volume_type"></a>
+### Nested Schema for `create_from.volume_type`
+
+Optional:
+
+- `disk_type` (String) Disk type value from the SDK, such as ssd or hdd.
+- `encryption_key_size` (String) Encryption key size value from the SDK, such as "0", "128", or "256".
+- `multiattach` (Boolean) Whether the volume type permits multiple server attachments. False is an explicit criterion.
+- `name` (String) Exact volume type name.
+- `speed` (String) Speed tier value from the SDK, such as 10k.
+
+Read-Only:
+
+- `id` (String) ID of the selected catalog entry.
+
+
+
+<a id="nestedatt--zone"></a>
+### Nested Schema for `zone`
+
+Optional:
+
+- `name` (String) Zone name. Required when the reference is configured.
 
 ## Import
 

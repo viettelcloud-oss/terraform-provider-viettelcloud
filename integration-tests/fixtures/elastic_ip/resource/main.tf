@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -25,7 +25,7 @@ variable "enable_ipv6" {
 resource "viettelcloud_elastic_ip" "elastic_ip" {
   description = var.description
   enable_ipv6 = var.enable_ipv6
-  region      = var.region
+  region      = { name = var.region }
 }
 
 output "elastic_ip_id" {

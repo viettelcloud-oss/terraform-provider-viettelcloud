@@ -6,11 +6,11 @@
 # region and asserts the rest against the values this module observed.
 
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -31,7 +31,7 @@ variable "description" {
 resource "viettelcloud_security_group" "security_group" {
   name        = var.name
   description = var.description
-  region      = var.region
+  region      = { name = var.region }
 }
 
 output "security_group_id" {
@@ -55,7 +55,7 @@ output "security_group_is_default" {
 }
 
 output "security_group_region" {
-  value = viettelcloud_security_group.security_group.region
+  value = viettelcloud_security_group.security_group.region.name
 }
 
 output "security_group_region_id" {

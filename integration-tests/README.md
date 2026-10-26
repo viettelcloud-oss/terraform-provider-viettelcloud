@@ -29,6 +29,8 @@ integration-tests/
   input variables.
 - `fixtures/<entity>/<target>` is an independent Terraform module loaded through
   `module.source` by the test file.
+- `fixtures/<entity>/source` creates prerequisite resources in a separate test
+  state. Terraform removes these resources after their dependent resources.
 - `fixtures/<entity>/import` is a separate module holding a config-driven
   `import` block, used by the test files that cover an import path. It is
   separate because `terraform test` has no import command and an `import` block
@@ -50,23 +52,29 @@ integration-tests/
 
 | Target | Coverage |
 | --- | --- |
+| Custom Image Resource | Create by volume name and ID, refresh, in-place updates, omit and clear, stable plans after omission, normalization, import, and teardown. Replacement covers disk format, volume name, and volume ID. Container-format replacement is N/A because the SDK supports only `bare`. Non-empty sharing requires an additional project UUID. |
+| Custom Image Data Source | Independent volume and image setup, direct ID, name, volume name and ID, region, OS, version, state, status, combined filters, full state mapping, and configured-value preservation |
 | Elastic IP Resource | Create and refresh, update/omit/clear description, replace address family, and teardown |
 | Elastic IP Data Source | Lookup by ID, IPv4/IPv6 address, status, region, availability, and combined filters; full state mapping and configured-value preservation |
 | Key Pair Resource | Create and refresh, generated private-key state, rename and normalization, public-key replacement and omission preservation, plan-only import, and teardown |
 | Key Pair Data Source | Lookup by ID, name, fingerprint, and combined filters; full state mapping and configured-value preservation |
-| Private IP Resource | Allocated and configured IP/MAC values, allowed VIP lifecycle, description lifecycle, replacement, normalization, and teardown with an attachment |
+| Private IP Resource | Allocated and configured IP/MAC values, allowed VIP lifecycle with stable plans after omission, description lifecycle, replacement, normalization, and teardown with an attachment |
 | Private IP Data Source | Direct ID and representative subnet/VPC name, ID, CIDR, and region selector combinations; full state mapping and configured-value preservation |
 | Placement Group Resource | Three parallel chains covering create and refresh, mutable and optional attributes, name and region normalization, policy replacement, plan-only import, and teardown. Region replacement is N/A until the test project provides a second region. |
 | Security Group Resource | Create and refresh, description lifecycle, rename in place, omitted-description no-drift, plan-only import, and teardown. Region replacement is N/A until the test project provides a second region. |
 | Security Group Data Source | Lookup by ID, name, region, default status, and combined filters; full state mapping and configured-value preservation |
-| Security Group Rule Resource | A shared test-owned security group and five parallel rule chains covering create and refresh, update/omit/clear description, backend-assigned optional values, direction/protocol/port-range/remote-prefix replacement, enum normalization, plan-only import, and teardown. security_group_id replacement is N/A because moving a rule requires a second security group. |
-| Server Resource | 15 independent parallel chains covering create/refresh, updates, attachments, power, coordinated offline resize/rebuild/start, replacement, flavor and attached-volume resize, import, and teardown |
+| Security Group Rule Resource | A shared test-owned security group and five parallel rule chains covering create and refresh, update/omit/clear description, backend-assigned optional values, direction/protocol/port-range/remote-prefix replacement, enum normalization, plan-only import, and teardown. `security_group` replacement is N/A because moving a rule requires a second security group. |
+| Server Resource | Create and refresh, mutable fields, network attachments, power, rebuild, resize, replacement, catalog selectors, import, and teardown that deletes server-owned volumes, private IPs, and elastic IPs. Data volumes cover new and existing attachments, including several existing volumes during creation. They cover reordering, addition, removal, switching, cleanup flags, omission, clearing during a server rename, and resize. Repeated plans preserve volume identity and backend IOPS. A data volume retype is N/A because the backend rejects a retype of an attached volume. Explicit IOPS updates lack live coverage because the volume type that the data-volume runs select fixes IOPS at one value, and an update needs a type that accepts an IOPS range. |
 | Subnet Resource | Create and refresh, update/omit/clear description, normalization, CIDR/VPC replacement, and teardown |
 | Subnet Data Source | Lookup by ID, name, CIDR, VPC ID/name, region, and combined filters; full state mapping and configured-value preservation |
 | VPC Resource | Create and refresh, update/omit/clear description, CIDR replacement, and teardown |
 | VPC Data Source | Lookup by ID, name, CIDR, region, and combined filters; full state mapping and configured-value preservation |
-| Volume Resource | Concurrent create and scaling, configured-zone creation, zone omission preservation, snapshot-source zone omission, mutable attributes, normalization, external sources, resize, retype, and stable plans |
+| Volume Resource | Concurrent create and scaling, configured-zone creation, zone omission preservation, snapshot-source zone omission, mutable attributes, normalization, external sources, resize, retype, image and volume type selectors, identity preservation when criteria change, plan-only import with name selectors, and stable plans |
 | Volume Data Source | Lookup by ID, name, size, status, bootable, zone, and combined filters; full state mapping and configured-value preservation |
+| Volume Backup Resource | Create and refresh, rename, description omit and clear, name normalization, no-drift plan, source-volume replacement, plan-only import, and teardown |
+| Volume Backup Data Source | Lookup by ID, name, source volume, status, size, region, and combined filters. Full state mapping and configured-value preservation. |
+| Volume Snapshot Resource | Create and refresh, update/omit/clear description, rename and name normalization, source-volume replacement, stable plan, plan-only import, and teardown |
+| Volume Snapshot Data Source | Lookup by ID, name, volume ID, zone, status, and combined filters; full state mapping and configured-value preservation |
 | Placement Group Data Source | Create an isolated subject; look up by ID, name, policy, region, and combined filters; verify full state equality and configured-value preservation |
 
 The index and assertions in each `.tftest.hcl` file are the source of truth for
@@ -74,8 +82,9 @@ its exact chains, scenarios, inputs, and expected results.
 
 ## Prerequisites
 
-The tests require Terraform 1.12 or newer because parallel test chains use
-`parallel` and `state_key`. Use credentials for a dedicated test project and a
+The tests require Terraform 1.16 or newer to support `import` blocks in test
+fixture modules. The tests also use `parallel` and `state_key` for independent
+lifecycle chains. Use credentials for a dedicated test project and a
 development override that points to the provider built from this repository.
 
 Each test file declares its environment-specific catalog and resource inputs.
@@ -84,15 +93,33 @@ regions, zones, images, volume types, and flavors, and has no resources that
 would collide with the test fixtures. The selected `.tftest.hcl` file is the
 source of truth for concrete values and compatibility constraints.
 
-Two test files require additional environment preparation:
+Every test file that creates a volume selects its volume type by name, encryption key size, and multiple-attachment support.
+Make sure that each volume type selector matches exactly one enabled, up volume type in the test zone.
+For server and volume selector tests, make sure that each selector matches exactly one catalog entry.
+The selected images must fit the requested volume size.
+The selector suites require distinct images and volume types for their replacement and rebuild cases.
+The image name used for equivalent criteria must identify the image selected by those criteria.
 
+The following test files require additional environment preparation:
+
+- `tests/custom_image_resource.tftest.hcl` and `tests/custom_image_data_source.tftest.hcl`:
+  - Quota for four source volumes and two custom images in the resource suite.
+  - Quota for one source volume and one custom image in the data source suite.
+  - Permission to create bootable volumes from catalog images and custom images from those volumes.
+  - An additional project UUID and sharing permission when testing non-empty sharing.
 - `tests/volume_resource.tftest.hcl`:
-  - existing snapshot and backup objects referenced by `snapshot_id` and
-    `backup_id`; and
-  - quota for up to five volumes totaling at least 150 GiB.
+  - existing snapshot and backup objects referenced by `create_from.snapshot`
+    and `create_from.backup`; and
+  - quota for up to six volumes totaling at least 180 GiB.
 - `tests/server_resource.tftest.hcl`:
-  - quota for one VPC, up to 15 servers, and their dependent storage and
-    networking resources.
+  - quota for one VPC, up to 17 servers, and their dependent storage and
+    networking resources, including four volumes for the attachment lifecycle.
+- `tests/volume_backup_resource.tftest.hcl`:
+  - quota for two 30 GiB volumes and two backups.
+- `tests/volume_backup_data_source.tftest.hcl`:
+  - quota for one 30 GiB volume and one backup.
+- `tests/volume_snapshot_resource.tftest.hcl` and `tests/volume_snapshot_data_source.tftest.hcl`:
+  - quota for five 30 GiB source volumes and three snapshots when both suites run at once.
 
 ## Set up
 
@@ -107,7 +134,7 @@ Configure the Terraform CLI using the absolute path to this repository:
 ```hcl
 provider_installation {
   dev_overrides {
-    "registry.terraform.io/viettelcloud/viettelcloud" = "/absolute/path/to/terraform-provider-viettelcloud"
+    "registry.terraform.io/viettelcloud-oss/viettelcloud" = "/absolute/path/to/terraform-provider-viettelcloud"
   }
 
   direct {}
@@ -132,7 +159,7 @@ expose its contents.
 Set the provider address before running the tests:
 
 ```bash
-export VIETTELCLOUD_PROVIDER_ADDRESS="registry.terraform.io/viettelcloud/viettelcloud"
+export VIETTELCLOUD_PROVIDER_ADDRESS="registry.terraform.io/viettelcloud-oss/viettelcloud"
 ```
 
 ## Run the tests

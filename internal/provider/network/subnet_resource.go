@@ -12,12 +12,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -65,12 +67,13 @@ func (r *SubnetResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				},
 				Description: "IPv4 network CIDR inside the VPC, e.g. 10.0.1.0/24.",
 			},
-			"vpc_id": schema.StringAttribute{
-				Required: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+			"vpc": schema.SingleNestedAttribute{
+				Required:    true,
+				Description: "VPC where the subnet is created.",
+				Attributes:  reference.Attributes(reference.ID, "VPC ID (UUID)."),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.RequiresReplace(),
 				},
-				Description: "VPC ID (UUID) where the subnet is created.",
 			},
 			"vpc_name": schema.StringAttribute{
 				Computed:    true,
@@ -241,7 +244,7 @@ func buildSubnetCreateBody(plan SubnetResourceModel) (networksdk.SubnetCreateSch
 	if plan.CIDR.IsNull() || plan.CIDR.IsUnknown() {
 		diags.AddError("Missing subnet CIDR", "cidr must be configured and known.")
 	}
-	vpcID, vpcDiags := parse.UUIDString(plan.VPCID, "vpc_id")
+	vpcID, vpcDiags := parse.UUIDString(reference.Get(plan.VPC, reference.ID), "vpc.id")
 	diags.Append(vpcDiags...)
 	if diags.HasError() {
 		return body, diags

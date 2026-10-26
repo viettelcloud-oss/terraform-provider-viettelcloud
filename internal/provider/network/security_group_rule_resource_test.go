@@ -19,6 +19,8 @@ import (
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 var (
@@ -41,7 +43,7 @@ func ruleSchema(t *testing.T) resourceschema.Schema {
 func nullSecurityGroupRuleResourceModel() SecurityGroupRuleResourceModel {
 	return SecurityGroupRuleResourceModel{
 		ID:                types.StringNull(),
-		SecurityGroupID:   types.StringNull(),
+		SecurityGroup:     types.ObjectNull(reference.AttributeTypes(reference.ID)),
 		SecurityGroupName: types.StringNull(),
 		Direction:         types.StringNull(),
 		Protocol:          types.StringNull(),
@@ -111,7 +113,7 @@ func TestSecurityGroupRuleModelsMatchSchemas(t *testing.T) {
 	t.Parallel()
 
 	resourcePlan := tfsdk.Plan{Schema: ruleSchema(t)}
-	if diags := resourcePlan.Set(context.Background(), &SecurityGroupRuleResourceModel{}); diags.HasError() {
+	if diags := resourcePlan.Set(context.Background(), &SecurityGroupRuleResourceModel{SecurityGroup: types.ObjectNull(reference.AttributeTypes(reference.ID))}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -216,7 +218,7 @@ func TestSecurityGroupRuleResourceValidateConfig(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 	validConfig := func() SecurityGroupRuleResourceModel {
 		config := nullSecurityGroupRuleResourceModel()
-		config.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+		config.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 		config.Direction = types.StringValue("ingress")
 		config.Protocol = types.StringValue("tcp")
 		return config
@@ -342,7 +344,7 @@ func TestSecurityGroupRuleReplacementAttributes(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 	state, plan := ruleModifierStateAndPlan(t, ruleSchemaValue)
 
-	for _, name := range []string{"security_group_id", "direction", "protocol"} {
+	for _, name := range []string{"direction", "protocol"} {
 		attribute, ok := ruleSchemaValue.Attributes[name].(resourceschema.StringAttribute)
 		if !ok {
 			t.Fatalf("%s is not a string attribute", name)
@@ -362,6 +364,30 @@ func TestSecurityGroupRuleReplacementAttributes(t *testing.T) {
 		if !response.RequiresReplace {
 			t.Errorf("expected changing %s to require replacement", name)
 		}
+	}
+}
+
+func TestSecurityGroupRuleSecurityGroupReferenceSchemaAndReplacement(t *testing.T) {
+	t.Parallel()
+
+	ruleSchemaValue := ruleSchema(t)
+	securityGroup := requiredReferenceAttribute(t, ruleSchemaValue, "security_group", reference.ID)
+	before := reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
+	tests := map[string]struct {
+		plan types.Object
+		want bool
+	}{
+		"same id updates in place": {plan: before},
+		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x77}.String())), want: true},
+		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := referenceRequiresReplace(t, ruleSchemaValue, securityGroup, before, test.plan); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -518,7 +544,7 @@ func TestSecurityGroupRuleResourceCreateSuccess(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 
 	planModel := nullSecurityGroupRuleResourceModel()
-	planModel.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	planModel.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	planModel.Direction = types.StringValue("ingress")
 	planModel.Protocol = types.StringValue("tcp")
 	planModel.PortRangeMin = types.Int64Value(22)
@@ -584,7 +610,7 @@ func TestSecurityGroupRuleResourceCreateOmitsUnconfiguredFields(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 
 	planModel := nullSecurityGroupRuleResourceModel()
-	planModel.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	planModel.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	planModel.Direction = types.StringValue("egress")
 	planModel.Protocol = types.StringValue("any")
 	planModel.PortRangeMin = types.Int64Unknown()
@@ -622,7 +648,7 @@ func TestSecurityGroupRuleResourceCreateInvalidPlan(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 
 	planModel := nullSecurityGroupRuleResourceModel()
-	planModel.SecurityGroupID = types.StringValue("invalid-uuid")
+	planModel.SecurityGroup = reference.Value(reference.ID, types.StringValue("invalid-uuid"))
 	planModel.Direction = types.StringValue("ingress")
 	planModel.Protocol = types.StringValue("tcp")
 
@@ -633,8 +659,8 @@ func TestSecurityGroupRuleResourceCreateInvalidPlan(t *testing.T) {
 
 	resp := resource.CreateResponse{State: tfsdk.State{Schema: ruleSchemaValue}}
 	r.Create(context.Background(), resource.CreateRequest{Plan: plan}, &resp)
-	if !resp.Diagnostics.HasError() {
-		t.Fatal("expected error diagnostic for invalid UUID in plan")
+	if !resp.Diagnostics.HasError() || !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "security_group.id") {
+		t.Fatalf("expected security_group.id diagnostic for invalid UUID in plan, got %v", resp.Diagnostics)
 	}
 }
 
@@ -649,7 +675,7 @@ func TestSecurityGroupRuleResourceCreateReportsAPIError(t *testing.T) {
 	ruleSchemaValue := ruleSchema(t)
 
 	planModel := nullSecurityGroupRuleResourceModel()
-	planModel.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	planModel.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	planModel.Direction = types.StringValue("ingress")
 	planModel.Protocol = types.StringValue("tcp")
 
@@ -828,7 +854,7 @@ func TestSecurityGroupRuleResourceUpdateInvalidID(t *testing.T) {
 
 	stateModel := nullSecurityGroupRuleResourceModel()
 	stateModel.ID = types.StringValue("invalid-uuid")
-	stateModel.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	stateModel.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	stateModel.Direction = types.StringValue("ingress")
 	stateModel.Protocol = types.StringValue("tcp")
 	stateModel.Description = types.StringValue("desc1")
@@ -936,7 +962,7 @@ func TestSecurityGroupRuleResourceImportState(t *testing.T) {
 	t.Parallel()
 
 	resp := resource.ImportStateResponse{State: tfsdk.State{Schema: ruleSchema(t)}}
-	if diags := resp.State.Set(context.Background(), &SecurityGroupRuleResourceModel{}); diags.HasError() {
+	if diags := resp.State.Set(context.Background(), &SecurityGroupRuleResourceModel{SecurityGroup: types.ObjectNull(reference.AttributeTypes(reference.ID))}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 
@@ -955,11 +981,28 @@ func TestSecurityGroupRuleResourceImportState(t *testing.T) {
 	}
 }
 
+func TestSecurityGroupRuleReadAfterImportFillsSecurityGroupReference(t *testing.T) {
+	t.Parallel()
+
+	rule := mockRule("imported")
+	state := readImportedState(t, func(client *networksdk.Client) resource.ResourceWithImportState {
+		return &SecurityGroupRuleResource{client: client, projectID: ruleTestSGID}
+	}, rule.Id.String(), rule)
+
+	var securityGroup types.Object
+	if diags := state.GetAttribute(context.Background(), path.Root("security_group"), &securityGroup); diags.HasError() {
+		t.Fatalf("read security_group: %v", diags)
+	}
+	if want := reference.Value(reference.ID, types.StringValue(rule.SecurityGroup.Id.String())); !securityGroup.Equal(want) {
+		t.Fatalf("imported security_group = %s, want %s", securityGroup, want)
+	}
+}
+
 func TestBuildSecurityGroupRuleCreateBody(t *testing.T) {
 	t.Parallel()
 
 	plan := nullSecurityGroupRuleResourceModel()
-	plan.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	plan.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	plan.Direction = types.StringValue("  INGRESS  ")
 	plan.Protocol = types.StringValue("  TCP  ")
 	plan.PortRangeMin = types.Int64Value(22)
@@ -1025,7 +1068,7 @@ func TestBuildSecurityGroupRuleCreateBodyOmitsUnsetFields(t *testing.T) {
 			t.Parallel()
 
 			plan := nullSecurityGroupRuleResourceModel()
-			plan.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+			plan.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 			plan.Direction = types.StringValue("egress")
 			plan.Protocol = types.StringValue("any")
 			tt.set(&plan)
@@ -1057,7 +1100,7 @@ func TestBuildSecurityGroupRuleCreateBodySendsEmptyDescription(t *testing.T) {
 	t.Parallel()
 
 	plan := nullSecurityGroupRuleResourceModel()
-	plan.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	plan.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	plan.Direction = types.StringValue("ingress")
 	plan.Protocol = types.StringValue("tcp")
 	plan.Description = types.StringValue("")
@@ -1081,7 +1124,7 @@ func TestBuildSecurityGroupRuleCreateBodyRejectsInvalidInputs(t *testing.T) {
 		{
 			name: "invalid security group ID",
 			set: func(plan *SecurityGroupRuleResourceModel) {
-				plan.SecurityGroupID = types.StringValue("not-a-uuid")
+				plan.SecurityGroup = reference.Value(reference.ID, types.StringValue("not-a-uuid"))
 			},
 		},
 		{
@@ -1152,7 +1195,7 @@ func TestBuildSecurityGroupRuleCreateBodyRejectsInvalidInputs(t *testing.T) {
 			t.Parallel()
 
 			plan := nullSecurityGroupRuleResourceModel()
-			plan.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+			plan.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 			plan.Direction = types.StringValue("ingress")
 			plan.Protocol = types.StringValue("tcp")
 			tt.set(&plan)
@@ -1238,7 +1281,7 @@ func TestPopulateSecurityGroupRuleModel(t *testing.T) {
 		want string
 	}{
 		{"id", m.ID.ValueString(), rule.Id.String()},
-		{"security_group_id", m.SecurityGroupID.ValueString(), rule.SecurityGroup.Id.String()},
+		{"security_group.id", reference.Get(m.SecurityGroup, reference.ID).ValueString(), rule.SecurityGroup.Id.String()},
 		{"security_group_name", m.SecurityGroupName.ValueString(), rule.SecurityGroup.Name},
 		{"direction", m.Direction.ValueString(), string(rule.Direction)},
 		{"protocol", m.Protocol.ValueString(), string(*rule.Protocol)},
@@ -1308,7 +1351,7 @@ func TestPopulateSecurityGroupRuleResourceStatePreservesConfiguredRepresentation
 	upperSecurityGroupID := strings.ToUpper(ruleTestSGID.String())
 
 	state := nullSecurityGroupRuleResourceModel()
-	state.SecurityGroupID = types.StringValue(upperSecurityGroupID)
+	state.SecurityGroup = reference.Value(reference.ID, types.StringValue(upperSecurityGroupID))
 	state.Direction = types.StringValue("  INGRESS  ")
 	state.Protocol = types.StringValue("  TCP  ")
 	state.RemoteIPPrefix = types.StringValue("0.0.0.0/0")
@@ -1316,8 +1359,8 @@ func TestPopulateSecurityGroupRuleResourceStatePreservesConfiguredRepresentation
 
 	populateSecurityGroupRuleResourceState(rule, &state)
 
-	if state.SecurityGroupID.ValueString() != upperSecurityGroupID {
-		t.Errorf("expected preserved SGID casing %q, got %q", upperSecurityGroupID, state.SecurityGroupID.ValueString())
+	if reference.Get(state.SecurityGroup, reference.ID).ValueString() != upperSecurityGroupID {
+		t.Errorf("expected preserved SGID casing %q, got %q", upperSecurityGroupID, reference.Get(state.SecurityGroup, reference.ID).ValueString())
 	}
 	if state.Direction.ValueString() != "  INGRESS  " {
 		t.Errorf("expected preserved direction %q, got %q", "  INGRESS  ", state.Direction.ValueString())
@@ -1346,8 +1389,8 @@ func TestPopulateSecurityGroupRuleResourceStateFillsNullStateAfterImport(t *test
 	state := nullSecurityGroupRuleResourceModel()
 	populateSecurityGroupRuleResourceState(rule, &state)
 
-	if state.SecurityGroupID.ValueString() != rule.SecurityGroup.Id.String() {
-		t.Errorf("expected security_group_id %q, got %q", rule.SecurityGroup.Id.String(), state.SecurityGroupID.ValueString())
+	if reference.Get(state.SecurityGroup, reference.ID).ValueString() != rule.SecurityGroup.Id.String() {
+		t.Errorf("expected security_group_id %q, got %q", rule.SecurityGroup.Id.String(), reference.Get(state.SecurityGroup, reference.ID).ValueString())
 	}
 	if state.SecurityGroupName.ValueString() != rule.SecurityGroup.Name {
 		t.Errorf("expected security_group_name %q, got %q", rule.SecurityGroup.Name, state.SecurityGroupName.ValueString())
@@ -1408,7 +1451,7 @@ func ruleStateWithID(t *testing.T, id string) tfsdk.State {
 
 	model := nullSecurityGroupRuleResourceModel()
 	model.ID = types.StringValue(id)
-	model.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	model.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	model.Direction = types.StringValue("ingress")
 	model.Protocol = types.StringValue("tcp")
 
@@ -1431,7 +1474,7 @@ func runRuleUpdate(
 	ruleSchemaValue := ruleSchema(t)
 	stateModel := nullSecurityGroupRuleResourceModel()
 	stateModel.ID = types.StringValue(ruleTestID.String())
-	stateModel.SecurityGroupID = types.StringValue(ruleTestSGID.String())
+	stateModel.SecurityGroup = reference.Value(reference.ID, types.StringValue(ruleTestSGID.String()))
 	stateModel.Direction = types.StringValue("ingress")
 	stateModel.Protocol = types.StringValue("tcp")
 	stateModel.Description = stateDescription

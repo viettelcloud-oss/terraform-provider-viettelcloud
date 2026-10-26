@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.12"
+  required_version = ">= 1.16"
 
   required_providers {
     viettelcloud = {
-      source = "viettelcloud/viettelcloud"
+      source = "viettelcloud-oss/viettelcloud"
     }
   }
 }
@@ -26,7 +26,7 @@ variable "sg1_description" {
 resource "viettelcloud_security_group" "sg1" {
   name        = var.sg1_name
   description = var.sg1_description
-  region      = var.region
+  region      = { name = var.region }
 }
 
 data "viettelcloud_security_group" "by_id" {
