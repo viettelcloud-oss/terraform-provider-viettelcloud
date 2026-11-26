@@ -32,8 +32,8 @@ func (f *customImageFakeLister) ListCustomImagesIter(_ context.Context, params s
 
 func TestCustomImageFinder(t *testing.T) {
 	t.Parallel()
-	image := serversdk.CustomImageSchema{Id: core.UUID{1}, Name: "image", Region: serversdk.NestedRegionSchema{Name: "region"}, Volume: &serversdk.NestedVolumeSchema{Id: core.UUID{2}, Name: "source"}, Os: new("Linux"), Version: new("1"), State: serversdk.ImageStateEnabled, Status: serversdk.ImageStatusActive}
-	filter := CustomImageFilter{ID: &image.Id, Name: new(" image "), Volume: new(" source "), VolumeID: &image.Volume.Id, Region: new(" region "), OS: new("Linux"), Version: new("1"), State: &image.State, Status: &image.Status}
+	image := serversdk.CustomImageSchema{Id: core.UUID{1}, Name: "image", Region: serversdk.NestedRegionSchema{Name: "region"}, Volume: core.NullableFromPtr(&serversdk.NestedVolumeSchema{Id: core.UUID{2}, Name: "source"}), Os: new("Linux"), Version: new("1"), State: serversdk.ImageStateEnabled, Status: serversdk.ImageStatusActive}
+	filter := CustomImageFilter{ID: &image.Id, Name: new(" image "), Volume: new(" source "), VolumeID: new(image.Volume.MustGet().Id), Region: new(" region "), OS: new("Linux"), Version: new("1"), State: &image.State, Status: &image.Status}
 	fake := &customImageFakeLister{images: []serversdk.CustomImageSchema{image}}
 	candidate, err := NewCustomImageFinder(fake, core.UUID{4}).Resolve(context.Background(), filter)
 	if err != nil || candidate.Id != image.Id || fake.params.ProjectID != (core.UUID{4}) || *fake.params.Name != "image" || *fake.params.Volume != "source" || *fake.params.Region != "region" || *fake.params.Os != "Linux" || *fake.params.Version != "1" || (*fake.params.State)[0] != image.State || (*fake.params.Status)[0] != image.Status {

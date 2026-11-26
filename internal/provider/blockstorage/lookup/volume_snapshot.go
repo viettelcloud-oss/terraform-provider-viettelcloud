@@ -40,7 +40,8 @@ func (f VolumeSnapshotFilter) matches(snapshot *blockstoragesdk.VolumeSnapshotSc
 	if zone := finder.Trim(f.Zone); zone != "" && snapshot.Zone.Name != zone {
 		return false
 	}
-	return f.Status == nil || snapshot.Status != nil && *snapshot.Status == *f.Status
+	status := core.NullableToPtr(snapshot.Status)
+	return f.Status == nil || status != nil && *status == *f.Status
 }
 
 func (f VolumeSnapshotFilter) params(projectID core.UUID) blockstoragesdk.ListVolumeSnapshotsParams {

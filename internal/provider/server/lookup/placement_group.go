@@ -55,8 +55,10 @@ func (f PlacementGroupFilter) matches(pg *serversdk.PlacementGroupSchema) bool {
 	}
 	// The backend reports policy as optional, so a candidate without one can
 	// never satisfy a policy criterion.
-	if policy := f.policy(); policy != "" && (pg.Policy == nil || *pg.Policy != policy) {
-		return false
+	if policy := f.policy(); policy != "" {
+		if pgPolicy := core.NullableToPtr(pg.Policy); pgPolicy == nil || *pgPolicy != policy {
+			return false
+		}
 	}
 	region := finder.Trim(f.Region)
 	return region == "" || pg.Region.Name == region
@@ -102,8 +104,8 @@ func (f *PlacementGroupFinder) Resolve(ctx context.Context, filter PlacementGrou
 
 func placementGroupSummary(pg serversdk.PlacementGroupSchema) string {
 	policy := ""
-	if pg.Policy != nil {
-		policy = string(*pg.Policy)
+	if pgPolicy := core.NullableToPtr(pg.Policy); pgPolicy != nil {
+		policy = string(*pgPolicy)
 	}
 	return fmt.Sprintf("id=%s (name=%q, policy=%q, region=%q)", pg.Id, pg.Name, policy, pg.Region.Name)
 }

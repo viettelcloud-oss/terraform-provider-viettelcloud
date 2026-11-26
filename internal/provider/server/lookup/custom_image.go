@@ -42,10 +42,11 @@ func (f CustomImageFilter) matches(image *serversdk.CustomImageSchema) bool {
 			return false
 		}
 	}
-	if volume := finder.Trim(f.Volume); volume != "" && (image.Volume == nil || image.Volume.Name != volume) {
+	imageVolume := core.NullableToPtr(image.Volume)
+	if volume := finder.Trim(f.Volume); volume != "" && (imageVolume == nil || imageVolume.Name != volume) {
 		return false
 	}
-	if f.VolumeID != nil && (image.Volume == nil || image.Volume.Id != *f.VolumeID) {
+	if f.VolumeID != nil && (imageVolume == nil || imageVolume.Id != *f.VolumeID) {
 		return false
 	}
 	if os := finder.Trim(f.OS); os != "" && (image.Os == nil || *image.Os != os) {

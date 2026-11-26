@@ -26,10 +26,10 @@ func TestRegionReferenceSchemaAndReplacement(t *testing.T) {
 		plan types.Object
 		want bool
 	}{
-		"same name updates in place": {plan: before},
-		"another name replaces":      {plan: reference.Value(reference.Name, types.StringValue("vn-north")), want: true},
-		"untrimmed name replaces":    {plan: reference.Value(reference.Name, types.StringValue(" vn-central ")), want: true},
-		"unknown name replaces":      {plan: reference.Value(reference.Name, types.StringUnknown()), want: true},
+		"same name updates in place":      {plan: before},
+		"another name replaces":           {plan: reference.Value(reference.Name, types.StringValue("vn-north")), want: true},
+		"untrimmed name updates in place": {plan: reference.Value(reference.Name, types.StringValue(" vn-central "))},
+		"unknown name replaces":           {plan: reference.Value(reference.Name, types.StringUnknown()), want: true},
 	}
 	for resourceName, resourceUnderTest := range map[string]resource.Resource{
 		"vpc":            &VPCResource{},
@@ -55,7 +55,7 @@ func TestResolveRegionReference(t *testing.T) {
 
 	regionID := core.UUID{7}
 	resolve := func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
-		if filter.Name == nil || *filter.Name != " vn-central " {
+		if filter.Name == nil || *filter.Name != "vn-central" {
 			return projectsdk.ProjectRegionSchema{}, errors.New("no region matches")
 		}
 		return projectsdk.ProjectRegionSchema{Region: projectsdk.NestedRegionSchema{Id: regionID, Name: "vn-central"}}, nil
@@ -63,7 +63,7 @@ func TestResolveRegionReference(t *testing.T) {
 
 	got, diags := resolveRegionReference(context.Background(), reference.Value(reference.Name, types.StringValue(" vn-central ")), resolve)
 	if diags.HasError() || got != regionID {
-		t.Fatalf("resolveRegionReference() = %s, %v; want %s and the unmodified name passed to the finder", got, diags, regionID)
+		t.Fatalf("resolveRegionReference() = %s, %v; want %s and the trimmed name passed to the finder", got, diags, regionID)
 	}
 
 	tests := map[string]struct {

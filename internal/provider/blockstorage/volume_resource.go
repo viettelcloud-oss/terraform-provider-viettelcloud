@@ -27,12 +27,14 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	blockstoragelookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/lookup"
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
@@ -81,8 +83,8 @@ func (r *VolumeResource) Metadata(_ context.Context, req resource.MetadataReques
 }
 
 func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	requiresReplace := []planmodifier.String{stringplanmodifier.RequiresReplace()}
-	replaceReference := []planmodifier.Object{objectplanmodifier.RequiresReplace()}
+	replaceSourceType := []planmodifier.String{replace.String(compare.SameTrimmedString)}
+	replaceReference := []planmodifier.Object{replace.Reference(reference.ID, compare.SameUUIDString)}
 	useStateForUnknown := []planmodifier.String{stringplanmodifier.UseStateForUnknown()}
 	imageSelector := serverselector.ImageAttribute()
 	imageSelector.Description += " Valid only for image sources. Selecting a different image replaces the volume."
@@ -141,7 +143,7 @@ func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Attributes:  reference.PreservedAttributes(reference.Name, "Zone name."),
 				PlanModifiers: []planmodifier.Object{
 					objectplanmodifier.UseStateForUnknown(),
-					objectplanmodifier.RequiresReplaceIfConfigured(),
+					replace.ReferenceIfConfigured(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"zone_id": schema.StringAttribute{
@@ -168,7 +170,7 @@ func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"source_type": schema.StringAttribute{
 						Required:      true,
 						Description:   "Source type: empty, image, custom_image, snapshot, or backup.",
-						PlanModifiers: requiresReplace,
+						PlanModifiers: replaceSourceType,
 					},
 					"image": imageSelector,
 					"custom_image": schema.SingleNestedAttribute{
@@ -194,6 +196,8 @@ func (r *VolumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"volume_type": volumeTypeSelector,
 				},
 			},
+			"snapshot_policy": volumeSnapshotPolicyAttribute(),
+			"backup_policy":   volumeBackupPolicyAttribute(),
 		},
 	}
 }
@@ -223,15 +227,13 @@ func (r *VolumeResource) ValidateConfig(ctx context.Context, req resource.Valida
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == "" {
 		resp.Diagnostics.AddError("Missing volume name", "name must be configured, known, and non-empty.")
 	}
-	// Rejecting surrounding whitespace keeps zone.name comparable as a plain
-	// string, so RequiresReplaceIfConfigured cannot replace a volume over padding.
-	if zone := reference.Get(config.Zone, reference.Name); !zone.IsNull() && !zone.IsUnknown() {
-		if name := zone.ValueString(); strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
-			resp.Diagnostics.AddAttributeError(path.Root("zone").AtName(reference.Name), "Invalid volume zone", "zone.name must be non-empty and have no leading or trailing whitespace when configured.")
-		}
+	if zone := reference.Get(config.Zone, reference.Name); !zone.IsNull() && !zone.IsUnknown() && strings.TrimSpace(zone.ValueString()) == "" {
+		resp.Diagnostics.AddAttributeError(path.Root("zone").AtName(reference.Name), "Invalid volume zone", "zone.name must be non-empty when configured.")
 	}
 	resp.Diagnostics.Append(validateVolumeCreateFromConfig(ctx, config.CreateFrom, config.Size)...)
 	resp.Diagnostics.Append(validateVolumeSnapshotZone(ctx, config.Zone, config.CreateFrom)...)
+	resp.Diagnostics.Append(validateVolumeSnapshotPolicyConfig(config.SnapshotPolicy)...)
+	resp.Diagnostics.Append(validateVolumeBackupPolicyConfig(config.BackupPolicy)...)
 }
 
 // ModifyPlan checks create-time constraints before a replacement can destroy
@@ -256,11 +258,13 @@ func (r *VolumeResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		return
 	}
 	validateCreate := func() {
+		resp.Diagnostics.Append(validateVolumeBackupPolicyUnset(plan.BackupPolicy)...)
 		// size is Optional+Computed, so the proposed plan can carry the prior
 		// state's value even when the practitioner omitted it. The backend's
 		// snapshot create rule applies to configuration, not that carried value.
 		resp.Diagnostics.Append(validateVolumeCreateSize(ctx, plan.CreateFrom, config.Size)...)
 		resp.Diagnostics.Append(validateVolumeSnapshotZone(ctx, config.Zone, plan.CreateFrom)...)
+		resp.Diagnostics.Append(validateVolumeSnapshotPolicyAbsent(config.SnapshotPolicy)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -300,9 +304,9 @@ func (r *VolumeResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("zone_id"), types.StringUnknown())...)
 		return
 	}
-	// This mirrors RequiresReplaceIfConfigured on zone, because ModifyPlan cannot
+	// This mirrors the zone replacement modifier, because ModifyPlan cannot
 	// read the replacement paths that the attribute modifiers report.
-	if !config.Zone.IsNull() && !plan.Zone.Equal(state.Zone) {
+	if !config.Zone.IsNull() && !sameVolumeZone(plan.Zone, state.Zone) {
 		validateCreate()
 		if resp.Diagnostics.HasError() {
 			return
@@ -368,6 +372,8 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 		configuredZone = plan.Zone
 	}
 	resp.Diagnostics.Append(validateVolumeSnapshotZone(ctx, configuredZone, plan.CreateFrom)...)
+	// ModifyPlan skips an unknown policy, which is known by apply time.
+	resp.Diagnostics.Append(validateVolumeBackupPolicyUnset(plan.BackupPolicy)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -521,6 +527,16 @@ func (r *VolumeResource) Update(ctx context.Context, req resource.UpdateRequest,
 			return
 		}
 	}
+	// Policy requests run last, because the backend attaches a policy only to
+	// an available or in-use volume.
+	resp.Diagnostics.Append(r.applyVolumeSnapshotPolicy(ctx, volumeID, plan.SnapshotPolicy, state.SnapshotPolicy)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(r.updateVolumeBackupPolicy(ctx, volumeID, plan.BackupPolicy, state.BackupPolicy)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	volume, err := r.get(ctx, volumeID)
 	if err != nil {
@@ -658,11 +674,11 @@ func (r *VolumeResource) planSelectors(ctx context.Context, req resource.ModifyP
 				return core.UUID{}, err
 			}
 			if volume != nil {
-				if image && volume.CreateFrom.Image != nil {
-					return volume.CreateFrom.Image.Id, nil
+				if sourceImage := core.NullableToPtr(volume.CreateFrom.Image); image && sourceImage != nil {
+					return sourceImage.Id, nil
 				}
-				if !image && volume.CreateFrom.VolumeType != nil {
-					return volume.CreateFrom.VolumeType.Id, nil
+				if volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); !image && volumeType != nil {
+					return volumeType.Id, nil
 				}
 			}
 			return core.UUID{}, fmt.Errorf("volume %s: %w", field, selector.ErrNoIdentity)
@@ -687,7 +703,7 @@ func (r *VolumeResource) planSelectors(ctx context.Context, req resource.ModifyP
 	return imageChanged, typeChanged
 }
 
-func (r *VolumeResource) get(ctx context.Context, id core.UUID) (*blockstoragesdk.VolumeDetailSchema, error) {
+func (r *VolumeResource) get(ctx context.Context, id core.UUID) (*blockstoragesdk.VolumeSchema, error) {
 	return r.client.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
 }
 
@@ -760,11 +776,15 @@ func (r *VolumeResource) retype(ctx context.Context, volumeID core.UUID, value t
 			diags.AddError("Unable to read volume type identity", err.Error())
 			return value, diags
 		}
-		if volume == nil || volume.CreateFrom.VolumeType == nil {
+		var currentType *blockstoragesdk.NestedVolumeTypeSchema
+		if volume != nil {
+			currentType = core.NullableToPtr(volume.CreateFrom.VolumeType)
+		}
+		if currentType == nil {
 			diags.AddError("Unable to read volume type identity", "The volume response does not identify its volume type.")
 			return value, diags
 		}
-		currentID = volume.CreateFrom.VolumeType.Id
+		currentID = currentType.Id
 	}
 	value = selector.WithID(value, types.StringValue(volumeType.Id.String()))
 	if currentID == volumeType.Id {
@@ -782,7 +802,7 @@ func (r *VolumeResource) retype(ctx context.Context, volumeID core.UUID, value t
 }
 
 func (r *VolumeResource) waitUntilReady(ctx context.Context, id core.UUID) error {
-	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("poll volume %s: %w", id, err)
@@ -806,7 +826,7 @@ func (r *VolumeResource) waitUntilReady(ctx context.Context, id core.UUID) error
 // which the waiter carries into its timeout error, so a backend that never
 // applies one is identifiable.
 func (r *VolumeResource) waitUntilPatched(ctx context.Context, id core.UUID, body blockstoragesdk.VolumePartialUpdateSchema) error {
-	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("poll volume %s: %w", id, err)
@@ -833,20 +853,21 @@ func (r *VolumeResource) waitUntilPatched(ctx context.Context, id core.UUID, bod
 // the extend action, retype only returns "accepted", so the effective volume
 // type is the observable that settles rather than the status.
 func (r *VolumeResource) waitUntilRetyped(ctx context.Context, id core.UUID, typeID core.UUID) error {
-	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("poll volume %s: %w", id, err)
 		}
-		if volumeStatusReady(volume.Status) && volume.CreateFrom.VolumeType != nil && volume.CreateFrom.VolumeType.Id == typeID {
+		volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType)
+		if volumeStatusReady(volume.Status) && volumeType != nil && volumeType.Id == typeID {
 			return volume, nil
 		}
 		if volumeStatusFailed(volume.Status) {
 			return nil, fmt.Errorf("volume %s entered terminal status %q while retyping to %q", id, volume.Status, typeID)
 		}
 		current := ""
-		if volume.CreateFrom.VolumeType != nil {
-			current = volume.CreateFrom.VolumeType.Id.String()
+		if volumeType != nil {
+			current = volumeType.Id.String()
 		}
 		return nil, fmt.Errorf("status=%s, volume_type=%q: %w", volume.Status, current, wait.ErrNotReady)
 	})
@@ -862,7 +883,7 @@ func (r *VolumeResource) waitUntilRetyped(ctx context.Context, id core.UUID, typ
 // rather than polling to the timeout; the honest value is then stored and
 // Terraform reports the mismatch.
 func (r *VolumeResource) waitUntilResized(ctx context.Context, id core.UUID, size int) error {
-	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("poll volume %s: %w", id, err)
@@ -883,7 +904,7 @@ func (r *VolumeResource) waitUntilDeleted(ctx context.Context, id core.UUID) err
 	// the delete call is accepted. A ready status therefore only means the
 	// deletion failed once deleting has actually been observed.
 	sawDeleting := false
-	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	_, err := r.newWaiter().WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.get(ctx, id)
 		if errors.Is(err, blockstoragesdk.ErrNotFound) {
 			// The volume is gone, which is the whole point of this wait; there
@@ -907,7 +928,7 @@ func (r *VolumeResource) waitUntilDeleted(ctx context.Context, id core.UUID) err
 // newWaiter builds the waiter every volume poll runs on. Block storage actions
 // run longer than the wait package assumes, so the volume defaults stand in for
 // unset values rather than the package ones.
-func (r *VolumeResource) newWaiter() *wait.Waiter[*blockstoragesdk.VolumeDetailSchema] {
+func (r *VolumeResource) newWaiter() *wait.Waiter[*blockstoragesdk.VolumeSchema] {
 	interval := r.pollInterval
 	if interval <= 0 {
 		interval = defaultVolumePollInterval
@@ -916,7 +937,7 @@ func (r *VolumeResource) newWaiter() *wait.Waiter[*blockstoragesdk.VolumeDetailS
 	if timeout <= 0 {
 		timeout = defaultVolumeTimeout
 	}
-	return wait.New[*blockstoragesdk.VolumeDetailSchema](interval, timeout)
+	return wait.New[*blockstoragesdk.VolumeSchema](interval, timeout)
 }
 
 func volumeWaitError(err error, id core.UUID, action string) error {
@@ -998,12 +1019,11 @@ func buildVolumeCreateBody(
 	body.Name = strings.TrimSpace(plan.Name.ValueString())
 	body.CreateFrom = createFrom
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	if !plan.IOPS.IsNull() && !plan.IOPS.IsUnknown() {
-		value := int(plan.IOPS.ValueInt64())
-		body.Iops = &value
+		body.Iops.Set(int(plan.IOPS.ValueInt64()))
 	}
 	return body, diags
 }
@@ -1029,14 +1049,15 @@ func buildVolumeUpdatePlan(ctx context.Context, plan, state VolumeResourceModel)
 		}
 	}
 	update.retypeSelector = volumeRetypeSelector(planned)
-	if !plan.Name.Equal(state.Name) {
+	if !compare.SameTrimmed(state.Name, plan.Name.ValueString()) {
 		value := strings.TrimSpace(plan.Name.ValueString())
 		update.body.Name = &value
 		update.patch = true
 	}
-	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !plan.Description.Equal(state.Description) {
-		value := plan.Description.ValueString()
-		update.body.Description = &value
+	// The API trims the description, so a change in outer whitespace only is
+	// no change.
+	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !compare.SameTrimmed(state.Description, plan.Description.ValueString()) {
+		update.body.Description.Set(strings.TrimSpace(plan.Description.ValueString()))
 		update.patch = true
 	}
 	if !plan.IOPS.IsNull() && !plan.IOPS.IsUnknown() && !plan.IOPS.Equal(state.IOPS) {
@@ -1055,23 +1076,23 @@ func buildVolumeUpdatePlan(ctx context.Context, plan, state VolumeResourceModel)
 	return update, diags
 }
 
-func unappliedVolumePatchFields(volume *blockstoragesdk.VolumeDetailSchema, body blockstoragesdk.VolumePartialUpdateSchema) []string {
+func unappliedVolumePatchFields(volume *blockstoragesdk.VolumeSchema, body blockstoragesdk.VolumePartialUpdateSchema) []string {
 	var fields []string
 	if body.Name != nil && volume.Name != *body.Name {
 		fields = append(fields, "name")
 	}
 	// Clearing a description is configured as an empty string, and the backend
 	// may echo that back as an omitted field; both mean cleared.
-	if body.Description != nil {
+	if description := core.NullableToPtr(body.Description); description != nil {
 		current := ""
-		if volume.Description != nil {
-			current = *volume.Description
+		if currentDescription := core.NullableToPtr(volume.Description); currentDescription != nil {
+			current = *currentDescription
 		}
-		if current != *body.Description {
+		if strings.TrimSpace(current) != strings.TrimSpace(*description) {
 			fields = append(fields, "description")
 		}
 	}
-	if body.Iops != nil && (volume.Iops == nil || *volume.Iops != *body.Iops) {
+	if body.Iops != nil && volume.Iops != *body.Iops {
 		fields = append(fields, "iops")
 	}
 	return fields
@@ -1182,15 +1203,24 @@ func validVolumeSourceType(sourceType string) bool {
 }
 
 // volumeSourceReplaced reports whether the plan changes a create_from field
-// that requires replacement. The comparison mirrors what those attribute plan
-// modifiers do — a plain inequality between plan and state. The resource and
-// the modifiers therefore cannot disagree about what counts as a replacement.
-// Image replacement and volume type retype use selector identity separately.
+// that requires replacement. It uses the comparisons of those attribute plan
+// modifiers, so the resource and the modifiers cannot disagree about what
+// counts as a replacement. Image replacement and volume type retype use
+// selector identity separately.
 func volumeSourceReplaced(planned, current volumeSource) bool {
-	return !planned.SourceType.Equal(current.SourceType) ||
-		!planned.CustomImageID.Equal(current.CustomImageID) ||
-		!planned.SnapshotID.Equal(current.SnapshotID) ||
-		!planned.BackupID.Equal(current.BackupID)
+	same := func(plan, state types.String, spelling replace.Same) bool {
+		return plan.Equal(state) || spelling(plan, state)
+	}
+	return !same(planned.SourceType, current.SourceType, compare.SameTrimmedString) ||
+		!same(planned.CustomImageID, current.CustomImageID, compare.SameUUIDString) ||
+		!same(planned.SnapshotID, current.SnapshotID, compare.SameUUIDString) ||
+		!same(planned.BackupID, current.BackupID, compare.SameUUIDString)
+}
+
+// sameVolumeZone reports whether two zone references name the same zone. It
+// uses the comparison of the zone replacement modifier.
+func sameVolumeZone(plan, state types.Object) bool {
+	return plan.Equal(state) || compare.SameTrimmedString(reference.Get(plan, reference.Name), reference.Get(state, reference.Name))
 }
 
 // volumeRetypeSelector returns criteria that still need an identity decision.

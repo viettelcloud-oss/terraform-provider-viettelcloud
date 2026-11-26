@@ -25,6 +25,7 @@ import (
 	blockstoragelookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
@@ -83,26 +84,26 @@ func (r *CustomImageResource) Schema(_ context.Context, _ resource.SchemaRequest
 						Optional:      true,
 						Computed:      true,
 						Description:   "Source volume name. Exactly one volume must match in the provider project.",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplaceIfConfigured()},
+						PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replace.StringIfConfigured(customImageSameVolume[reference.Name])},
 					},
 					reference.ID: schema.StringAttribute{
 						Optional:      true,
 						Computed:      true,
 						Description:   "Source volume ID (UUID). The volume must belong to the provider project.",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplaceIfConfigured()},
+						PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replace.StringIfConfigured(customImageSameVolume[reference.ID])},
 					},
 				},
 			},
 			"disk_format": schema.StringAttribute{
 				Required:      true,
 				Description:   "Disk format: raw or qcow2. Changing this value replaces the image.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				PlanModifiers: []planmodifier.String{replace.String(compare.SameTrimmedString)},
 			},
 			"container_format": schema.StringAttribute{
 				Optional:      true,
 				Computed:      true,
 				Description:   "Container format: bare. Changing a configured value replaces the image.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplaceIfConfigured()},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replace.StringIfConfigured(compare.SameTrimmedString)},
 			},
 			"os": schema.StringAttribute{
 				Optional:    true,
@@ -220,11 +221,12 @@ func (r *CustomImageResource) ModifyPlan(ctx context.Context, req resource.Modif
 	}
 	// ModifyPlan cannot read replacement paths from attribute modifiers.
 	// Reset the inferred source when a create-only value replaces the image.
-	replacing := !plan.DiskFormat.Equal(state.DiskFormat) ||
-		(!config.ContainerFormat.IsNull() && !plan.ContainerFormat.Equal(state.ContainerFormat))
+	// The comparisons match the replace modifiers in Schema.
+	replacing := !compare.SameTrimmedString(plan.DiskFormat, state.DiskFormat) ||
+		(!config.ContainerFormat.IsNull() && !compare.SameTrimmedString(plan.ContainerFormat, state.ContainerFormat))
 	for _, criterion := range customImageVolumeCriteria {
 		configured := reference.Get(config.Volume, criterion)
-		replacing = replacing || (!configured.IsNull() && !reference.Get(plan.Volume, criterion).Equal(reference.Get(state.Volume, criterion)))
+		replacing = replacing || (!configured.IsNull() && !customImageSameVolume[criterion](reference.Get(plan.Volume, criterion), reference.Get(state.Volume, criterion)))
 	}
 	if !replacing {
 		return
@@ -489,13 +491,14 @@ func validateCustomImageInputs(ctx context.Context, plan CustomImageResourceMode
 		_, idDiags := parse.UUIDString(volumeID, "volume.id")
 		diags.Append(idDiags...)
 	}
-	if !plan.DiskFormat.IsUnknown() && (plan.DiskFormat.IsNull() || !serversdk.ImageCustomFormat(plan.DiskFormat.ValueString()).Valid()) {
+	if !plan.DiskFormat.IsUnknown() && (plan.DiskFormat.IsNull() || !serversdk.ImageCustomFormat(strings.TrimSpace(plan.DiskFormat.ValueString())).Valid()) {
 		diags.AddError("Invalid disk format", "disk_format must be raw or qcow2.")
 	}
-	if !plan.ContainerFormat.IsNull() && !plan.ContainerFormat.IsUnknown() && !serversdk.ImageCustomContainerFormat(plan.ContainerFormat.ValueString()).Valid() {
+	if !plan.ContainerFormat.IsNull() && !plan.ContainerFormat.IsUnknown() &&
+		!serversdk.ImageCustomContainerFormat(strings.TrimSpace(plan.ContainerFormat.ValueString())).Valid() {
 		diags.AddError("Invalid container format", "container_format must be bare.")
 	}
-	if !plan.State.IsNull() && !plan.State.IsUnknown() && !serversdk.ImageState(plan.State.ValueString()).Valid() {
+	if !plan.State.IsNull() && !plan.State.IsUnknown() && !serversdk.ImageState(strings.TrimSpace(plan.State.ValueString())).Valid() {
 		diags.AddError("Invalid image state", "state must be enabled or disabled.")
 	}
 	if !plan.Metadata.IsNull() && !plan.Metadata.IsUnknown() {
@@ -504,11 +507,20 @@ func validateCustomImageInputs(ctx context.Context, plan CustomImageResourceMode
 			diags.AddError("Invalid image metadata", err.Error())
 		}
 	}
+	seen := map[core.UUID]bool{}
 	for _, value := range reference.Strings(plan.SharedProjects, reference.ID) {
-		if !value.IsUnknown() {
-			_, idDiags := parse.UUIDString(value, "shared_projects.id")
-			diags.Append(idDiags...)
+		if value.IsUnknown() {
+			continue
 		}
+		id, idDiags := parse.UUIDString(value, "shared_projects.id")
+		diags.Append(idDiags...)
+		if idDiags.HasError() {
+			continue
+		}
+		if seen[id] {
+			diags.AddError("Duplicate shared project", fmt.Sprintf("shared_projects lists project %s more than once.", id))
+		}
+		seen[id] = true
 	}
 	return diags
 }
@@ -538,14 +550,14 @@ func buildCustomImageCreateBody(ctx context.Context, plan CustomImageResourceMod
 	}
 	body.Name = strings.TrimSpace(plan.Name.ValueString())
 	body.VolumeId = volumeID
-	body.DiskFormat = serversdk.ImageCustomFormat(plan.DiskFormat.ValueString())
+	body.DiskFormat = serversdk.ImageCustomFormat(strings.TrimSpace(plan.DiskFormat.ValueString()))
 	// Create requires a container format. The SDK exposes bare as its only value.
 	body.ContainerFormat = serversdk.ImageCustomContainerFormatBare
 	if !plan.ContainerFormat.IsNull() && !plan.ContainerFormat.IsUnknown() {
-		body.ContainerFormat = serversdk.ImageCustomContainerFormat(plan.ContainerFormat.ValueString())
+		body.ContainerFormat = serversdk.ImageCustomContainerFormat(strings.TrimSpace(plan.ContainerFormat.ValueString()))
 	}
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	return body, diags
@@ -564,15 +576,18 @@ func buildCustomImageUpdateBody(ctx context.Context, plan, state CustomImageReso
 	}
 	for _, field := range []struct {
 		plan, state types.String
-		target      **string
-	}{{plan.Description, state.Description, &body.Description}, {plan.OS, state.OS, &body.Os}, {plan.Version, state.Version, &body.Version}} {
-		if !field.plan.IsNull() && !field.plan.IsUnknown() && !field.plan.Equal(field.state) {
-			value := field.plan.ValueString()
-			*field.target = &value
+		set         func(string)
+	}{
+		{plan.Description, state.Description, func(value string) { body.Description = &value }},
+		{plan.OS, state.OS, body.Os.Set},
+		{plan.Version, state.Version, body.Version.Set},
+	} {
+		if !field.plan.IsNull() && !field.plan.IsUnknown() && !compare.SameTrimmed(field.state, field.plan.ValueString()) {
+			field.set(strings.TrimSpace(field.plan.ValueString()))
 		}
 	}
-	if !plan.State.IsNull() && !plan.State.IsUnknown() && !plan.State.Equal(state.State) {
-		value := serversdk.ImageState(plan.State.ValueString())
+	if !plan.State.IsNull() && !plan.State.IsUnknown() && !compare.SameTrimmed(state.State, plan.State.ValueString()) {
+		value := serversdk.ImageState(strings.TrimSpace(plan.State.ValueString()))
 		if !value.Valid() {
 			diags.AddError("Invalid image state", "state must be enabled or disabled.")
 		} else {
@@ -588,7 +603,7 @@ func buildCustomImageUpdateBody(ctx context.Context, plan, state CustomImageReso
 		}
 	}
 	if !plan.SharedProjects.IsNull() && !plan.SharedProjects.IsUnknown() &&
-		!compare.SameUUIDSet(customImageSharedProjectIDSet(plan.SharedProjects), customImageSharedProjectIDSet(state.SharedProjects)) {
+		!compare.SameUUIDSet(referenceIDSet(plan.SharedProjects), referenceIDSet(state.SharedProjects)) {
 		values := reference.Strings(plan.SharedProjects, reference.ID)
 		ids := make([]core.UUID, 0, len(values))
 		for _, value := range values {
@@ -598,7 +613,7 @@ func buildCustomImageUpdateBody(ctx context.Context, plan, state CustomImageReso
 		}
 		body.SharedProjectIds = &ids
 	}
-	changed := body.Name != nil || body.Description != nil || body.Os != nil || body.Version != nil || body.State != nil || body.Metadata != nil || body.SharedProjectIds != nil
+	changed := body.Name != nil || body.Description != nil || body.Os.IsSpecified() || body.Version.IsSpecified() || body.State != nil || body.Metadata != nil || body.SharedProjectIds != nil
 	return body, changed, diags
 }
 

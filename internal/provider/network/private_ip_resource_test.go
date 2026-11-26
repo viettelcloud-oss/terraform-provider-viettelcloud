@@ -12,7 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	resourceschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -86,53 +86,34 @@ func TestPrivateIPReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	resourceSchema := privateIPSchema(t)
-	for _, name := range []string{"ip_address", "mac_address"} {
-		attribute, ok := resourceSchema.Attributes[name].(resourceschema.StringAttribute)
-		if !ok {
-			t.Fatalf("%s is not a string attribute", name)
-		}
-		modifier := attribute.PlanModifiers[len(attribute.PlanModifiers)-1]
-		stateModel := nullPrivateIPResourceModel()
-		stateModel.IPAddress = types.StringValue("before")
-		stateModel.MACAddress = types.StringValue("before")
-		state := tfsdk.State{Schema: resourceSchema}
-		if diags := state.Set(context.Background(), &stateModel); diags.HasError() {
-			t.Fatalf("set modifier state: %v", diags)
-		}
-		planModel := stateModel
-		planModel.IPAddress = types.StringValue("after")
-		planModel.MACAddress = types.StringValue("after")
-		plan := tfsdk.Plan{Schema: resourceSchema}
-		if diags := plan.Set(context.Background(), &planModel); diags.HasError() {
-			t.Fatalf("set modifier plan: %v", diags)
-		}
-		request := planmodifier.StringRequest{
-			ConfigValue: types.StringValue("after"),
-			State:       state,
-			Plan:        plan,
-			StateValue:  types.StringValue("before"),
-			PlanValue:   types.StringValue("after"),
-		}
-		var response planmodifier.StringResponse
-		modifier.PlanModifyString(context.Background(), request, &response)
-		if !response.RequiresReplace {
-			t.Errorf("expected changing %s to require replacement", name)
-		}
+	tests := map[string]struct {
+		attribute     string
+		state, config types.String
+		want          bool
+	}{
+		"ip_address/same":            {attribute: "ip_address", state: types.StringValue("10.0.1.10"), config: types.StringValue("10.0.1.10")},
+		"ip_address/padded":          {attribute: "ip_address", state: types.StringValue("10.0.1.10"), config: types.StringValue(" 10.0.1.10 ")},
+		"ip_address/another":         {attribute: "ip_address", state: types.StringValue("10.0.1.10"), config: types.StringValue("10.0.1.11"), want: true},
+		"ip_address/omitted":         {attribute: "ip_address", state: types.StringValue("10.0.1.10"), config: types.StringNull()},
+		"mac_address/same":           {attribute: "mac_address", state: types.StringValue("aa:bb:cc:dd:ee:ff"), config: types.StringValue("aa:bb:cc:dd:ee:ff")},
+		"mac_address/padded":         {attribute: "mac_address", state: types.StringValue("aa:bb:cc:dd:ee:ff"), config: types.StringValue(" AA:BB:CC:DD:EE:FF ")},
+		"mac_address/another":        {attribute: "mac_address", state: types.StringValue("aa:bb:cc:dd:ee:ff"), config: types.StringValue("aa:bb:cc:dd:ee:00"), want: true},
+		"mac_address/omitted":        {attribute: "mac_address", state: types.StringValue("aa:bb:cc:dd:ee:ff"), config: types.StringNull()},
+		"ip_address/unparsable":      {attribute: "ip_address", state: types.StringValue("before"), config: types.StringValue("after"), want: true},
+		"mac_address/unknown config": {attribute: "mac_address", state: types.StringValue("aa:bb:cc:dd:ee:ff"), config: types.StringUnknown(), want: true},
 	}
-
-	for _, name := range []string{"ip_address", "mac_address"} {
-		attribute := resourceSchema.Attributes[name].(resourceschema.StringAttribute)
-		modifier := attribute.PlanModifiers[len(attribute.PlanModifiers)-1]
-		request := planmodifier.StringRequest{
-			ConfigValue: types.StringNull(),
-			StateValue:  types.StringValue("allocated"),
-			PlanValue:   types.StringUnknown(),
-		}
-		var response planmodifier.StringResponse
-		modifier.PlanModifyString(context.Background(), request, &response)
-		if response.RequiresReplace {
-			t.Errorf("expected unconfigured computed %s to avoid replacement", name)
-		}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// An omitted Optional and Computed value is planned as unknown.
+			plan := test.config
+			if plan.IsNull() {
+				plan = types.StringUnknown()
+			}
+			if got := stringRequiresReplace(t, resourceSchema, test.attribute, test.state, plan, test.config); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -146,9 +127,10 @@ func TestPrivateIPSubnetReferenceSchemaAndReplacement(t *testing.T) {
 		plan types.Object
 		want bool
 	}{
-		"same id updates in place": {plan: before},
-		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x99}.String())), want: true},
-		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+		"same id updates in place":   {plan: before},
+		"padded id updates in place": {plan: reference.Value(reference.ID, types.StringValue("  "+privateIPTestSubnetID.String()+" "))},
+		"another id replaces":        {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x99}.String())), want: true},
+		"unknown id replaces":        {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -176,6 +158,41 @@ func TestPrivateIPAllowedVIPsSchema(t *testing.T) {
 	}
 }
 
+func TestPrivateIPAllowedVIPsRejectsDuplicates(t *testing.T) {
+	t.Parallel()
+
+	attribute, ok := privateIPSchema(t).Attributes["allowed_vips"].(resourceschema.SetNestedAttribute)
+	if !ok {
+		t.Fatal("allowed_vips is not a set nested attribute")
+	}
+	first := core.UUID{0x31}.String()
+	second := core.UUID{0x32}.String()
+	tests := map[string]struct {
+		value     types.Set
+		wantError bool
+	}{
+		"distinct ids":         {value: reference.Set(reference.ID, []string{first, second})},
+		"padded duplicate":     {value: reference.Set(reference.ID, []string{first, "  " + first + "  "}), wantError: true},
+		"upper-case duplicate": {value: reference.Set(reference.ID, []string{first, strings.ToUpper(first)}), wantError: true},
+		"unparsable ids":       {value: reference.Set(reference.ID, []string{"a", "b"})},
+		"null set":             {value: types.SetNull(reference.ObjectType(reference.ID))},
+		"unknown set":          {value: types.SetUnknown(reference.ObjectType(reference.ID))},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			request := validator.SetRequest{Path: path.Root("allowed_vips"), ConfigValue: test.value}
+			var response validator.SetResponse
+			for _, v := range attribute.Validators {
+				v.ValidateSet(context.Background(), request, &response)
+			}
+			if response.Diagnostics.HasError() != test.wantError {
+				t.Fatalf("diagnostics = %v, want error %t", response.Diagnostics, test.wantError)
+			}
+		})
+	}
+}
+
 func TestBuildPrivateIPCreateBody(t *testing.T) {
 	t.Parallel()
 
@@ -191,7 +208,7 @@ func TestBuildPrivateIPCreateBody(t *testing.T) {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
 	if body.SubnetId != privateIPTestSubnetID || body.Description == nil || *body.Description != "application address" ||
-		body.IpAddress == nil || *body.IpAddress != "10.0.1.10" || body.MacAddress == nil || *body.MacAddress != "aa:bb:cc:dd:ee:ff" {
+		core.NullableToPtr(body.IpAddress) == nil || *core.NullableToPtr(body.IpAddress) != "10.0.1.10" || core.NullableToPtr(body.MacAddress) == nil || *core.NullableToPtr(body.MacAddress) != "aa:bb:cc:dd:ee:ff" {
 		t.Fatalf("unexpected create body: %#v", body)
 	}
 }
@@ -210,7 +227,7 @@ func TestBuildPrivateIPCreateBodyOmitsOptionalValues(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if body.Description != nil || body.IpAddress != nil || body.MacAddress != nil {
+	if body.Description != nil || body.IpAddress.IsSpecified() || body.MacAddress.IsSpecified() {
 		t.Fatalf("expected optional fields to be omitted, got %#v", body)
 	}
 }
@@ -238,20 +255,26 @@ func TestBuildPrivateIPUpdateBody(t *testing.T) {
 	plan := state
 	plan.Description = types.StringValue("after")
 	body, changed := buildPrivateIPUpdateBody(plan, state)
-	if !changed || body.Description == nil || *body.Description != "after" {
+	if !changed || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "after" {
 		t.Fatalf("expected sparse description update, got changed=%v body=%#v", changed, body)
 	}
 
 	plan.Description = types.StringValue("")
 	body, changed = buildPrivateIPUpdateBody(plan, state)
-	if !changed || body.Description == nil || *body.Description != "" {
+	if !changed || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "" {
 		t.Fatalf("expected explicit clear, got changed=%v body=%#v", changed, body)
 	}
 
-	for _, description := range []types.String{types.StringNull(), types.StringUnknown(), state.Description} {
+	plan.Description = types.StringValue("  after  ")
+	body, changed = buildPrivateIPUpdateBody(plan, state)
+	if !changed || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "after" {
+		t.Fatalf("expected trimmed description update, got changed=%v body=%#v", changed, body)
+	}
+
+	for _, description := range []types.String{types.StringNull(), types.StringUnknown(), state.Description, types.StringValue("  before  ")} {
 		plan.Description = description
 		body, changed = buildPrivateIPUpdateBody(plan, state)
-		if changed || body.Description != nil {
+		if changed || body.Description.IsSpecified() {
 			t.Errorf("expected omitted or unchanged description to be preserved, got changed=%v body=%#v", changed, body)
 		}
 	}
@@ -503,6 +526,108 @@ func TestPrivateIPResourceLifecycleUsesPublicSDK(t *testing.T) {
 	}
 }
 
+func TestPrivateIPResourceTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+
+		switch requests {
+		case 1:
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			if body["description"] != "before" || body["ip_address"] != "10.0.1.10" || body["mac_address"] != "aa:bb:cc:dd:ee:ff" ||
+				body["subnet_id"] != privateIPTestSubnetID.String() {
+				t.Errorf("create body = %#v, want trimmed description, ip_address, mac_address, and subnet_id", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+			writePrivateIPResponse(t, w, mockPrivateIP("before"))
+		case 2:
+			writePrivateIPResponse(t, w, mockPrivateIP("before"))
+		case 3:
+			var body map[string]string
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("decode update body: %v", err)
+			}
+			if len(body) != 1 || body["description"] != "after" {
+				t.Errorf("update body = %#v, want only trimmed description", body)
+			}
+			writePrivateIPResponse(t, w, mockPrivateIP("after"))
+		default:
+			t.Errorf("unexpected extra request: %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := networksdk.NewClient(server.URL, networksdk.WithHTTPClient(server.Client()), networksdk.WithRetry(core.NoRetry()))
+	if err != nil {
+		t.Fatalf("create network client: %v", err)
+	}
+	r := &PrivateIPResource{client: client, projectID: privateIPTestProjectID}
+	resourceSchema := privateIPSchema(t)
+
+	createModel := nullPrivateIPResourceModel()
+	createModel.Subnet = reference.Value(reference.ID, types.StringValue("  "+privateIPTestSubnetID.String()+"  "))
+	createModel.Description = types.StringValue("  before  ")
+	createModel.IPAddress = types.StringValue("  10.0.1.10  ")
+	createModel.MACAddress = types.StringValue("  aa:bb:cc:dd:ee:ff  ")
+	createPlan := tfsdk.Plan{Schema: resourceSchema}
+	if diags := createPlan.Set(ctx, &createModel); diags.HasError() {
+		t.Fatalf("set create plan: %v", diags)
+	}
+	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: resourceSchema}}
+	r.Create(ctx, resource.CreateRequest{Plan: createPlan}, &createResponse)
+	if createResponse.Diagnostics.HasError() {
+		t.Fatalf("create diagnostics: %v", createResponse.Diagnostics)
+	}
+	readResponse := resource.ReadResponse{State: createResponse.State}
+	r.Read(ctx, resource.ReadRequest{State: createResponse.State}, &readResponse)
+	if readResponse.Diagnostics.HasError() {
+		t.Fatalf("read diagnostics: %v", readResponse.Diagnostics)
+	}
+	for step, state := range map[string]tfsdk.State{"create": createResponse.State, "read": readResponse.State} {
+		var model PrivateIPResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state after %s: %v", step, diags)
+		}
+		if !model.Description.Equal(createModel.Description) || !model.IPAddress.Equal(createModel.IPAddress) ||
+			!model.MACAddress.Equal(createModel.MACAddress) || !model.Subnet.Equal(createModel.Subnet) {
+			t.Fatalf("state after %s: description=%q ip_address=%q mac_address=%q subnet=%s, want the configured spelling",
+				step, model.Description.ValueString(), model.IPAddress.ValueString(), model.MACAddress.ValueString(), model.Subnet)
+		}
+	}
+
+	var updateModel PrivateIPResourceModel
+	if diags := readResponse.State.Get(ctx, &updateModel); diags.HasError() {
+		t.Fatalf("get state before update: %v", diags)
+	}
+	updateModel.Description = types.StringValue("  after  ")
+	updatePlan := tfsdk.Plan{Schema: resourceSchema}
+	if diags := updatePlan.Set(ctx, &updateModel); diags.HasError() {
+		t.Fatalf("set update plan: %v", diags)
+	}
+	updateResponse := resource.UpdateResponse{State: tfsdk.State{Schema: resourceSchema}}
+	r.Update(ctx, resource.UpdateRequest{Plan: updatePlan, State: readResponse.State}, &updateResponse)
+	if updateResponse.Diagnostics.HasError() {
+		t.Fatalf("update diagnostics: %v", updateResponse.Diagnostics)
+	}
+	var afterUpdate PrivateIPResourceModel
+	if diags := updateResponse.State.Get(ctx, &afterUpdate); diags.HasError() {
+		t.Fatalf("get state after update: %v", diags)
+	}
+	if afterUpdate.Description.ValueString() != "  after  " {
+		t.Fatalf("description after update = %q, want configured %q", afterUpdate.Description.ValueString(), "  after  ")
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d, want create, read, and update", requests)
+	}
+}
+
 func TestPrivateIPResourceCreateConfiguresAllowedVIPs(t *testing.T) {
 	t.Parallel()
 
@@ -745,13 +870,13 @@ func mockPrivateIP(description string) *networksdk.PrivateIPSchema {
 	allowedCIDRs := []string{"10.0.1.0/24", "10.0.2.0/24"}
 	attachedVIPs := []networksdk.NestedPrivateIPAllowedVIPSchema{{
 		Id:        privateIPTestVIPID,
-		IpAddress: &vipAddress,
+		IpAddress: core.NullableFromPtr(&vipAddress),
 	}}
 	return &networksdk.PrivateIPSchema{
 		Id:           privateIPTestID,
-		Description:  &description,
-		IpAddress:    &ipAddress,
-		MacAddress:   &macAddress,
+		Description:  core.NullableFromPtr(&description),
+		IpAddress:    core.NullableFromPtr(&ipAddress),
+		MacAddress:   core.NullableFromPtr(&macAddress),
 		DisplayName:  ipAddress,
 		DeviceOwner:  networksdk.PrivateIPDeviceOwnerUser,
 		PortSecurity: true,
@@ -772,10 +897,10 @@ func mockPrivateIP(description string) *networksdk.PrivateIPSchema {
 			Name:        "vn-central-1",
 			Description: "Central region",
 		},
-		Server: &networksdk.NestedServerSchema{
+		Server: core.NullableFromPtr(&networksdk.NestedServerSchema{
 			Id:   privateIPTestServerID,
 			Name: "app-server",
-		},
+		}),
 		Project: networksdk.NestedProjectSchema{
 			Id:   privateIPTestProjectID,
 			Name: "integration",

@@ -82,11 +82,11 @@ func TestImageFinderCardinalityAndListErrors(t *testing.T) {
 func TestImageFinderCombinesCatalogCriteriaWithoutName(t *testing.T) {
 	t.Parallel()
 	filter := ImageFilter{OS: new(" Ubuntu "), Version: new(" 22.04 "), Type: new(serversdk.ImageType(" server "))}
-	want := serversdk.ImageSchema{Id: core.UUID{1}, Name: "public-ubuntu", Os: new("Ubuntu"), Version: new("22.04"), Type: new(serversdk.ImageTypeServer)}
+	want := serversdk.ImageSchema{Id: core.UUID{1}, Name: "public-ubuntu", Os: new("Ubuntu"), Version: new("22.04"), Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}
 	wrongOS, wrongVersion, wrongType, missing := want, want, want, want
 	wrongOS.Os = new("Debian")
 	wrongVersion.Version = new("24.04")
-	wrongType.Type = new(serversdk.ImageTypePrebuilt)
+	wrongType.Type = core.NullableFromPtr(new(serversdk.ImageTypePrebuilt))
 	missing.Os, missing.Version, missing.Type = nil, nil, nil
 	lister := &fakeImageLister{values: []serversdk.ImageSchema{wrongOS, wrongVersion, wrongType, missing, want}}
 	got, err := NewImageFinder(lister, core.UUID{9}).Resolve(context.Background(), filter)

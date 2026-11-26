@@ -41,13 +41,29 @@ func TestResolveVolumeTypePassesTrimmedTypedCriteriaAndScope(t *testing.T) {
 	zoneID := core.UUID{9}
 	got, diags := ResolveVolumeType(context.Background(), value, "boot.volume_type", &zoneID, 30, func(_ context.Context, req blockstoragelookup.VolumeTypeResolveRequest) (blockstoragesdk.VolumeTypeSchema, error) {
 		f := req.Filter
-		if *f.Name != "fast" || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || string(*f.Speed) != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.ZoneID != &zoneID || req.RequestedSize != 30 {
+		if *f.Name != "fast" || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || *f.Speed != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.ZoneID != &zoneID || req.RequestedSize != 30 {
 			t.Fatalf("unexpected criteria: %#v", req)
 		}
 		return blockstoragesdk.VolumeTypeSchema{Id: core.UUID{2}}, nil
 	})
 	if diags.HasError() || got.Id != (core.UUID{2}) {
 		t.Fatalf("resolve type: %v", diags)
+	}
+}
+
+// The SDK types speed as a free-form string, so the selector must pass a value
+// outside the tiers that earlier SDK releases enumerated without rewriting it.
+func TestVolumeTypeFilterPassesFreeFormSpeedUnchanged(t *testing.T) {
+	t.Parallel()
+	filter, diags := VolumeTypeFilter(context.Background(), volumeTypeCriteria(map[string]attr.Value{"speed": types.StringValue("7.5k IOPS")}), "volume_type")
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+	if filter.Speed == nil || *filter.Speed != "7.5k IOPS" {
+		t.Fatalf("speed = %v, want %q", filter.Speed, "7.5k IOPS")
+	}
+	if filter.Name != nil || filter.DiskType != nil || filter.EncryptionKeySize != nil || filter.Multiattach != nil {
+		t.Fatalf("unconfigured criteria must stay unset: %#v", filter)
 	}
 }
 

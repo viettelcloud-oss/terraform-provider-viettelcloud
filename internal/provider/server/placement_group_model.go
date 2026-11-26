@@ -5,8 +5,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
@@ -45,8 +47,8 @@ func populatePlacementGroupModel(pg *serversdk.PlacementGroupSchema, m *Placemen
 	m.CreatedAt = types.StringValue(pg.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(pg.UpdatedAt.Format(time.RFC3339))
 
-	if pg.Policy != nil {
-		m.Policy = types.StringValue(string(*pg.Policy))
+	if policy := core.NullableToPtr(pg.Policy); policy != nil {
+		m.Policy = types.StringValue(string(*policy))
 	} else {
 		m.Policy = types.StringNull()
 	}
@@ -63,14 +65,20 @@ func populatePlacementGroupResourceState(pg *serversdk.PlacementGroupSchema, sta
 	}
 
 	configuredName := state.Name
+	configuredDescription := state.Description
+	configuredPolicy := state.Policy
 	configuredRegion := reference.Get(state.Region, reference.Name)
 	populatePlacementGroupModel(pg, &state.PlacementGroupModel)
 	state.Region = reference.Value(reference.Name, types.StringValue(pg.Region.Name))
 
 	// buildPlacementGroupCreateBody and buildPlacementGroupUpdateBody trim outer
-	// whitespace from name and region before every request, so the backend
-	// reports the trimmed form; preserve the configured representation so
-	// Terraform does not report drift.
+	// whitespace from name, description, policy and region before every
+	// request, so the backend reports the trimmed form; preserve the configured
+	// representation so Terraform does not report drift.
+	state.Description = compare.PreservedString(configuredDescription, pg.Description)
+	if !state.Policy.IsNull() {
+		state.Policy = compare.PreservedString(configuredPolicy, state.Policy.ValueString())
+	}
 	if !configuredName.IsNull() && !configuredName.IsUnknown() &&
 		strings.TrimSpace(configuredName.ValueString()) == pg.Name {
 		state.Name = configuredName

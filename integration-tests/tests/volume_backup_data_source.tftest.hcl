@@ -17,7 +17,7 @@ run "lookupBackup_supportedFilters_matchingBackupReturned" {
   }
 
   assert {
-    condition     = output.by_id.id == output.subject.id && output.by_id.description == output.subject.description && output.by_id.volume_name == output.subject.volume_name && output.by_id.status == output.subject.status && output.by_id.size == output.subject.size && output.by_id.expired == output.subject.expired && output.by_id.disk_type == output.subject.disk_type && output.by_id.encryption_key_size == output.subject.encryption_key_size && output.by_id.project_id == output.subject.project_id && output.by_id.region_id == output.subject.region_id && output.by_id.policy_id == output.subject.policy_id && output.by_id.created_at == output.subject.created_at && length(output.by_id.updated_at) > 0
+    condition     = output.by_id.id == output.subject.id && output.by_id.name == output.subject.name && output.by_id.volume_id == output.subject.volume.id && output.by_id.region == output.subject.region && output.by_id.description == output.subject.description && output.by_id.volume_name == output.subject.volume_name && output.by_id.status == output.subject.status && output.by_id.size == output.subject.size && output.by_id.expired == output.subject.expired && output.by_id.disk_type == output.subject.disk_type && output.by_id.encryption_key_size == output.subject.encryption_key_size && output.by_id.project_id == output.subject.project_id && output.by_id.region_id == output.subject.region_id && output.by_id.policy_id == output.subject.policy_id && output.by_id.created_at == output.subject.created_at && length(output.by_id.updated_at) > 0
     error_message = "The ID lookup returned incomplete backup state."
   }
   assert {

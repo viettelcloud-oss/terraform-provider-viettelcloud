@@ -39,7 +39,7 @@ func customImageFixture() *serversdk.CustomImageSchema {
 		Id: core.UUID{0x81}, Name: "image-a", Description: "", DiskFormat: serversdk.ImageCustomFormatQcow2,
 		ContainerFormat: serversdk.ImageCustomContainerFormatBare, State: serversdk.ImageStateEnabled, Status: serversdk.ImageStatusActive,
 		EncryptKeySize: serversdk.VolumeTypeEncryptKeySizeN0,
-		Volume:         &serversdk.NestedVolumeSchema{Id: core.UUID{0x82}, Name: "boot-source", Size: 20},
+		Volume:         core.NullableFromPtr(&serversdk.NestedVolumeSchema{Id: core.UUID{0x82}, Name: "boot-source", Size: 20}),
 		Region:         serversdk.NestedRegionSchema{Id: core.UUID{0x83}, Name: "region-a"},
 		Project:        placementGroupTestProject, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), UpdatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}
@@ -95,4 +95,18 @@ func selectorTestCriteria(typesMap map[string]attr.Type, values map[string]attr.
 		}
 	}
 	return types.ObjectValueMust(typesMap, complete)
+}
+
+// nullableEquals reports whether n holds want; an unset or null n holds nothing.
+func nullableEquals[T comparable](n core.Nullable[T], want T) bool {
+	value, err := n.Get()
+	return err == nil && value == want
+}
+
+// nullNullable returns a Nullable holding an explicit null, the value the
+// backend sends for a nullable field that has none.
+func nullNullable[T any]() core.Nullable[T] {
+	var n core.Nullable[T]
+	n.SetNull()
+	return n
 }

@@ -212,7 +212,7 @@ func TestPrivateIPDataSourceReadByDirectID(t *testing.T) {
 
 	d := privateIPDataSourceForServer(t, server)
 	config := nullPrivateIPDataSourceModel()
-	configuredID := strings.ToUpper(privateIPDataSourceTestID.String())
+	configuredID := "  " + strings.ToUpper(privateIPDataSourceTestID.String()) + " "
 	config.ID = types.StringValue(configuredID)
 	response := readPrivateIPDataSource(t, d, config)
 	if response.Diagnostics.HasError() {
@@ -467,7 +467,7 @@ func TestPreserveConfiguredPrivateIPValuesUsesChangedBackendValues(t *testing.T)
 	populatePrivateIPDataSourceState(privateIP, &state)
 	preserveConfiguredPrivateIPValues(privateIP, config, &state)
 
-	if state.IPAddress.ValueString() != *privateIP.IpAddress || state.SubnetName.ValueString() != privateIP.Subnet.Name ||
+	if state.IPAddress.ValueString() != *core.NullableToPtr(privateIP.IpAddress) || state.SubnetName.ValueString() != privateIP.Subnet.Name ||
 		state.SubnetCIDR.ValueString() != privateIP.Subnet.Cidr || state.VPCName.ValueString() != privateIP.Vpc.Name ||
 		state.Region.ValueString() != privateIP.Region.Name {
 		t.Fatalf("expected backend values when criteria differ, got %#v", state)
@@ -480,8 +480,8 @@ func TestPreserveConfiguredPrivateIPValuesUsesChangedBackendValues(t *testing.T)
 	}
 
 	matching := nullPrivateIPDataSourceModel()
-	matching.SubnetID = types.StringValue(strings.ToUpper(privateIP.Subnet.Id.String()))
-	matching.VPCID = types.StringValue(strings.ToUpper(privateIP.Vpc.Id.String()))
+	matching.SubnetID = types.StringValue("  " + strings.ToUpper(privateIP.Subnet.Id.String()) + " ")
+	matching.VPCID = types.StringValue("  " + strings.ToUpper(privateIP.Vpc.Id.String()) + " ")
 	populatePrivateIPDataSourceState(privateIP, &state)
 	preserveConfiguredPrivateIPValues(privateIP, matching, &state)
 	if state.SubnetID.ValueString() != matching.SubnetID.ValueString() || state.VPCID.ValueString() != matching.VPCID.ValueString() {
@@ -638,13 +638,13 @@ func mockPrivateIPDataSource(description string) *networksdk.PrivateIPSchema {
 	allowedCIDRs := []string{"10.0.1.0/24", "10.0.2.0/24"}
 	attachedVIPs := []networksdk.NestedPrivateIPAllowedVIPSchema{{
 		Id:        privateIPDataSourceTestVIPID,
-		IpAddress: &vipAddress,
+		IpAddress: core.NullableFromPtr(&vipAddress),
 	}}
 	return &networksdk.PrivateIPSchema{
 		Id:           privateIPDataSourceTestID,
-		Description:  &description,
-		IpAddress:    &ipAddress,
-		MacAddress:   &macAddress,
+		Description:  core.NullableFromPtr(&description),
+		IpAddress:    core.NullableFromPtr(&ipAddress),
+		MacAddress:   core.NullableFromPtr(&macAddress),
 		DisplayName:  ipAddress,
 		DeviceOwner:  networksdk.PrivateIPDeviceOwnerUser,
 		PortSecurity: true,
@@ -665,10 +665,10 @@ func mockPrivateIPDataSource(description string) *networksdk.PrivateIPSchema {
 			Name:        "vn-central-1",
 			Description: "Central region",
 		},
-		Server: &networksdk.NestedServerSchema{
+		Server: core.NullableFromPtr(&networksdk.NestedServerSchema{
 			Id:   privateIPDataSourceTestServerID,
 			Name: "app-server",
-		},
+		}),
 		Project: networksdk.NestedProjectSchema{
 			Id:   privateIPDataSourceTestProjectID,
 			Name: "integration",

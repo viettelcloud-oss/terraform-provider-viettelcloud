@@ -2,15 +2,16 @@ package server
 
 import (
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 )
 
 type CustomImageModel struct {
@@ -55,6 +56,14 @@ type CustomImageDataSourceModel struct {
 // a custom image resource.
 var customImageVolumeCriteria = []string{reference.Name, reference.ID}
 
+// customImageSameVolume compares each source volume criterion the way
+// customImageSourceVolume preserves it, so that a change of spelling keeps
+// the image.
+var customImageSameVolume = map[string]replace.Same{
+	reference.Name: compare.SameTrimmedString,
+	reference.ID:   compare.SameUUIDString,
+}
+
 func populateCustomImageModel(image *serversdk.CustomImageSchema, m *CustomImageModel) {
 	prior := *m
 	m.ID = types.StringValue(image.Id.String())
@@ -67,17 +76,17 @@ func populateCustomImageModel(image *serversdk.CustomImageSchema, m *CustomImage
 	m.State = types.StringValue(string(image.State))
 	m.Status = types.StringValue(string(image.Status))
 	m.Metadata = types.StringNull()
-	if image.Metadata != nil {
-		raw, _ := json.Marshal(*image.Metadata)
+	if metadata := core.NullableToPtr(image.Metadata); metadata != nil {
+		raw, _ := json.Marshal(*metadata)
 		m.Metadata = types.StringValue(string(raw))
 	}
 	m.Size = types.Int64Null()
-	if image.Size != nil {
-		m.Size = types.Int64Value(int64(*image.Size))
+	if size := core.NullableToPtr(image.Size); size != nil {
+		m.Size = types.Int64Value(int64(*size))
 	}
 	m.MinVolumeSize = types.Int64Null()
-	if image.MinVolumeSize != nil {
-		m.MinVolumeSize = types.Int64Value(int64(*image.MinVolumeSize))
+	if minVolumeSize := core.NullableToPtr(image.MinVolumeSize); minVolumeSize != nil {
+		m.MinVolumeSize = types.Int64Value(int64(*minVolumeSize))
 	}
 	m.EncryptKeySize = types.StringValue(string(image.EncryptKeySize))
 	m.Region = types.StringValue(image.Region.Name)
@@ -85,9 +94,9 @@ func populateCustomImageModel(image *serversdk.CustomImageSchema, m *CustomImage
 	m.Project = types.StringValue(image.Project.Name)
 	m.OwnerID = types.StringNull()
 	m.Owner = types.StringNull()
-	if image.Owner != nil {
-		m.OwnerID = types.StringValue(image.Owner.Id.String())
-		m.Owner = types.StringValue(image.Owner.Username)
+	if owner := core.NullableToPtr(image.Owner); owner != nil {
+		m.OwnerID = types.StringValue(owner.Id.String())
+		m.Owner = types.StringValue(owner.Username)
 	}
 	m.CreatedAt = types.StringValue(image.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(image.UpdatedAt.Format(time.RFC3339))
@@ -95,7 +104,15 @@ func populateCustomImageModel(image *serversdk.CustomImageSchema, m *CustomImage
 		before types.String
 		after  *types.String
 	}{
-		{prior.Name, &m.Name}, {prior.Region, &m.Region},
+		{prior.Name, &m.Name},
+		{prior.Region, &m.Region},
+		{prior.Description, &m.Description},
+		{prior.OS, &m.OS},
+		{prior.Version, &m.Version},
+		{prior.DiskFormat, &m.DiskFormat},
+		{prior.ContainerFormat, &m.ContainerFormat},
+		{prior.State, &m.State},
+		{prior.Status, &m.Status},
 	} {
 		preserveTrimmedString(pair.before, pair.after)
 	}
@@ -115,7 +132,7 @@ func populateCustomImageResourceState(image *serversdk.CustomImageSchema, m *Cus
 	m.Volume = reference.Of(map[string]types.String{reference.Name: name, reference.ID: id})
 	// The API can omit a removed source volume. Keep the creation reference so
 	// deleting the source does not force replacement of its existing image.
-	if image.Volume == nil {
+	if core.NullableToPtr(image.Volume) == nil {
 		m.Volume = types.ObjectNull(reference.AttributeTypes(customImageVolumeCriteria...))
 		if !source.IsNull() && !source.IsUnknown() {
 			m.Volume = reference.Of(map[string]types.String{reference.Name: knownOrNull(priorName), reference.ID: knownOrNull(priorID)})
@@ -123,13 +140,12 @@ func populateCustomImageResourceState(image *serversdk.CustomImageSchema, m *Cus
 	}
 	ids := customImageSharedProjectIDs(image)
 	m.SharedProjects = customImageSharedProjects(ids)
-	if compare.SameUUIDSet(customImageSharedProjectIDSet(sharedProjects), ids) {
+	if compare.SameUUIDSet(referenceIDSet(sharedProjects), ids) {
 		m.SharedProjects = sharedProjects
 	}
 }
 
 func populateCustomImageDataSourceState(image *serversdk.CustomImageSchema, state *CustomImageDataSourceModel) {
-	configuredOS, configuredVersion := state.OS, state.Version
 	sharedProjectIDs := state.SharedProjectIDs
 	populateCustomImageModel(image, &state.CustomImageModel)
 	state.Volume, state.VolumeID = customImageSourceVolume(image, state.Volume, state.VolumeID)
@@ -137,26 +153,19 @@ func populateCustomImageDataSourceState(image *serversdk.CustomImageSchema, stat
 	if compare.SameUUIDSet(sharedProjectIDs, state.SharedProjectIDs) {
 		state.SharedProjectIDs = sharedProjectIDs
 	}
-	for _, pair := range []struct {
-		configured types.String
-		target     *types.String
-	}{{configuredOS, &state.OS}, {configuredVersion, &state.Version}} {
-		if !pair.configured.IsNull() && !pair.configured.IsUnknown() && !pair.target.IsNull() && strings.TrimSpace(pair.configured.ValueString()) == pair.target.ValueString() {
-			*pair.target = pair.configured
-		}
-	}
 }
 
 // customImageSourceVolume returns the name and UUID of the image's source
 // volume, or nulls when the API omits it. A prior value that names the same
 // volume keeps its representation.
 func customImageSourceVolume(image *serversdk.CustomImageSchema, priorName, priorID types.String) (types.String, types.String) {
-	if image.Volume == nil {
+	volume := core.NullableToPtr(image.Volume)
+	if volume == nil {
 		return types.StringNull(), types.StringNull()
 	}
-	name, id := types.StringValue(image.Volume.Name), types.StringValue(image.Volume.Id.String())
+	name, id := types.StringValue(volume.Name), types.StringValue(volume.Id.String())
 	preserveTrimmedString(priorName, &name)
-	if compare.SameUUID(priorID, image.Volume.Id) {
+	if compare.SameUUID(priorID, volume.Id) {
 		id = priorID
 	}
 	return name, id
@@ -189,9 +198,10 @@ func customImageSharedProjects(ids types.Set) types.Set {
 	return types.SetValueMust(reference.ObjectType(reference.ID), projects)
 }
 
-// customImageSharedProjectIDSet returns the project UUIDs of a shared_projects
-// set as a set of strings, keeping a null or unknown set.
-func customImageSharedProjectIDSet(projects types.Set) types.Set {
+// referenceIDSet returns the IDs of a set of ID references, such as
+// shared_projects or security_groups, as a set of strings, keeping a null or
+// unknown set.
+func referenceIDSet(projects types.Set) types.Set {
 	if projects.IsNull() {
 		return types.SetNull(types.StringType)
 	}
@@ -206,10 +216,11 @@ func customImageSharedProjectIDSet(projects types.Set) types.Set {
 	return types.SetValueMust(types.StringType, elements)
 }
 
-// preserveTrimmedString keeps a prior value whose trimmed form equals the
-// backend value in target.
+// preserveTrimmedString keeps a prior value that differs from the non-null
+// backend value in target only by outer whitespace. A null backend value stays
+// null, so a configured "" does not hide an absent os or version.
 func preserveTrimmedString(prior types.String, target *types.String) {
-	if !prior.IsNull() && !prior.IsUnknown() && strings.TrimSpace(prior.ValueString()) == target.ValueString() {
+	if !target.IsNull() && compare.SameTrimmed(prior, target.ValueString()) {
 		*target = prior
 	}
 }

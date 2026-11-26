@@ -12,7 +12,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	resourceschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -95,38 +94,23 @@ func TestSubnetReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	subnetResourceSchema := subnetSchema(t)
-	attribute, ok := subnetResourceSchema.Attributes["cidr"].(resourceschema.StringAttribute)
-	if !ok {
-		t.Fatal("cidr is not a string attribute")
+	before := types.StringValue("10.0.1.0/24")
+	tests := map[string]struct {
+		plan types.String
+		want bool
+	}{
+		"same cidr updates in place":   {plan: before},
+		"padded cidr updates in place": {plan: types.StringValue(" 10.0.1.0/24 ")},
+		"another cidr replaces":        {plan: types.StringValue("10.0.2.0/24"), want: true},
+		"unknown cidr replaces":        {plan: types.StringUnknown(), want: true},
 	}
-	if len(attribute.PlanModifiers) != 1 {
-		t.Fatalf("expected one plan modifier for cidr, got %d", len(attribute.PlanModifiers))
-	}
-
-	state := tfsdk.State{Schema: subnetResourceSchema}
-	if diags := state.Set(context.Background(), &SubnetResourceModel{
-		SubnetModel: SubnetModel{CIDR: types.StringValue("before")},
-		VPC:         reference.Value(reference.ID, types.StringValue("before")),
-	}); diags.HasError() {
-		t.Fatalf("set modifier state: %v", diags)
-	}
-	plan := tfsdk.Plan{Schema: subnetResourceSchema}
-	if diags := plan.Set(context.Background(), &SubnetResourceModel{
-		SubnetModel: SubnetModel{CIDR: types.StringValue("after")},
-		VPC:         reference.Value(reference.ID, types.StringValue("after")),
-	}); diags.HasError() {
-		t.Fatalf("set modifier plan: %v", diags)
-	}
-	request := planmodifier.StringRequest{
-		State:      state,
-		Plan:       plan,
-		StateValue: types.StringValue("before"),
-		PlanValue:  types.StringValue("after"),
-	}
-	var response planmodifier.StringResponse
-	attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
-	if !response.RequiresReplace {
-		t.Error("expected changing cidr to require replacement")
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := stringRequiresReplace(t, subnetResourceSchema, "cidr", before, test.plan, test.plan); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -140,9 +124,11 @@ func TestSubnetVPCReferenceSchemaAndReplacement(t *testing.T) {
 		plan types.Object
 		want bool
 	}{
-		"same id updates in place": {plan: before},
-		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0xef}.String())), want: true},
-		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+		"same id updates in place":       {plan: before},
+		"padded id updates in place":     {plan: reference.Value(reference.ID, types.StringValue("  "+subnetTestVPCID.String()+" "))},
+		"upper-case id updates in place": {plan: reference.Value(reference.ID, types.StringValue(strings.ToUpper(subnetTestVPCID.String())))},
+		"another id replaces":            {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0xef}.String())), want: true},
+		"unknown id replaces":            {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -231,6 +217,18 @@ func TestBuildSubnetCreateBodyRejectsUnknownAndInvalidInputs(t *testing.T) {
 	if !diagsUnknownVPC.HasError() || !strings.Contains(diagsUnknownVPC.Errors()[0].Detail(), "vpc.id") {
 		t.Fatalf("expected diagnostics naming vpc.id for an unknown VPC ID, got %v", diagsUnknownVPC)
 	}
+
+	// A name that is blank after the trim
+	_, diagsBlank := buildSubnetCreateBody(SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name: types.StringValue("   "),
+			CIDR: types.StringValue("10.0.1.0/24"),
+		},
+		VPC: reference.Value(reference.ID, types.StringValue(subnetTestVPCID.String())),
+	})
+	if !diagsBlank.HasError() || diagsBlank.Errors()[0].Summary() != "Missing subnet name" {
+		t.Fatalf("expected a diagnostic for a blank name, got %v", diagsBlank)
+	}
 }
 
 func TestBuildSubnetUpdateBodySendsOnlyChanges(t *testing.T) {
@@ -247,7 +245,7 @@ func TestBuildSubnetUpdateBodySendsOnlyChanges(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if !changed || body.Name == nil || *body.Name != "services" || body.Description != nil {
+	if !changed || body.Name == nil || *body.Name != "services" || body.Description.IsSpecified() {
 		t.Fatalf("unexpected sparse update body: %#v", body)
 	}
 }
@@ -266,7 +264,7 @@ func TestBuildSubnetUpdateBodyPreservesOmittedDescription(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if changed || body.Description != nil || body.Name != nil {
+	if changed || body.Description.IsSpecified() || body.Name != nil {
 		t.Fatalf("expected an empty update body, got %#v", body)
 	}
 }
@@ -285,7 +283,7 @@ func TestBuildSubnetUpdateBodyClearsDescription(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if !changed || body.Description == nil || *body.Description != "" || body.Name != nil {
+	if !changed || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "" || body.Name != nil {
 		t.Fatalf("expected an explicit description clear, got %#v", body)
 	}
 }
@@ -304,7 +302,7 @@ func TestBuildSubnetUpdateBodyDescriptionOnly(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if !changed || body.Name != nil || body.Description == nil || *body.Description != "after" {
+	if !changed || body.Name != nil || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "after" {
 		t.Fatalf("expected description update body, got %#v", body)
 	}
 }
@@ -323,7 +321,7 @@ func TestBuildSubnetUpdateBodyStateNullDescription(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if !changed || body.Description == nil || *body.Description != "new description" {
+	if !changed || core.NullableToPtr(body.Description) == nil || *core.NullableToPtr(body.Description) != "new description" {
 		t.Fatalf("expected description to be set from null state, got %#v", body)
 	}
 }
@@ -347,7 +345,7 @@ func TestBuildSubnetUpdateBodyPreservesUntrimmedNameWhenSemanticallyEqual(t *tes
 	}
 }
 
-func TestBuildSubnetUpdateBodyRejectsUnknownAndNullName(t *testing.T) {
+func TestBuildSubnetUpdateBodyRejectsUnknownNullAndBlankName(t *testing.T) {
 	t.Parallel()
 
 	state := SubnetResourceModel{SubnetModel: SubnetModel{
@@ -368,6 +366,14 @@ func TestBuildSubnetUpdateBodyRejectsUnknownAndNullName(t *testing.T) {
 	_, _, diagsNull := buildSubnetUpdateBody(planNull, state)
 	if !diagsNull.HasError() {
 		t.Fatal("expected diagnostic for null name in update plan")
+	}
+
+	// Case 3: Name that is blank after the trim
+	planBlank := state
+	planBlank.Name = types.StringValue("   ")
+	_, changed, diagsBlank := buildSubnetUpdateBody(planBlank, state)
+	if !diagsBlank.HasError() || changed {
+		t.Fatalf("expected diagnostic and no change for blank name in update plan, got changed=%t %v", changed, diagsBlank)
 	}
 }
 
@@ -700,6 +706,129 @@ func TestSubnetResourceLifecycleWithUntrimmedName(t *testing.T) {
 	}
 	if stateAfterRead.Name.ValueString() != untrimmedName {
 		t.Fatalf("expected read state name to preserve untrimmed %q, got %q", untrimmedName, stateAfterRead.Name.ValueString())
+	}
+}
+
+func TestSubnetResourceCreateTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+
+		switch requests {
+		case 1:
+			var body networksdk.SubnetCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			if body.Cidr != "10.0.1.0/24" {
+				t.Errorf("create body cidr = %q, want trimmed 10.0.1.0/24", body.Cidr)
+			}
+			if body.Description == nil || *body.Description != "tier" {
+				t.Errorf("create body description = %v, want trimmed tier", body.Description)
+			}
+			if body.VpcId != subnetTestVPCID {
+				t.Errorf("create body vpc_id = %s, want %s", body.VpcId, subnetTestVPCID)
+			}
+			w.WriteHeader(http.StatusCreated)
+			writeSubnetResponse(t, w, mockSubnet("application", "tier"))
+		case 2:
+			writeSubnetResponse(t, w, mockSubnet("application", "tier"))
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := networksdk.NewClient(
+		server.URL,
+		networksdk.WithHTTPClient(server.Client()),
+		networksdk.WithRetry(core.NoRetry()),
+	)
+	if err != nil {
+		t.Fatalf("create network client: %v", err)
+	}
+	r := &SubnetResource{client: client, projectID: subnetProjectID}
+	subnetResourceSchema := subnetSchema(t)
+
+	const paddedCIDR = " 10.0.1.0/24 "
+	const paddedDescription = " tier "
+	paddedVPC := reference.Value(reference.ID, types.StringValue("  "+subnetTestVPCID.String()+" "))
+	createPlan := tfsdk.Plan{Schema: subnetResourceSchema}
+	if diags := createPlan.Set(ctx, &SubnetResourceModel{
+		SubnetModel: SubnetModel{
+			Name:        types.StringValue("application"),
+			CIDR:        types.StringValue(paddedCIDR),
+			Description: types.StringValue(paddedDescription),
+		},
+		VPC: paddedVPC,
+	}); diags.HasError() {
+		t.Fatalf("set create plan: %v", diags)
+	}
+	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: subnetResourceSchema}}
+	r.Create(ctx, resource.CreateRequest{Plan: createPlan}, &createResponse)
+	if createResponse.Diagnostics.HasError() {
+		t.Fatalf("create diagnostics: %v", createResponse.Diagnostics)
+	}
+
+	readResponse := resource.ReadResponse{State: createResponse.State}
+	r.Read(ctx, resource.ReadRequest{State: createResponse.State}, &readResponse)
+	if readResponse.Diagnostics.HasError() {
+		t.Fatalf("read diagnostics: %v", readResponse.Diagnostics)
+	}
+
+	for step, state := range map[string]tfsdk.State{"create": createResponse.State, "read": readResponse.State} {
+		var model SubnetResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state after %s: %v", step, diags)
+		}
+		if model.CIDR.ValueString() != paddedCIDR || model.Description.ValueString() != paddedDescription || !model.VPC.Equal(paddedVPC) {
+			t.Fatalf("state after %s: cidr=%q description=%q vpc=%s, want configured %q, %q and %s",
+				step, model.CIDR.ValueString(), model.Description.ValueString(), model.VPC, paddedCIDR, paddedDescription, paddedVPC)
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want create and read", requests)
+	}
+}
+
+func TestBuildSubnetUpdateBodyComparesTrimmedDescription(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		state       types.String
+		plan        string
+		wantChanged bool
+	}{
+		"padded plan of same description":  {state: types.StringValue("tier"), plan: " tier ", wantChanged: false},
+		"padded state of same description": {state: types.StringValue(" tier "), plan: "tier", wantChanged: false},
+		"changed description is trimmed":   {state: types.StringValue("tier"), plan: " web ", wantChanged: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			state := SubnetResourceModel{SubnetModel: SubnetModel{Name: types.StringValue("application"), Description: tt.state}}
+			plan := state
+			plan.Description = types.StringValue(tt.plan)
+
+			body, changed, diags := buildSubnetUpdateBody(plan, state)
+			if diags.HasError() {
+				t.Fatalf("unexpected diagnostics: %v", diags)
+			}
+			if changed != tt.wantChanged {
+				t.Fatalf("changed = %t, want %t (body %#v)", changed, tt.wantChanged, body)
+			}
+			if !tt.wantChanged {
+				return
+			}
+			if description := core.NullableToPtr(body.Description); description == nil || *description != strings.TrimSpace(tt.plan) {
+				t.Fatalf("body description = %v, want %q", description, strings.TrimSpace(tt.plan))
+			}
+		})
 	}
 }
 
@@ -1148,7 +1277,7 @@ func mockSubnet(name, description string) *networksdk.SubnetSchema {
 	return &networksdk.SubnetSchema{
 		Id:          subnetTestUUID,
 		Name:        name,
-		Description: &description,
+		Description: core.NullableFromPtr(&description),
 		Cidr:        "10.0.1.0/24",
 		Vpc: networksdk.NestedVPCSchema{
 			Id:          subnetTestVPCID,

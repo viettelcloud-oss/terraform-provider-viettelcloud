@@ -122,16 +122,24 @@ func TestCustomImageResourceSchemaAndModifiers(t *testing.T) {
 		if field != "disk_format" && (!a.Optional || !a.Computed) {
 			t.Fatalf("%s must be optional and computed", field)
 		}
+		old, respelled := "old", " old "
+		if field == "volume.id" {
+			old = core.UUID{0x82}.String()
+			respelled = " " + strings.ToUpper(old) + " "
+		}
 		for _, test := range []struct {
 			name    string
 			value   types.String
 			replace bool
 		}{
-			{"change", types.StringValue("new"), true}, {"remove", types.StringNull(), field == "disk_format"}, {"unknown", types.StringUnknown(), true},
+			{"change", types.StringValue("new"), true},
+			{"respell", types.StringValue(respelled), false},
+			{"remove", types.StringNull(), field == "disk_format"},
+			{"unknown", types.StringUnknown(), true},
 		} {
 			t.Run(field+"/"+test.name, func(t *testing.T) {
 				response := planmodifier.StringResponse{PlanValue: test.value}
-				req := planmodifier.StringRequest{State: customImageState(t, model), Plan: customImagePlan(t, model), ConfigValue: test.value, StateValue: types.StringValue("old"), PlanValue: test.value}
+				req := planmodifier.StringRequest{State: customImageState(t, model), Plan: customImagePlan(t, model), ConfigValue: test.value, StateValue: types.StringValue(old), PlanValue: test.value}
 				for _, modifier := range a.PlanModifiers {
 					req.PlanValue = response.PlanValue
 					modifier.PlanModifyString(context.Background(), req, &response)
@@ -186,6 +194,9 @@ func TestCustomImageSourcePlans(t *testing.T) {
 		{name: "name disk replacement", change: "disk", wantReplace: true, wantUnknown: true},
 		{name: "ID disk replacement", byID: true, change: "disk", wantReplace: true, wantUnknown: true},
 		{name: "switch to same ID", byID: true, change: "metadata"},
+		{name: "name respelled", change: "respelled"},
+		{name: "ID respelled", byID: true, change: "respelled"},
+		{name: "name disk respelled", change: "disk respelled"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			state := customImageBaseModel()
@@ -221,6 +232,17 @@ func TestCustomImageSourcePlans(t *testing.T) {
 			case "disk":
 				config.DiskFormat = types.StringValue("raw")
 				proposed.DiskFormat = config.DiskFormat
+			case "disk respelled":
+				config.DiskFormat = types.StringValue(" " + state.DiskFormat.ValueString() + " ")
+				proposed.DiskFormat = config.DiskFormat
+			case "respelled":
+				if tt.byID {
+					config.Volume = customImageVolume(types.StringNull(), types.StringValue("  "+strings.ToUpper(stateID.ValueString())+" "))
+					proposed.Volume = customImageVolume(stateName, reference.Get(config.Volume, reference.ID))
+				} else {
+					config.Volume = customImageVolume(types.StringValue(" "+stateName.ValueString()+" "), types.StringNull())
+					proposed.Volume = customImageVolume(reference.Get(config.Volume, reference.Name), stateID)
+				}
 			}
 			dynamic := func(model CustomImageResourceModel) *tfprotov6.DynamicValue {
 				state := tfsdk.State{Schema: resourceSchema}
@@ -298,9 +320,14 @@ func TestBuildCustomImageCreateBody(t *testing.T) {
 		model.Name = types.StringValue(" image-a ")
 		model.Volume = customImageVolumeName(" boot-source ")
 		model.Description = description
+		model.DiskFormat = types.StringValue(" raw ")
 		model.ContainerFormat = types.StringUnknown()
+		if description.IsNull() {
+			model.ContainerFormat = types.StringValue(" bare\n")
+		}
 		body, diags := buildCustomImageCreateBody(context.Background(), model, core.UUID{0x82})
-		if diags.HasError() || body.Name != "image-a" || body.VolumeId != (core.UUID{0x82}) || body.ContainerFormat != serversdk.ImageCustomContainerFormatBare {
+		if diags.HasError() || body.Name != "image-a" || body.VolumeId != (core.UUID{0x82}) ||
+			body.DiskFormat != serversdk.ImageCustomFormatRaw || body.ContainerFormat != serversdk.ImageCustomContainerFormatBare {
 			t.Fatalf("%#v %v", body, diags)
 		}
 		raw, _ := json.Marshal(body)
@@ -331,6 +358,9 @@ func TestBuildCustomImageRejectsInvalidInputs(t *testing.T) {
 		{"metadata array", func(m *CustomImageResourceModel) { m.Metadata = types.StringValue(`[]`) }},
 		{"metadata root null", func(m *CustomImageResourceModel) { m.Metadata = types.StringValue(`null`) }},
 		{"invalid project", func(m *CustomImageResourceModel) { m.SharedProjects = reference.Set(reference.ID, []string{"wrong"}) }},
+		{"duplicate project after trim", func(m *CustomImageResourceModel) {
+			m.SharedProjects = reference.Set(reference.ID, []string{core.UUID{0x91}.String(), " " + core.UUID{0x91}.String() + " "})
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -361,18 +391,18 @@ func TestBuildCustomImageUpdatePresence(t *testing.T) {
 		plan.SharedProjects = types.SetNull(reference.ObjectType(reference.ID))
 		body, changed, diags := buildCustomImageUpdateBody(context.Background(), plan, state)
 		clearing := !value.IsNull() && !value.IsUnknown()
-		if diags.HasError() || changed != clearing || (body.Description != nil) != clearing || (body.Os != nil) != clearing || (body.Version != nil) != clearing || body.Metadata != nil || body.SharedProjectIds != nil {
+		if diags.HasError() || changed != clearing || (body.Description != nil) != clearing || body.Os.IsSpecified() != clearing || body.Version.IsSpecified() != clearing || body.Metadata != nil || body.SharedProjectIds != nil {
 			t.Fatalf("%#v %v", body, diags)
 		}
 	}
 	plan := state
 	plan.Name = types.StringValue(" renamed ")
-	plan.State = types.StringValue("disabled")
+	plan.State = types.StringValue(" disabled ")
 	plan.Metadata = types.StringValue("{}")
 	plan.SharedProjects = reference.Set(reference.ID, nil)
 	body, changed, diags := buildCustomImageUpdateBody(context.Background(), plan, state)
 	raw, _ := json.Marshal(body)
-	if diags.HasError() || !changed || body.Name == nil || *body.Name != "renamed" || body.Metadata == nil || len(*body.Metadata) != 0 || body.SharedProjectIds == nil || len(*body.SharedProjectIds) != 0 || body.State == nil {
+	if diags.HasError() || !changed || body.Name == nil || *body.Name != "renamed" || body.Metadata == nil || len(*body.Metadata) != 0 || body.SharedProjectIds == nil || len(*body.SharedProjectIds) != 0 || body.State == nil || *body.State != serversdk.ImageStateDisabled {
 		t.Fatalf("%s %v", raw, diags)
 	}
 	if !strings.Contains(string(raw), `"metadata":{}`) || !strings.Contains(string(raw), `"shared_project_ids":[]`) {
@@ -380,8 +410,9 @@ func TestBuildCustomImageUpdatePresence(t *testing.T) {
 	}
 	plan = state
 	plan.Name = types.StringValue(" image-a ")
+	plan.State = types.StringValue(" " + state.State.ValueString() + " ")
 	plan.Metadata = types.StringValue(`{ "a" : "b" }`)
-	plan.SharedProjects = reference.Set(reference.ID, []string{strings.ToUpper(core.UUID{0x91}.String())})
+	plan.SharedProjects = reference.Set(reference.ID, []string{" " + strings.ToUpper(core.UUID{0x91}.String()) + " "})
 	_, changed, diags = buildCustomImageUpdateBody(context.Background(), plan, state)
 	if diags.HasError() || changed {
 		t.Fatal("semantically equal values must not patch")
@@ -410,7 +441,7 @@ func TestCustomImageCreateAndUpdate(t *testing.T) {
 			post++
 			var body serversdk.CustomImageCreateSchema
 			_ = json.NewDecoder(req.Body).Decode(&body)
-			if body.VolumeId != image.Volume.Id || body.Name != "image-a" {
+			if body.VolumeId != image.Volume.MustGet().Id || body.Name != "image-a" {
 				t.Errorf("bad create: %#v", body)
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -419,8 +450,8 @@ func TestCustomImageCreateAndUpdate(t *testing.T) {
 			patch++
 			var body serversdk.CustomImagePartialUpdateSchema
 			_ = json.NewDecoder(req.Body).Decode(&body)
-			if body.Os != nil {
-				image.Os = body.Os
+			if os := core.NullableToPtr(body.Os); os != nil {
+				image.Os = os
 			}
 			if body.Name != nil {
 				image.Name = *body.Name
@@ -440,7 +471,7 @@ func TestCustomImageCreateAndUpdate(t *testing.T) {
 		if req.URL.Query().Get("name") != "boot-source" {
 			t.Error(req.URL.String())
 		}
-		_ = json.NewEncoder(w).Encode(blockstoragesdk.PagedVolumeSchema{Count: 1, Results: []blockstoragesdk.VolumeSchema{{Id: image.Volume.Id, Name: "boot-source"}}})
+		_ = json.NewEncoder(w).Encode(blockstoragesdk.PagedVolumeSchema{Count: 1, Results: []blockstoragesdk.VolumeSchema{{Id: image.Volume.MustGet().Id, Name: "boot-source"}}})
 	}))
 	defer volumeServer.Close()
 	blockStorage, err := blockstoragesdk.NewClient(volumeServer.URL, blockstoragesdk.WithPAT("test"))
@@ -483,19 +514,132 @@ func TestCustomImageCreateAndUpdate(t *testing.T) {
 	}
 }
 
+// The API trims outer whitespace from description, os and version, so the
+// provider sends trimmed values and keeps the configured spelling in state.
+func TestCustomImageResourceTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	image := customImageFixture()
+	var sent []string
+	client := customImageClient(t, func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case http.MethodPost:
+			var body serversdk.CustomImageCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Description == nil {
+				t.Errorf("bad create: %v %#v", err, body)
+				return
+			}
+			sent = append(sent, "description="+*body.Description, "disk_format="+string(body.DiskFormat), "container_format="+string(body.ContainerFormat))
+			image.Description = *body.Description
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodPatch:
+			var body serversdk.CustomImagePartialUpdateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if body.Description != nil {
+				sent = append(sent, "description="+*body.Description)
+				image.Description = *body.Description
+			}
+			if value := core.NullableToPtr(body.Os); value != nil {
+				sent = append(sent, "os="+*value)
+				image.Os = value
+			}
+			if value := core.NullableToPtr(body.Version); value != nil {
+				sent = append(sent, "version="+*value)
+				image.Version = value
+			}
+			if body.State != nil {
+				sent = append(sent, "state="+string(*body.State))
+				image.State = *body.State
+			}
+		}
+		writeCustomImageResponse(t, w, image)
+	})
+	volumeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(blockstoragesdk.PagedVolumeSchema{Count: 1, Results: []blockstoragesdk.VolumeSchema{{Id: image.Volume.MustGet().Id, Name: "boot-source"}}})
+	}))
+	defer volumeServer.Close()
+	blockStorage, err := blockstoragesdk.NewClient(volumeServer.URL, blockstoragesdk.WithPAT("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &CustomImageResource{client: client, blockStorage: blockStorage, projectID: placementGroupProjectID}
+	imageState := " enabled "
+	assertText := func(stage string, state tfsdk.State, description, os, version string) {
+		t.Helper()
+		var model CustomImageResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatal(diags)
+		}
+		if model.Description.ValueString() != description || model.OS.ValueString() != os || model.Version.ValueString() != version {
+			t.Fatalf("state after %s: description=%q os=%q version=%q", stage, model.Description.ValueString(), model.OS.ValueString(), model.Version.ValueString())
+		}
+		if model.DiskFormat.ValueString() != " qcow2 " || model.ContainerFormat.ValueString() != " bare " || model.State.ValueString() != imageState {
+			t.Fatalf("state after %s: disk_format=%q container_format=%q state=%q", stage, model.DiskFormat.ValueString(), model.ContainerFormat.ValueString(), model.State.ValueString())
+		}
+	}
+
+	model := customImageBaseModel()
+	model.Description = types.StringValue(" desc ")
+	model.OS = types.StringValue(" Linux ")
+	model.Version = types.StringValue(" 22.04 ")
+	model.DiskFormat = types.StringValue(" qcow2 ")
+	model.ContainerFormat = types.StringValue(" bare ")
+	model.State = types.StringValue(imageState)
+	config := model
+	config.Volume = customImageVolumeName("boot-source")
+	create := resource.CreateResponse{State: tfsdk.State{Schema: customImageResourceSchema(t)}}
+	r.Create(ctx, resource.CreateRequest{Plan: customImagePlan(t, model), Config: tfsdk.Config(customImageState(t, config))}, &create)
+	if create.Diagnostics.HasError() {
+		t.Fatal(create.Diagnostics)
+	}
+	assertText("create", create.State, " desc ", " Linux ", " 22.04 ")
+
+	read := resource.ReadResponse{State: create.State}
+	r.Read(ctx, resource.ReadRequest{State: create.State}, &read)
+	if read.Diagnostics.HasError() {
+		t.Fatal(read.Diagnostics)
+	}
+	assertText("read", read.State, " desc ", " Linux ", " 22.04 ")
+
+	var plan CustomImageResourceModel
+	if diags := read.State.Get(ctx, &plan); diags.HasError() {
+		t.Fatal(diags)
+	}
+	plan.Description = types.StringValue(" new ")
+	plan.OS = types.StringValue(" Windows ")
+	plan.Version = types.StringValue(" 11 ")
+	imageState = " disabled "
+	plan.State = types.StringValue(imageState)
+	update := resource.UpdateResponse{State: read.State}
+	r.Update(ctx, resource.UpdateRequest{State: read.State, Plan: customImagePlan(t, plan)}, &update)
+	if update.Diagnostics.HasError() {
+		t.Fatal(update.Diagnostics)
+	}
+	assertText("update", update.State, " new ", " Windows ", " 11 ")
+
+	want := "description=desc|disk_format=qcow2|container_format=bare|os=Linux|version=22.04|description=new|os=Windows|version=11|state=disabled"
+	if got := strings.Join(sent, "|"); got != want {
+		t.Fatalf("requests carried %q, want %q", got, want)
+	}
+}
+
 func TestCustomImageCreateByVolumeID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	image := customImageFixture()
-	image.Owner = &serversdk.NestedUserSchema{Id: core.UUID{0x92}, Username: "image-owner"}
-	image.Volume.Id = core.UUID{0xab}
+	image.Owner = core.NullableFromPtr(&serversdk.NestedUserSchema{Id: core.UUID{0x92}, Username: "image-owner"})
+	volume := image.Volume.MustGet()
+	volume.Id = core.UUID{0xab}
+	image.Volume.Set(volume)
 	volumeCalls, creates := 0, 0
 	volumeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		volumeCalls++
-		if req.Method != http.MethodGet || req.URL.Path != "/v2/block-storage/volumes/"+image.Volume.Id.String()+"/" || req.Header.Get("Project-ID") != placementGroupProjectID.String() {
+		if req.Method != http.MethodGet || req.URL.Path != "/v2/block-storage/volumes/"+image.Volume.MustGet().Id.String()+"/" || req.Header.Get("Project-ID") != placementGroupProjectID.String() {
 			t.Errorf("unexpected volume lookup: %s %s", req.Method, req.URL)
 		}
-		_ = json.NewEncoder(w).Encode(blockstoragesdk.VolumeDetailSchema{Id: image.Volume.Id, ProjectId: placementGroupProjectID, Name: image.Volume.Name})
+		_ = json.NewEncoder(w).Encode(blockstoragesdk.VolumeSchema{Id: image.Volume.MustGet().Id, ProjectId: placementGroupProjectID, Name: image.Volume.MustGet().Name})
 	}))
 	defer volumeServer.Close()
 	blockStorage, err := blockstoragesdk.NewClient(volumeServer.URL)
@@ -509,7 +653,7 @@ func TestCustomImageCreateByVolumeID(t *testing.T) {
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			if body.VolumeId != image.Volume.Id {
+			if body.VolumeId != image.Volume.MustGet().Id {
 				t.Error(body.VolumeId)
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -517,7 +661,7 @@ func TestCustomImageCreateByVolumeID(t *testing.T) {
 		writeCustomImageResponse(t, w, image)
 	})
 	config := customImageBaseModel()
-	configuredID := types.StringValue(strings.ToUpper(image.Volume.Id.String()))
+	configuredID := types.StringValue(strings.ToUpper(image.Volume.MustGet().Id.String()))
 	config.Volume = customImageVolume(types.StringNull(), configuredID)
 	plan := config
 	plan.Volume = customImageVolume(types.StringUnknown(), configuredID)
@@ -531,10 +675,10 @@ func TestCustomImageCreateByVolumeID(t *testing.T) {
 	if diags := response.State.Get(ctx, &state); diags.HasError() {
 		t.Fatal(diags)
 	}
-	if state.ID.ValueString() != image.Id.String() || !state.Volume.Equal(customImageVolume(types.StringValue(image.Volume.Name), configuredID)) || volumeCalls != 1 || creates != 1 {
+	if state.ID.ValueString() != image.Id.String() || !state.Volume.Equal(customImageVolume(types.StringValue(image.Volume.MustGet().Name), configuredID)) || volumeCalls != 1 || creates != 1 {
 		t.Fatalf("state=%#v volumeCalls=%d creates=%d", state, volumeCalls, creates)
 	}
-	if state.Project.ValueString() != image.Project.Name || state.OwnerID.ValueString() != image.Owner.Id.String() || state.Owner.ValueString() != image.Owner.Username {
+	if state.Project.ValueString() != image.Project.Name || state.OwnerID.ValueString() != image.Owner.MustGet().Id.String() || state.Owner.ValueString() != image.Owner.MustGet().Username {
 		t.Fatalf("ownership outputs differ from the API: %#v", state)
 	}
 	image.Volume = nil
@@ -637,7 +781,7 @@ func TestCustomImageResolveSourceVolume(t *testing.T) {
 					if req.URL.Path != "/v2/block-storage/volumes/"+id.String()+"/" {
 						t.Error(req.URL.Path)
 					}
-					_ = json.NewEncoder(w).Encode(blockstoragesdk.VolumeDetailSchema{Id: id, ProjectId: placementGroupProjectID})
+					_ = json.NewEncoder(w).Encode(blockstoragesdk.VolumeSchema{Id: id, ProjectId: placementGroupProjectID})
 					return
 				}
 				name := strings.TrimSpace(tt.volume.ValueString())
@@ -776,7 +920,7 @@ func TestCustomImageValidateConfig(t *testing.T) {
 			m.Volume = customImageVolume(types.StringUnknown(), types.StringNull())
 		}},
 		{name: "ID reference", modify: func(m *CustomImageResourceModel) {
-			m.Volume = customImageVolumeID(customImageFixture().Volume.Id.String())
+			m.Volume = customImageVolumeID(customImageFixture().Volume.MustGet().Id.String())
 		}},
 		{name: "unknown ID reference", modify: func(m *CustomImageResourceModel) {
 			m.Volume = customImageVolume(types.StringNull(), types.StringUnknown())
@@ -788,13 +932,13 @@ func TestCustomImageValidateConfig(t *testing.T) {
 			m.Volume = customImageVolume(types.StringNull(), types.StringNull())
 		}, wantError: true},
 		{name: "both references", modify: func(m *CustomImageResourceModel) {
-			m.Volume = customImageVolume(types.StringValue("boot-source"), types.StringValue(customImageFixture().Volume.Id.String()))
+			m.Volume = customImageVolume(types.StringValue("boot-source"), types.StringValue(customImageFixture().Volume.MustGet().Id.String()))
 		}, wantError: true},
 		{name: "unknown and known references", modify: func(m *CustomImageResourceModel) {
 			m.Volume = customImageVolume(types.StringValue("boot-source"), types.StringUnknown())
 		}},
 		{name: "unknown name and known ID", modify: func(m *CustomImageResourceModel) {
-			m.Volume = customImageVolume(types.StringUnknown(), types.StringValue(customImageFixture().Volume.Id.String()))
+			m.Volume = customImageVolume(types.StringUnknown(), types.StringValue(customImageFixture().Volume.MustGet().Id.String()))
 		}},
 		{name: "both unknown references", modify: func(m *CustomImageResourceModel) {
 			m.Volume = customImageVolume(types.StringUnknown(), types.StringUnknown())
@@ -848,7 +992,7 @@ func TestCustomImageRefreshAndDelete(t *testing.T) {
 	if diags := response.State.Get(context.Background(), &got); diags.HasError() {
 		t.Fatal(diags)
 	}
-	if got.Description.ValueString() != "external change" || !got.Volume.Equal(customImageVolume(types.StringValue("boot-source"), types.StringValue(customImageFixture().Volume.Id.String()))) {
+	if got.Description.ValueString() != "external change" || !got.Volume.Equal(customImageVolume(types.StringValue("boot-source"), types.StringValue(customImageFixture().Volume.MustGet().Id.String()))) {
 		t.Fatal(got)
 	}
 	del := resource.DeleteResponse{}

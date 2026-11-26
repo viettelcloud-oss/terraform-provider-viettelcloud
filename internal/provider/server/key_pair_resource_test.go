@@ -889,6 +889,86 @@ func TestKeyPairResourceUpdate_Success(t *testing.T) {
 	}
 }
 
+func TestKeyPairResourceUpdate_PublicKeyWhitespaceKeepsConfiguredValue(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	httpClient := &http.Client{
+		Transport: keyPairRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPatch || req.URL.Path != "/v2/server/key-pairs/"+keyPairTestUUID.String()+"/" {
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read update body: %v", err)
+			}
+			if strings.Contains(string(raw), "public_key") {
+				t.Fatalf("update body must not contain public_key: %s", raw)
+			}
+			return jsonResponse(http.StatusOK, serversdk.KeyPairSchema{
+				Id:          keyPairTestUUID,
+				Name:        "my-key",
+				PublicKey:   "ssh-rsa AAA... user",
+				Fingerprint: "11:22:33",
+				Type:        serversdk.KeyPairTypeRsa,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			})
+		}),
+	}
+
+	client, err := serversdk.NewClient("https://server.test", serversdk.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	r := &KeyPairResource{client: client, projectID: keyPairTestUUID}
+
+	var schemaResp resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &schemaResp)
+
+	priorState := KeyPairResourceModel{
+		KeyPairModel: KeyPairModel{
+			ID:          types.StringValue(keyPairTestUUID.String()),
+			Name:        types.StringValue("my-key"),
+			PublicKey:   types.StringValue("ssh-rsa AAA... user"),
+			Fingerprint: types.StringValue("11:22:33"),
+			Type:        types.StringValue("rsa"),
+			CreatedAt:   types.StringValue(now.Format(time.RFC3339)),
+			UpdatedAt:   types.StringValue(now.Format(time.RFC3339)),
+		},
+		PrivateKey: types.StringNull(),
+	}
+	state := tfsdk.State{Schema: schemaResp.Schema}
+	if diags := state.Set(context.Background(), &priorState); diags.HasError() {
+		t.Fatalf("set state: %v", diags)
+	}
+
+	planModel := priorState
+	planModel.PublicKey = types.StringValue("ssh-rsa AAA... user\n")
+	planModel.UpdatedAt = types.StringUnknown()
+	plan := tfsdk.Plan{Schema: schemaResp.Schema}
+	if diags := plan.Set(context.Background(), &planModel); diags.HasError() {
+		t.Fatalf("set plan: %v", diags)
+	}
+
+	updateResp := resource.UpdateResponse{State: tfsdk.State{Schema: schemaResp.Schema}}
+	r.Update(context.Background(), resource.UpdateRequest{Plan: plan, State: state}, &updateResp)
+	if updateResp.Diagnostics.HasError() {
+		t.Fatalf("unexpected update error: %v", updateResp.Diagnostics)
+	}
+
+	var newState KeyPairResourceModel
+	if diags := updateResp.State.Get(context.Background(), &newState); diags.HasError() {
+		t.Fatalf("get state: %v", diags)
+	}
+	if got := newState.PublicKey.ValueString(); got != "ssh-rsa AAA... user\n" {
+		t.Errorf("expected state to keep the configured public_key, got %q", got)
+	}
+	if got := newState.ID.ValueString(); got != keyPairTestUUID.String() {
+		t.Errorf("expected id to stay %s, got %s", keyPairTestUUID, got)
+	}
+}
+
 func TestKeyPairResourceDelete_Success(t *testing.T) {
 	t.Parallel()
 
@@ -1140,6 +1220,84 @@ func TestKeyPairPlanModifiers(t *testing.T) {
 			t.Fatal("expected changed public_key to require replacement")
 		}
 	})
+
+	for _, tc := range []struct {
+		name        string
+		stateValue  string
+		configValue types.String
+		wantReplace bool
+	}{
+		{
+			name:        "public_key gaining a trailing newline updates in place",
+			stateValue:  "ssh-rsa AAA... user",
+			configValue: types.StringValue("ssh-rsa AAA... user\n"),
+		},
+		{
+			name:        "public_key losing outer whitespace updates in place",
+			stateValue:  "  ssh-rsa AAA... user\r\n",
+			configValue: types.StringValue("ssh-rsa AAA... user"),
+		},
+		{
+			name:        "public_key changing key material with a newline requires replace",
+			stateValue:  "ssh-rsa AAA... user",
+			configValue: types.StringValue("ssh-rsa BBB... user\n"),
+			wantReplace: true,
+		},
+		{
+			name:        "public_key changing inner whitespace requires replace",
+			stateValue:  "ssh-rsa AAA... user",
+			configValue: types.StringValue("ssh-rsa  AAA... user"),
+			wantReplace: true,
+		},
+		{
+			name:        "public_key unknown in configuration requires replace",
+			stateValue:  "ssh-rsa AAA... user",
+			configValue: types.StringUnknown(),
+			wantReplace: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stateModel := KeyPairResourceModel{
+				KeyPairModel: KeyPairModel{
+					ID:        types.StringValue(keyPairTestUUID.String()),
+					Name:      types.StringValue("my-key"),
+					PublicKey: types.StringValue(tc.stateValue),
+				},
+			}
+			planModel := stateModel
+			planModel.PublicKey = tc.configValue
+
+			state := tfsdk.State{Schema: schemaResp.Schema}
+			plan := tfsdk.Plan{Schema: schemaResp.Schema}
+			if diags := state.Set(context.Background(), &stateModel); diags.HasError() {
+				t.Fatalf("set state: %v", diags)
+			}
+			if diags := plan.Set(context.Background(), &planModel); diags.HasError() {
+				t.Fatalf("set plan: %v", diags)
+			}
+
+			req := planmodifier.StringRequest{
+				ConfigValue: tc.configValue,
+				State:       state,
+				Plan:        plan,
+				StateValue:  types.StringValue(tc.stateValue),
+				PlanValue:   tc.configValue,
+			}
+			resp := planmodifier.StringResponse{PlanValue: req.PlanValue}
+			for _, modifier := range pubKeyAttr.PlanModifiers {
+				modifier.PlanModifyString(context.Background(), req, &resp)
+				req.PlanValue = resp.PlanValue
+			}
+			if resp.RequiresReplace != tc.wantReplace {
+				t.Fatalf("RequiresReplace = %v, want %v", resp.RequiresReplace, tc.wantReplace)
+			}
+			if !resp.PlanValue.Equal(tc.configValue) {
+				t.Fatalf("expected plan value to stay the configured value %v, got %v", tc.configValue, resp.PlanValue)
+			}
+		})
+	}
 
 	t.Run("private_key retains state value when plan is unknown", func(t *testing.T) {
 		t.Parallel()

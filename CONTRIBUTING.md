@@ -21,11 +21,13 @@
 **Design rules** (normative)
 
 - [Provider Design Decisions](#provider-design-decisions) — attribute
-  configurability, plan modifiers
+  configurability, plan modifiers, write-only attributes
 - [References and Lookups](#references-and-lookups) — reference objects,
   human-readable references, the finder pattern, data-source filtering
 - [Request and Lifecycle Semantics](#request-and-lifecycle-semantics) —
-  create/update bodies, [lifecycle waiters](#lifecycle-waiters)
+  create/update bodies, [user-supplied strings](#user-supplied-strings),
+  [lifecycle waiters](#lifecycle-waiters),
+  [busy resources](#busy-resources)
 - [Resource Implementation Practices](#resource-implementation-practices)
 
 **Recipes**
@@ -74,8 +76,10 @@ internal/
 ├── compare/                       # Semantic equality
 ├── parse/                         # Value conversion
 ├── wait/                          # Asynchronous polling
+├── keylock/                       # In-process locks per claimed object
 ├── finder/                        # Shared finder mechanics
 ├── reference/                     # Reference object schemas and values
+├── replace/                       # Replacement that ignores a change of spelling
 ├── selector/                      # Catalog selector logic
 └── provider/
     ├── provider.go                # Configuration and registration
@@ -195,7 +199,7 @@ non-standard file includes an ownership comment.
 
 Before implementing Framework-dependent logic in a resource or data source,
 check the Framework API and the helper packages under `internal/`
-(`compare`, `parse`, `reference`, `wait`) for an existing solution. This
+(`compare`, `parse`, `reference`, `replace`, `wait`) for an existing solution. This
 is especially important for:
 
 - checking Framework value states such as `null` and `unknown`;
@@ -208,8 +212,8 @@ when the Framework has no equivalent and the same
 service-independent behavior is needed by at least two provider entities.
 Organize helpers by purpose, one package each, and open every package with a doc
 comment saying what it owns: `compare` for normalized comparison, `parse` for
-parsing and conversion, `reference` for reference objects, `wait` for
-lifecycle polling.
+parsing and conversion, `reference` for reference objects, `replace` for
+replacement plan modifiers that ignore spelling, `wait` for lifecycle polling.
 Keep CRUD orchestration, API calls, service-specific request construction, and
 resource state mapping in their owning provider packages.
 
@@ -227,6 +231,11 @@ SDK release tags use the format `go/vX.Y.Z` because the module lives in the
 SDK repository's `go/` subdirectory. The tag `go/v0.1.0` is the module version
 `v0.1.0`. Always require a release tag. A pseudo-version (`v0.0.0-<time>-<sha>`)
 names a commit that the public mirror does not have.
+
+Go downloads the SDK from a Go module proxy, and `go.sum` holds the checksums
+that `sum.golang.org` records for the public module. Release the SDK version
+on GitHub before you require it. Do not set `GOPRIVATE`, `GONOSUMDB`, or
+`GONOPROXY` for the SDK module.
 
 Provider code imports the service packages, for example
 `github.com/viettelcloud-oss/sdks/go/network`, and
@@ -380,6 +389,10 @@ resource and its data source share one type name.
 | Server | Core | `internal/provider/server` | `viettelcloud_placement_group` |
 | Block Storage | Core | `internal/provider/blockstorage` | `viettelcloud_volume_snapshot` |
 | Load Balancing | `lb` | `internal/provider/loadbalancer` | `viettelcloud_lb_server_group` |
+| Project | `project` | `internal/provider/project` | `viettelcloud_project_member_roles` |
+| Database | `db` | `internal/provider/dbaas` | `viettelcloud_db_backup` |
+| File Storage | `fs` | `internal/provider/filestorage` | `viettelcloud_fs_filesystem_snapshot` |
+| Database Cluster | `dbc` | `internal/provider/dbaascluster` | `viettelcloud_dbc_cluster` |
 
 Add a row in the same change that adds a service's first resource. Choose the
 prefix once: renaming a type is a breaking change for every user's state.
@@ -453,6 +466,13 @@ Define whether removing configuration preserves, defaults, or clears the field,
 and test that lifecycle explicitly. For data sources, make lookup arguments
 `Required` or `Optional` and API-only results `Computed` by default.
 
+Reject a configured value that the API accepts but ignores, such as a field
+of a union variant that the configuration does not select. Use a validator or
+`ValidateConfig`, so that `terraform plan` reports the conflict. Never drop
+the value from the request silently. Terraform requires state to match the
+configuration after apply, and the response cannot return a value that the
+backend did not store. Cover each rejected combination with a unit test.
+
 Make every descendant of an `Optional` and `Computed` nested attribute
 `Computed` too when omission preserves its prior value. Otherwise, Terraform
 can propose null for the omitted attribute and leave runtime outputs unknown
@@ -472,6 +492,7 @@ lifecycle contract. Use the typed package matching the attribute.
 | `RequiresReplace()` | `state A -> plan B/null/unknown`: replace | Every change to an immutable attribute creates a new object, including VPC `cidr`, subnet `vpc`, or private IP `subnet`. |
 | `RequiresReplaceIfConfigured()` | `configured A -> configured B`: replace; `configured A -> omitted/null`: no replacement | An immutable `Optional` and `Computed` value is allocated or preserved when omitted, such as private IP `ip_address` and `mac_address`. |
 | `RequiresReplaceIf(...)` | `state A -> plan B` and predicate `true`: replace; predicate `false`: update in place | Replacement depends on provider-defined, deterministic conditions. |
+| `replace.String`, `replace.Reference` and their `IfConfigured` forms | Like `RequiresReplace` or `RequiresReplaceIfConfigured`, but `state A -> plan A'` updates in place when `A'` is another spelling of `A` | An immutable value that the provider accepts in more than one spelling and keeps as configured in state, such as a region name with outer whitespace or an upper-case UUID. |
 | `UseStateForUnknown()` | `state A + plan unknown -> plan A` | A computed value is guaranteed not to change during the operation, such as `id` or `created_at`. Do not use it for values that can change or must be recomputed during replacement. |
 
 Test `A -> B`, `A -> omitted/null`, and `state A -> plan unknown`. Treat an
@@ -484,6 +505,35 @@ Declare built-in modifiers inline in `Schema()`. Keep a custom modifier with
 the domain logic it protects, including its identity comparison. If that needs
 a separate file, follow [Non-standard files](#non-standard-files). Custom
 modifiers are not part of the Framework entry-point order.
+
+### Write-only Attributes
+
+Make a secret write-only when the API accepts it but never returns it, such
+as the `root_password` of `viettelcloud_db_instance`. Terraform then keeps the
+value out of the plan and the state. When `Read` returns the secret, use
+`Optional` and `Sensitive` instead, so that refresh can detect drift.
+Write-only attributes need Terraform 1.11 or later, which the 1.16 minimum of
+this repository covers. The generated docs add a note about this.
+
+- Set `WriteOnly` and `Sensitive`, and exactly one of `Required` or
+  `Optional`. The Framework rejects `WriteOnly` with `Computed`, and inside a
+  set nested attribute or block.
+- Add no default and no plan modifier. The planned value is always null.
+- Read the value from `req.Config`, not from `req.Plan`. In `Create`, return
+  an attribute error when a required value is null or unknown.
+- Keep the model field null in every state that the resource writes,
+  including `Read` and import.
+- A change of the value plans no update. Say in the `Description` when the API
+  uses the value, and what a change does, such as "sent only at creation;
+  changing it later has no effect".
+- When the API has an endpoint that changes the secret, add an `Optional`
+  integer `<name>_version` attribute, such as `root_password_version`. A
+  change of the version plans an in-place update, and `Update` reads the
+  secret from `req.Config` and calls that endpoint. Do not add the version
+  attribute before the endpoint exists.
+- Test the schema flags, and test that `Create` sends the configured value
+  and stores null in state. See `TestInstanceResourceSchema` and
+  `TestInstanceCreateWaitsForActiveWithoutPatch`.
 
 ## References and Lookups
 
@@ -568,6 +618,15 @@ explicitly or use a composite reference rather than guessing.
 Preserve the configured representation in state when it is semantically equal
 to a backend-normalized value. Do not suppress a difference that identifies a
 different object or hides real drift.
+
+When the preserved attribute is immutable, use the `replace` modifier with
+the comparison that state preservation uses, for example
+`replace.Reference(reference.Name, compare.SameTrimmedString)`. A plain
+`RequiresReplace` compares raw values, so a change of spelling alone would
+destroy and create the same object. A comparison that is broader than state
+preservation breaks the other way: Terraform plans an update, and the update
+then reports an inconsistent result. A `ModifyPlan` that compares immutable
+values to detect a replacement must use the same comparison.
 
 ### Catalog Selectors
 
@@ -755,6 +814,40 @@ from clearing, document the supported behavior instead of simulating it.
   only when backend evidence shows that endpoint actually violates this
   contract.
 
+### User-Supplied Strings
+
+The API removes leading and trailing whitespace from almost every request
+string. The provider trims every user-supplied string at the client in the
+same way, so that the request, the lookup, and the state agree. A
+user-supplied string is a `Required` or `Optional` string attribute. This
+includes a nested attribute and a reference criterion, such as `role.urn`.
+
+1. Send `strings.TrimSpace(value)` in every create, update, and action
+   request body, and in every lookup filter.
+2. Compare trimmed values when the provider decides something from the
+   value. Examples are a duplicate check across set elements, a uniqueness
+   check, a change check in `ModifyPlan` or `Update`, and a replacement. Use
+   the `replace` modifiers instead of `RequiresReplace` for an immutable
+   user-supplied string.
+3. After create, update, and read, keep the configured value in state when it
+   differs from the backend value only by outer whitespace. Use
+   `compare.PreservedString` or `compare.SameTrimmed`. In all other cases,
+   store the backend value, so that real drift still shows.
+4. Reject a value that is blank after the trim when the API requires a
+   non-empty value. Do not reject outer whitespace itself.
+5. Do not trim a value whose whitespace is part of its content, such as a
+   password, `user_data`, or a JSON document. Write the reason in a code
+   comment next to the request builder.
+
+The rule covers enum values, UUIDs, CIDRs, and IP addresses too. Trim the
+value before an enum check such as `Valid()`, and parse a UUID with
+`parse.UUID` or `parse.UUIDString`, which trim. `compare.SameUUID` ignores
+outer whitespace.
+
+Add a unit test with a padded value, such as `" name "`. The test must make
+sure that the request carries the trimmed value and that state after create
+and after the next read keeps `" name "`.
+
 ### Lifecycle Waiters
 
 Add a waiter when Terraform must not return until the backend finishes an
@@ -807,10 +900,137 @@ func (r *<Resource>Resource) waitUntilReady(
   tests can assert elapsed waits against the same constants.
 - Distinguish the two failure modes in callers with `errors.Is(err,
   wait.ErrTimeout)`. A cancelled operation wraps `context.Canceled` instead.
+  A deadline on `ctx`, such as one from `timeouts`, also ends the wait with
+  `wait.ErrTimeout`. When the deadline has a cause that wraps
+  `wait.ErrTimeout`, the error shows that cause.
 - A delete waiter depends on the backend reporting a removed object as HTTP
   404. Confirm that against the API before relying on it; the network OpenAPI
   documents no 404 response for any endpoint.
 - Do not add backoff, retry, or transport concerns. The SDK owns HTTP retry.
+  The one exception is the bounded replay that
+  [Busy Resources](#busy-resources) allows. Build it with
+  `wait.NewBackoffWithJitter`.
+
+#### Configurable timeouts
+
+Add a `timeouts` attribute only when the duration of a wait depends on the
+data or the configuration of the practitioner. Examples are the size of a
+volume and the restore of a backup. For every other wait, keep the package
+constant.
+
+1. Build the attribute with `timeouts.Attributes` from
+   `github.com/hashicorp/terraform-plugin-framework-timeouts`. Add a key only
+   for an operation whose duration depends on the data. Write the default and
+   an example value in the description of each key.
+2. Read the value with `plan.Timeouts.Create(ctx, <constant>)` or
+   `plan.Timeouts.Update(ctx, <constant>)`. The package constant is the default,
+   so a configuration without `timeouts` behaves as before.
+3. Make the value the deadline of the whole operation with
+   `context.WithTimeoutCause`. The cause wraps `wait.ErrTimeout` and names the
+   value, such as `fmt.Errorf("%w after %s", wait.ErrTimeout, timeout)`. Then
+   a timeout error shows the configured value, not the time that was left for
+   one wait. Pass the same value to each waiter, so that the deadline of `ctx`
+   ends each wait. Keep a shorter bounded step, such as a busy replay, on its
+   own constant.
+4. When the deadline ends the operation, name the key and its value in the
+   diagnostic.
+5. When the API accepted a request before the deadline ended the wait, keep
+   the result of the request in state. Create already saves the ID before the
+   wait. For an action in Update, record the new value and return an error, so
+   that the next apply does not send the request again.
+6. A change of `timeouts` alone sends no write request.
+
+Test the default, a configured value, and the deadline in `testing/synctest`.
+Test that a change of `timeouts` alone sends no write request. Declare the
+attribute in the design doc of the entity. See `viettelcloud_volume_backup`.
+
+### Busy Resources
+
+Some backend objects accept one operation at a time. While an operation runs,
+the backend holds a claim on the object. A claim is the backend's lock for one
+operation. A busy refusal is the answer to a request that meets the claim of
+another operation: HTTP 409 with at least one `errors[].code` equal to
+`resource_busy`. With a busy refusal, the backend changes nothing. The
+SDK returns it as `ErrConflict` and does not retry HTTP 409. Thus the provider
+handles it with the three rules below.
+
+These rules cover busy refusals only. Any other provider-level retry is a
+departure under [Provider Design Decisions](#provider-design-decisions).
+
+#### Wait for the idle state
+
+The idle state of a resource is the state in its API response that shows that
+no operation holds the claim. Use the rules below before each request that the
+backend can refuse as busy:
+
+1. Wait with `wait.New[T]` until the object reaches its idle state.
+2. If the operation also claims a parent, wait for each parent up to the root,
+   for example the Load Balancer of a listener.
+3. If the wait reads a state in which the backend refuses the request, return
+   an error immediately. The API contract of each resource defines these
+   states for each operation. Do not assume that a state is safe for one
+   operation because it is safe for another operation or another resource.
+
+Name the idle state, the states that fail at once, and the objects that each
+operation claims in the comment on the waiter.
+
+#### Serialize operations on one claimed object
+
+Terraform runs independent resources in parallel. Two resources that claim the
+same object can then refuse each other during one apply. For example, a
+listener and a server group of one Load Balancer both claim that Load
+Balancer.
+
+Hold an in-process mutex during each such operation. Key the mutex by the ID of
+the root object that the operation claims. Hold it from the idle wait to the
+end of the ready wait that follows the request. If no ready wait follows,
+release the mutex when the request returns. One mutex then covers the claims
+on the root and on its children.
+
+Some operations claim more than one root, for example a server and an Elastic
+IP. Lock each root in ascending ID order, so that two such operations cannot
+deadlock. Put the mutex in one package under `internal/`, as
+[Reusable helpers](#reusable-helpers) describes.
+
+The mutex covers one provider process. It does not cover another Terraform run,
+another provider configuration, or another API client. A busy refusal after the
+idle wait therefore has one of two causes. One of these clients took the claim,
+or the backend does not show the claim in its response.
+
+#### Return a busy refusal
+
+Do not send the request again after a busy refusal. The object was idle a
+moment before, so the operation that took the claim has only started, and the
+object stays busy for most of its run.
+
+Match HTTP 409 and the `resource_busy` code only. Do not read the message.
+Return a diagnostic that names the busy object and includes the error.
+
+Unit tests cover the match and the diagnostic.
+
+#### When the API does not show the claim
+
+Some APIs keep the claim in a field that the response does not return. The idle
+wait then cannot see the claim, and the request often meets a claim that the
+provider cannot wait for. For example, the GET response of a server shows the
+claim of a delete, but not the claim of a resize or a volume attachment.
+
+Treat this gap as a backend contract defect. For each such resource:
+
+1. Open a backend issue that asks the API to show the claim.
+2. Add a bounded replay of busy refusals. Build it with
+   `wait.NewBackoffWithJitter`, and derive its delays and timeout from the
+   backend retry schedule of the claiming operation. Jitter is a random part
+   of each delay.
+3. Replay only HTTP 409 with the `resource_busy` code. Keep the idle wait and
+   the mutex.
+4. Name the delays, the timeout, the issue, and the removal condition in the
+   comment on the replay. Call out the departure in the merge request.
+5. After the backend shows the claim, remove the replay.
+
+In the replay, the poll function sends the request. It wraps a busy refusal in
+`wait.ErrNotReady` and returns every other error as is. Do not write a replay
+loop in a service package.
 
 ## Resource Implementation Practices
 
@@ -844,7 +1064,8 @@ func (r *<Resource>Resource) waitUntilReady(
   unknown values in state.
 - Honor `context.Context` in every SDK call and waiter. Add lifecycle waiters
   for asynchronous APIs as described in [Lifecycle Waiters](#lifecycle-waiters),
-  but do not duplicate SDK HTTP retry behavior.
+  but do not duplicate SDK HTTP retry behavior. Handle a busy refusal as
+  [Busy Resources](#busy-resources) describes.
 - Support import for every managed resource. Use a stable ID or a documented
   composite import key sufficient for `Read`.
 - Mark sensitive schema attributes appropriately. Remember that `Sensitive`
@@ -1177,6 +1398,14 @@ terraform -chdir=integration-tests test \
   -filter=tests/<entity>_<target>.tftest.hcl \
   -verbose
 ```
+
+To run only the runs that a change affects, run a copy of the test file from
+`tools/select-tftest-runs`. See
+[Run part of a test file](integration-tests/README.md#run-part-of-a-test-file).
+The copy keeps each named run and the runs that it needs. Those are the earlier
+runs with the same state and each run that a kept run references through
+`run.<name>`. `tools/select-tftest-runs` parses the file with
+`github.com/hashicorp/hcl/v2/hclsyntax`, and `make test` runs its tests.
 
 ## Code Style
 

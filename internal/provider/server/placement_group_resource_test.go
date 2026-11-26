@@ -104,6 +104,7 @@ func TestPlacementGroupReplacementAttributes(t *testing.T) {
 		replace bool
 	}{
 		{"same name", placementGroupRegion(types.StringValue("vn-central")), false},
+		{"padded name", placementGroupRegion(types.StringValue(" vn-central ")), false},
 		{"changed name", placementGroupRegion(types.StringValue("vn-north")), true},
 		{"unknown name", placementGroupRegion(types.StringUnknown()), true},
 		{"unknown reference", types.ObjectUnknown(reference.AttributeTypes(reference.Name)), true},
@@ -143,16 +144,18 @@ func TestPlacementGroupReplacementAttributes(t *testing.T) {
 		}, Region: placementGroupRegion(types.StringValue("vn-north"))}); diags.HasError() {
 			t.Fatalf("set modifier plan: %v", diags)
 		}
-		request := planmodifier.StringRequest{
-			State:      state,
-			Plan:       plan,
-			StateValue: types.StringValue("before"),
-			PlanValue:  types.StringValue("after"),
-		}
-		var response planmodifier.StringResponse
-		attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
-		if !response.RequiresReplace {
-			t.Errorf("expected changing %s to require replacement", name)
+		for planned, want := range map[string]bool{"anti-affinity": true, " affinity ": false} {
+			request := planmodifier.StringRequest{
+				State:      state,
+				Plan:       plan,
+				StateValue: types.StringValue("affinity"),
+				PlanValue:  types.StringValue(planned),
+			}
+			var response planmodifier.StringResponse
+			attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
+			if response.RequiresReplace != want {
+				t.Errorf("%s affinity -> %q: replace=%t, want %t", name, planned, response.RequiresReplace, want)
+			}
 		}
 	}
 }
@@ -163,7 +166,7 @@ func TestBuildPlacementGroupCreateBodyResolvesRegionName(t *testing.T) {
 	body, diags := buildPlacementGroupCreateBody(context.Background(), PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
 		Name:        types.StringValue("  cluster-a  "),
 		Description: types.StringValue("primary cluster"),
-		Policy:      types.StringValue("affinity"),
+		Policy:      types.StringValue(" affinity\n"),
 	}, Region: placementGroupRegion(types.StringValue("vn-central"))}, func(_ context.Context, filter projectlookup.RegionFilter) (projectsdk.ProjectRegionSchema, error) {
 		if filter.Name == nil || *filter.Name != "vn-central" {
 			t.Fatalf("unexpected region filter %#v", filter.Name)
@@ -192,6 +195,10 @@ func TestBuildPlacementGroupCreateBodyRejectsInvalidInputs(t *testing.T) {
 		{
 			name:  "null name",
 			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringValue("vn-central"))},
+		},
+		{
+			name:  "blank name",
+			model: PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("   "), Policy: types.StringValue("affinity")}, Region: placementGroupRegion(types.StringValue("vn-central"))},
 		},
 		{
 			name:  "unknown policy",
@@ -342,6 +349,41 @@ func TestBuildPlacementGroupUpdateBodyPreservesUntrimmedNameWhenSemanticallyEqua
 	}
 }
 
+func TestBuildPlacementGroupUpdateBodyComparesTrimmedDescription(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, state, plan string
+		want              *string
+	}{
+		{name: "padded equal value", state: "primary", plan: " primary "},
+		{name: "padded state", state: " primary ", plan: "primary"},
+		{name: "padded change", state: "primary", plan: " other ", want: new("other")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			state := PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
+				Name: types.StringValue("cluster-a"), Description: types.StringValue(tc.state),
+			}}
+			plan := state
+			plan.Description = types.StringValue(tc.plan)
+			body, changed, diags := buildPlacementGroupUpdateBody(plan, state)
+			if diags.HasError() {
+				t.Fatalf("unexpected diagnostics: %v", diags)
+			}
+			if tc.want == nil {
+				if changed || body.Description != nil {
+					t.Fatalf("expected no change, got changed=%v body=%#v", changed, body)
+				}
+				return
+			}
+			if !changed || body.Description == nil || *body.Description != *tc.want {
+				t.Fatalf("expected description %q, got changed=%v body=%#v", *tc.want, changed, body)
+			}
+		})
+	}
+}
+
 func TestBuildPlacementGroupUpdateBodyRejectsUnknownName(t *testing.T) {
 	t.Parallel()
 
@@ -352,6 +394,18 @@ func TestBuildPlacementGroupUpdateBodyRejectsUnknownName(t *testing.T) {
 	_, _, diags := buildPlacementGroupUpdateBody(plan, state)
 	if !diags.HasError() {
 		t.Fatal("expected diagnostic for unknown name in update plan")
+	}
+}
+
+func TestBuildPlacementGroupUpdateBodyRejectsBlankName(t *testing.T) {
+	t.Parallel()
+
+	state := PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{Name: types.StringValue("cluster-a")}}
+	plan := state
+	plan.Name = types.StringValue(" \t ")
+
+	if _, _, diags := buildPlacementGroupUpdateBody(plan, state); !diags.HasError() {
+		t.Fatal("expected diagnostic for a name that is blank after the trim")
 	}
 }
 
@@ -374,7 +428,7 @@ func TestPopulatePlacementGroupModelMapsAllFields(t *testing.T) {
 		Id:          placementGroupTestUUID,
 		Name:        "cluster-a",
 		Description: "primary cluster",
-		Policy:      &policy,
+		Policy:      core.NullableFromPtr(&policy),
 		Project: serversdk.NestedProjectSchema{
 			Id:   placementGroupProjectID,
 			Name: "integration",
@@ -413,7 +467,7 @@ func TestPopulatePlacementGroupResourceStatePreservesConfiguredNameAndRegion(t *
 	pg := &serversdk.PlacementGroupSchema{
 		Id:     placementGroupTestUUID,
 		Name:   "cluster-a",
-		Policy: &policy,
+		Policy: core.NullableFromPtr(&policy),
 		Region: serversdk.NestedRegionSchema{
 			Id:   placementGroupTestRegion,
 			Name: "vn-central",
@@ -436,7 +490,7 @@ func TestPopulatePlacementGroupResourceStateUsesChangedBackend(t *testing.T) {
 	pg := &serversdk.PlacementGroupSchema{
 		Id:     placementGroupTestUUID,
 		Name:   "new-backend-name",
-		Policy: &policy,
+		Policy: core.NullableFromPtr(&policy),
 		Region: serversdk.NestedRegionSchema{
 			Id:   core.UUID{0x99},
 			Name: "vn-north",
@@ -687,6 +741,129 @@ func TestPlacementGroupResourceLifecycleUsesPublicSDK(t *testing.T) {
 	}
 	if serverRequests != 4 {
 		t.Fatalf("expected four SDK requests, got %d", serverRequests)
+	}
+}
+
+// The API trims outer whitespace from description, so the provider sends the
+// trimmed value and keeps the configured spelling in state.
+func TestPlacementGroupResourceTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var sent []string
+	var sentPolicy serversdk.PlacementGroupPolicy
+	currentDesc := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.URL.Path == "/v2/projects/"+placementGroupProjectID.String()+"/regions/":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(projectsdk.PagedProjectRegionSchema{
+				Count: 1,
+				Results: []projectsdk.ProjectRegionSchema{{
+					Region: projectsdk.NestedRegionSchema{Id: placementGroupTestRegion, Name: "vn-central"},
+				}},
+			})
+		case req.URL.Path == "/v2/server/placement-groups/" && req.Method == http.MethodPost:
+			var body serversdk.PlacementGroupCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Description == nil {
+				t.Errorf("decode create body: %v %#v", err, body)
+				return
+			}
+			sent = append(sent, *body.Description)
+			sentPolicy = body.Policy
+			currentDesc = *body.Description
+			w.WriteHeader(http.StatusCreated)
+			writePlacementGroupResponse(t, w, mockPlacementGroup("cluster-a", currentDesc, serversdk.PlacementGroupPolicyAffinity))
+		case req.URL.Path == "/v2/server/placement-groups/"+placementGroupTestUUID.String()+"/":
+			if req.Method == http.MethodPatch {
+				var body serversdk.PlacementGroupPartialUpdateSchema
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Description == nil {
+					t.Errorf("decode update body: %v %#v", err, body)
+					return
+				}
+				sent = append(sent, *body.Description)
+				currentDesc = *body.Description
+			}
+			writePlacementGroupResponse(t, w, mockPlacementGroup("cluster-a", currentDesc, serversdk.PlacementGroupPolicyAffinity))
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	serverClient, err := serversdk.NewClient(server.URL, serversdk.WithHTTPClient(server.Client()), serversdk.WithRetry(core.NoRetry()))
+	if err != nil {
+		t.Fatalf("create server client: %v", err)
+	}
+	projectClient, err := projectsdk.NewClient(server.URL, projectsdk.WithHTTPClient(server.Client()), projectsdk.WithRetry(core.NoRetry()))
+	if err != nil {
+		t.Fatalf("create project client: %v", err)
+	}
+	r := &PlacementGroupResource{client: serverClient, project: projectClient, projectID: placementGroupProjectID}
+	schema := placementGroupSchema(t)
+	description := func(state tfsdk.State) string {
+		t.Helper()
+		var model PlacementGroupResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		if model.Policy.ValueString() != " affinity " {
+			t.Fatalf("state has policy %q, want the configured spelling", model.Policy.ValueString())
+		}
+		return model.Description.ValueString()
+	}
+
+	createPlan := tfsdk.Plan{Schema: schema}
+	if diags := createPlan.Set(ctx, &PlacementGroupResourceModel{PlacementGroupModel: PlacementGroupModel{
+		Name:        types.StringValue("cluster-a"),
+		Description: types.StringValue(" before "),
+		Policy:      types.StringValue(" affinity "),
+		RegionID:    types.StringUnknown(),
+		ID:          types.StringUnknown(),
+		Project:     types.StringUnknown(),
+		ServerCount: types.Int64Unknown(),
+		CreatedAt:   types.StringUnknown(),
+		UpdatedAt:   types.StringUnknown(),
+	}, Region: placementGroupRegion(types.StringValue("vn-central"))}); diags.HasError() {
+		t.Fatalf("set create plan: %v", diags)
+	}
+	create := resource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: createPlan}, &create)
+	if create.Diagnostics.HasError() {
+		t.Fatalf("create diagnostics: %v", create.Diagnostics)
+	}
+	if got := description(create.State); got != " before " {
+		t.Fatalf("state after create has description %q, want the configured spelling", got)
+	}
+
+	read := resource.ReadResponse{State: create.State}
+	r.Read(ctx, resource.ReadRequest{State: create.State}, &read)
+	if read.Diagnostics.HasError() {
+		t.Fatalf("read diagnostics: %v", read.Diagnostics)
+	}
+	if got := description(read.State); got != " before " {
+		t.Fatalf("state after read has description %q, want the configured spelling", got)
+	}
+
+	var planModel PlacementGroupResourceModel
+	if diags := read.State.Get(ctx, &planModel); diags.HasError() {
+		t.Fatalf("get state before update: %v", diags)
+	}
+	planModel.Description = types.StringValue(" after ")
+	updatePlan := tfsdk.Plan{Schema: schema}
+	if diags := updatePlan.Set(ctx, &planModel); diags.HasError() {
+		t.Fatalf("set update plan: %v", diags)
+	}
+	update := resource.UpdateResponse{State: tfsdk.State{Schema: schema}}
+	r.Update(ctx, resource.UpdateRequest{Plan: updatePlan, State: read.State}, &update)
+	if update.Diagnostics.HasError() {
+		t.Fatalf("update diagnostics: %v", update.Diagnostics)
+	}
+	if got := description(update.State); got != " after " {
+		t.Fatalf("state after update has description %q, want the configured spelling", got)
+	}
+	if strings.Join(sent, "|") != "before|after" || sentPolicy != serversdk.PlacementGroupPolicyAffinity {
+		t.Fatalf("requests carried descriptions %q and policy %q, want them trimmed", sent, sentPolicy)
 	}
 }
 
@@ -977,7 +1154,7 @@ func mockPlacementGroup(name, description string, policy serversdk.PlacementGrou
 		Id:          placementGroupTestUUID,
 		Name:        name,
 		Description: description,
-		Policy:      &value,
+		Policy:      core.NullableFromPtr(&value),
 		Region: serversdk.NestedRegionSchema{
 			Id:   placementGroupTestRegion,
 			Name: "vn-central",

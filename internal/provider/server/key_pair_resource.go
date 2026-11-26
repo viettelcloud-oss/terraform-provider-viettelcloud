@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -56,10 +58,10 @@ func (r *KeyPairResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"public_key": schema.StringAttribute{
 				Optional:    true,
 				Computed:    true,
-				Description: "Public key material to upload. On create, omit it to generate a new key pair. Changing a configured value replaces the key pair; removing it from configuration preserves the existing public key.",
+				Description: "Public key material to upload. On create, omit it to generate a new key pair. Changing a configured value replaces the key pair, but adding or removing leading or trailing whitespace does not; removing it from configuration preserves the existing public key.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+					replace.StringIfConfigured(compare.SameTrimmedString),
 				},
 			},
 			"private_key": schema.StringAttribute{

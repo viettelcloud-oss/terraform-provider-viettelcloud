@@ -19,6 +19,7 @@ func TestSameUUID(t *testing.T) {
 	}{
 		"same canonical UUID": {value: types.StringValue(want.String()), want: true},
 		"same uppercase UUID": {value: types.StringValue(strings.ToUpper(want.String())), want: true},
+		"padded UUID":         {value: types.StringValue("  " + want.String() + "\n"), want: true},
 		"different UUID":      {value: types.StringValue("00000000-0000-0000-0000-000000000001")},
 		"invalid UUID":        {value: types.StringValue("not-a-uuid")},
 		"null":                {value: types.StringNull()},
@@ -30,6 +31,31 @@ func TestSameUUID(t *testing.T) {
 			t.Parallel()
 			if got := SameUUID(tt.value, want); got != tt.want {
 				t.Fatalf("SameUUID() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPreservedUUID(t *testing.T) {
+	t.Parallel()
+
+	id := mustParseUUID(t, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	upper := types.StringValue(strings.ToUpper(id.String()))
+	tests := map[string]struct {
+		configured types.String
+		want       types.String
+	}{
+		"same UUID keeps configured spelling": {configured: upper, want: upper},
+		"different UUID takes backend value":  {configured: types.StringValue("00000000-0000-0000-0000-000000000001"), want: types.StringValue(id.String())},
+		"null takes backend value":            {configured: types.StringNull(), want: types.StringValue(id.String())},
+		"unknown takes backend value":         {configured: types.StringUnknown(), want: types.StringValue(id.String())},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := PreservedUUID(tt.configured, id); !got.Equal(tt.want) {
+				t.Fatalf("PreservedUUID() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -194,4 +220,62 @@ func mustParseUUID(t *testing.T, value string) core.UUID {
 		t.Fatalf("parse test UUID %q: %v", value, err)
 	}
 	return id
+}
+
+func TestPreservedString(t *testing.T) {
+	t.Parallel()
+
+	const backend = "urn:role:agent_builder:viewer"
+	padded := types.StringValue(" " + backend + "\n")
+	tests := map[string]struct {
+		configured types.String
+		want       types.String
+	}{
+		"outer whitespace keeps configured spelling": {configured: padded, want: padded},
+		"same value keeps configured value":          {configured: types.StringValue(backend), want: types.StringValue(backend)},
+		"inner whitespace takes backend value":       {configured: types.StringValue("urn:role: agent_builder:viewer"), want: types.StringValue(backend)},
+		"case change takes backend value":            {configured: types.StringValue(strings.ToUpper(backend)), want: types.StringValue(backend)},
+		"null takes backend value":                   {configured: types.StringNull(), want: types.StringValue(backend)},
+		"unknown takes backend value":                {configured: types.StringUnknown(), want: types.StringValue(backend)},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := PreservedString(tt.configured, backend); !got.Equal(tt.want) {
+				t.Fatalf("PreservedString() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSameStringPairs(t *testing.T) {
+	t.Parallel()
+
+	const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	tests := map[string]struct {
+		same func(v, w types.String) bool
+		v, w types.String
+		want bool
+	}{
+		"trimmed equal":        {same: SameTrimmedString, v: types.StringValue(" hn "), w: types.StringValue("hn"), want: true},
+		"trimmed differ":       {same: SameTrimmedString, v: types.StringValue("hn"), w: types.StringValue("hcm")},
+		"trimmed state null":   {same: SameTrimmedString, v: types.StringValue("hn"), w: types.StringNull()},
+		"trimmed plan unknown": {same: SameTrimmedString, v: types.StringUnknown(), w: types.StringValue("hn")},
+		"uuid padded upper":    {same: SameUUIDString, v: types.StringValue(" " + strings.ToUpper(id)), w: types.StringValue(id), want: true},
+		"uuid differ":          {same: SameUUIDString, v: types.StringValue(id), w: types.StringValue("00000000-0000-0000-0000-000000000001")},
+		"uuid state invalid":   {same: SameUUIDString, v: types.StringValue(id), w: types.StringValue("x")},
+		"ip padded":            {same: SameIPAddressString, v: types.StringValue(" 10.0.0.1 "), w: types.StringValue("10.0.0.1"), want: true},
+		"ip state null":        {same: SameIPAddressString, v: types.StringValue("10.0.0.1"), w: types.StringNull()},
+		"mac separators":       {same: SameMACAddressString, v: types.StringValue("AA-BB-CC-DD-EE-FF"), w: types.StringValue("aa:bb:cc:dd:ee:ff"), want: true},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.same(tt.v, tt.w); got != tt.want {
+				t.Fatalf("got %t, want %t", got, tt.want)
+			}
+		})
+	}
 }

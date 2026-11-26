@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -221,10 +222,8 @@ func preserveConfiguredSecurityGroupDataSourceValues(sg *networksdk.SecurityGrou
 	if sg == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == sg.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, sg.Id) {
+		state.ID = config.ID
 	}
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == sg.Name {
 		state.Name = config.Name

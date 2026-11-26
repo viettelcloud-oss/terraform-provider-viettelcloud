@@ -117,9 +117,10 @@ func TestVPCDataSourceReadDirectID(t *testing.T) {
 
 	schema := vpcDataSourceSchema(t)
 	configState := tfsdk.State{Schema: schema}
+	configuredID := "  " + vpcID.String() + "  "
 	diags := configState.Set(context.Background(), &VPCDataSourceModel{
 		VPCModel: VPCModel{
-			ID: types.StringValue(vpcID.String()),
+			ID: types.StringValue(configuredID),
 		},
 	})
 	if diags.HasError() {
@@ -143,7 +144,7 @@ func TestVPCDataSourceReadDirectID(t *testing.T) {
 	if diags := resp.State.Get(context.Background(), &state); diags.HasError() {
 		t.Fatalf("failed to get state: %v", diags)
 	}
-	if state.ID.ValueString() != vpcID.String() || state.Name.ValueString() != "direct-vpc" || state.Region.ValueString() != "vn-central" {
+	if state.ID.ValueString() != configuredID || state.Name.ValueString() != "direct-vpc" || state.Region.ValueString() != "vn-central" {
 		t.Fatalf("unexpected state: %#v", state)
 	}
 }

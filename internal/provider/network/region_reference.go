@@ -12,13 +12,13 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/viettelcloud-oss/sdks/go/core"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
 // resolveRegionReference resolves the region reference to a region ID. It
-// passes the configured name unmodified, so the region finder alone decides
-// how to match it.
+// passes the trimmed name to the region finder.
 func resolveRegionReference(
 	ctx context.Context,
 	region types.Object,
@@ -31,7 +31,7 @@ func resolveRegionReference(
 		return core.UUID{}, diags
 	}
 
-	value := name.ValueString()
+	value := strings.TrimSpace(name.ValueString())
 	resolved, err := resolveRegion(ctx, projectlookup.RegionFilter{Name: &value})
 	if err != nil {
 		diags.AddError("Unable to resolve region", "region.name: "+err.Error())
@@ -44,8 +44,7 @@ func resolveRegionReference(
 // configured reference when its name differs from the backend name only by
 // outer whitespace, otherwise Terraform reports an inconsistent result.
 func regionReferenceState(configured types.Object, backendName string) types.Object {
-	name := reference.Get(configured, reference.Name)
-	if !name.IsNull() && !name.IsUnknown() && strings.TrimSpace(name.ValueString()) == backendName {
+	if compare.SameTrimmed(reference.Get(configured, reference.Name), backendName) {
 		return configured
 	}
 	return reference.Value(reference.Name, types.StringValue(backendName))

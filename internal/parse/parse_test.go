@@ -49,6 +49,10 @@ func TestUUIDString(t *testing.T) {
 			wantSummary:    "Invalid UUID",
 			wantDetailPart: "project_id must be a valid UUID:",
 		},
+		"padded": {
+			value: types.StringValue("\t" + testUUID + "  "),
+			want:  testUUID,
+		},
 	}
 
 	for name, tt := range tests {
@@ -102,6 +106,10 @@ func TestOptionalUUIDString(t *testing.T) {
 			value:          types.StringValue(" "),
 			wantSummary:    "Invalid UUID",
 			wantDetailPart: "vpc_id must be a valid UUID:",
+		},
+		"padded": {
+			value: types.StringValue("  " + testUUID + "\n"),
+			want:  testUUID,
 		},
 	}
 

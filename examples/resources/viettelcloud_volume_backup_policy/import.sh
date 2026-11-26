@@ -1,0 +1,1 @@
+terraform import viettelcloud_volume_backup_policy.periodic 00000000-0000-0000-0000-000000000001

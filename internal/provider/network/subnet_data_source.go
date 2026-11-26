@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -231,10 +232,8 @@ func preserveConfiguredSubnetValues(subnet *networksdk.SubnetSchema, config Subn
 	if subnet == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == subnet.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, subnet.Id) {
+		state.ID = config.ID
 	}
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == subnet.Name {
 		state.Name = config.Name
@@ -242,10 +241,8 @@ func preserveConfiguredSubnetValues(subnet *networksdk.SubnetSchema, config Subn
 	if !config.CIDR.IsNull() && !config.CIDR.IsUnknown() && strings.TrimSpace(config.CIDR.ValueString()) == subnet.Cidr {
 		state.CIDR = config.CIDR
 	}
-	if !config.VPCID.IsNull() && !config.VPCID.IsUnknown() {
-		if parsedVPCID, err := core.ParseUUID(config.VPCID.ValueString()); err == nil && parsedVPCID == subnet.Vpc.Id {
-			state.VPCID = config.VPCID
-		}
+	if compare.SameUUID(config.VPCID, subnet.Vpc.Id) {
+		state.VPCID = config.VPCID
 	}
 	if !config.VPCName.IsNull() && !config.VPCName.IsUnknown() && strings.TrimSpace(config.VPCName.ValueString()) == subnet.Vpc.Name {
 		state.VPCName = config.VPCName

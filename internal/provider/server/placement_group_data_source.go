@@ -241,8 +241,8 @@ func preserveConfiguredPlacementGroupValues(
 		strings.TrimSpace(config.Name.ValueString()) == pg.Name {
 		state.Name = config.Name
 	}
-	if !config.Policy.IsNull() && !config.Policy.IsUnknown() && pg.Policy != nil &&
-		placementGroupPolicyCriterion(config.Policy) == *pg.Policy {
+	if policy := core.NullableToPtr(pg.Policy); !config.Policy.IsNull() && !config.Policy.IsUnknown() && policy != nil &&
+		placementGroupPolicyCriterion(config.Policy) == *policy {
 		state.Policy = config.Policy
 	}
 	if !config.Region.IsNull() && !config.Region.IsUnknown() &&

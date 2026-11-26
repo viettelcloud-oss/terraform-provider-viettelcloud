@@ -10,17 +10,18 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	projectlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 )
 
 var (
@@ -66,7 +67,7 @@ func (r *PlacementGroupResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Required:    true,
 				Description: "Placement Group policy: one of affinity, anti-affinity, soft-affinity, or soft-anti-affinity. Changing the policy replaces the Placement Group.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					replace.String(compare.SameTrimmedString),
 				},
 			},
 			"region": schema.SingleNestedAttribute{
@@ -74,7 +75,7 @@ func (r *PlacementGroupResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Description: "Project region where the Placement Group is created. Changing the region replaces the Placement Group.",
 				Attributes:  reference.Attributes(reference.Name, "Region name."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"region_id": schema.StringAttribute{
@@ -254,8 +255,8 @@ func buildPlacementGroupCreateBody(
 	var body serversdk.PlacementGroupCreateSchema
 	var diags diag.Diagnostics
 
-	if plan.Name.IsNull() || plan.Name.IsUnknown() {
-		diags.AddError("Missing Placement Group name", "name must be configured and known.")
+	if plan.Name.IsNull() || plan.Name.IsUnknown() || strings.TrimSpace(plan.Name.ValueString()) == "" {
+		diags.AddError("Missing Placement Group name", "name must be configured, known and not blank.")
 	}
 	if plan.Policy.IsNull() || plan.Policy.IsUnknown() || strings.TrimSpace(plan.Policy.ValueString()) == "" {
 		diags.AddError("Missing Placement Group policy", "policy must be configured and known.")
@@ -268,11 +269,11 @@ func buildPlacementGroupCreateBody(
 		return body, diags
 	}
 
-	policyValue := serversdk.PlacementGroupPolicy(plan.Policy.ValueString())
+	policyValue := serversdk.PlacementGroupPolicy(strings.TrimSpace(plan.Policy.ValueString()))
 	if !policyValue.Valid() {
 		diags.AddError(
 			"Invalid Placement Group policy",
-			fmt.Sprintf("policy %q is not one of affinity, anti-affinity, soft-affinity, soft-anti-affinity.", plan.Policy.ValueString()),
+			fmt.Sprintf("policy %q is not one of affinity, anti-affinity, soft-affinity, soft-anti-affinity.", policyValue),
 		)
 		return body, diags
 	}
@@ -289,7 +290,7 @@ func buildPlacementGroupCreateBody(
 	body.Policy = policyValue
 	body.RegionId = region.Region.Id
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	return body, diags
@@ -306,19 +307,19 @@ func buildPlacementGroupUpdateBody(
 	var diags diag.Diagnostics
 	changed := false
 
-	if plan.Name.IsNull() || plan.Name.IsUnknown() {
-		diags.AddError("Missing Placement Group name", "name must be configured and known.")
+	desiredName := strings.TrimSpace(plan.Name.ValueString())
+	if plan.Name.IsNull() || plan.Name.IsUnknown() || desiredName == "" {
+		diags.AddError("Missing Placement Group name", "name must be configured, known and not blank.")
 		return body, changed, diags
 	}
-	desiredName := strings.TrimSpace(plan.Name.ValueString())
 	if state.Name.IsNull() || state.Name.IsUnknown() || strings.TrimSpace(state.Name.ValueString()) != desiredName {
 		body.Name = &desiredName
 		changed = true
 	}
 
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() &&
-		(state.Description.IsNull() || state.Description.IsUnknown() || !plan.Description.Equal(state.Description)) {
-		value := plan.Description.ValueString()
+		!compare.SameTrimmed(state.Description, plan.Description.ValueString()) {
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 		changed = true
 	}

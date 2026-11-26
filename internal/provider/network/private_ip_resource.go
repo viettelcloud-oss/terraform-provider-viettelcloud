@@ -4,17 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
@@ -62,7 +64,7 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Computed:    true,
 				Description: "Private IP address. When omitted during creation, the platform allocates an address from the subnet; removing it from configuration preserves the assigned address.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+					replace.StringIfConfigured(compare.SameIPAddressString),
 				},
 			},
 			"mac_address": schema.StringAttribute{
@@ -70,7 +72,7 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Computed:    true,
 				Description: "MAC address. When omitted during creation, the platform allocates one; removing it from configuration preserves the assigned address.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+					replace.StringIfConfigured(compare.SameMACAddressString),
 				},
 			},
 			"subnet": schema.SingleNestedAttribute{
@@ -78,7 +80,7 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Description: "Subnet where the private IP is allocated.",
 				Attributes:  reference.Attributes(reference.ID, "Subnet ID (UUID)."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.ID, compare.SameUUIDString),
 				},
 			},
 			"subnet_name": schema.StringAttribute{
@@ -132,6 +134,9 @@ func (r *PrivateIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Description: "Full set of private IPs allowed as VIPs. Omitting it preserves the backend set; use an empty set to clear all allowed VIPs.",
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: reference.PreservedAttributes(reference.ID, "Allowed VIP private IP ID (UUID)."),
+				},
+				Validators: []validator.Set{
+					distinctAllowedVIPs{},
 				},
 			},
 			"attached_vips": schema.SetNestedAttribute{
@@ -348,28 +353,31 @@ func buildPrivateIPCreateBody(plan PrivateIPResourceModel) (networksdk.PrivateIP
 	body.SubnetId = subnetID
 
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
+		description := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &description
 	}
 	if !plan.IPAddress.IsNull() && !plan.IPAddress.IsUnknown() {
-		ipAddress := plan.IPAddress.ValueString()
-		body.IpAddress = &ipAddress
+		ipAddress := strings.TrimSpace(plan.IPAddress.ValueString())
+		body.IpAddress.Set(ipAddress)
 	}
 	if !plan.MACAddress.IsNull() && !plan.MACAddress.IsUnknown() {
-		macAddress := plan.MACAddress.ValueString()
-		body.MacAddress = &macAddress
+		macAddress := strings.TrimSpace(plan.MACAddress.ValueString())
+		body.MacAddress.Set(macAddress)
 	}
 	return body, diags
 }
 
 func buildPrivateIPUpdateBody(plan, state PrivateIPResourceModel) (networksdk.PrivateIPPartialUpdateSchema, bool) {
 	var body networksdk.PrivateIPPartialUpdateSchema
-	if plan.Description.IsNull() || plan.Description.IsUnknown() || plan.Description.Equal(state.Description) {
+	if plan.Description.IsNull() || plan.Description.IsUnknown() {
 		return body, false
 	}
-
-	description := plan.Description.ValueString()
-	body.Description = &description
+	// The API trims the description, so compare trimmed values.
+	description := strings.TrimSpace(plan.Description.ValueString())
+	if compare.SameTrimmed(state.Description, description) {
+		return body, false
+	}
+	body.Description.Set(description)
 	return body, true
 }
 
@@ -390,6 +398,41 @@ func buildPrivateIPAllowedVIPsBody(value types.Set) (networksdk.PrivateIPAllowed
 		}
 	}
 	return body, true, diags
+}
+
+// distinctAllowedVIPs rejects two allowed_vips elements that name the same
+// private IP, such as an ID with and without outer whitespace. The API stores
+// the private IP once, so the result would not match the planned set.
+type distinctAllowedVIPs struct{}
+
+func (distinctAllowedVIPs) Description(context.Context) string {
+	return "Each element must name a different private IP."
+}
+
+func (v distinctAllowedVIPs) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (distinctAllowedVIPs) ValidateSet(_ context.Context, req validator.SetRequest, resp *validator.SetResponse) {
+	seen := make(map[core.UUID]string)
+	for _, value := range reference.Strings(req.ConfigValue, reference.ID) {
+		if value.IsNull() || value.IsUnknown() {
+			continue
+		}
+		id, err := parse.UUID(value.ValueString())
+		if err != nil {
+			continue
+		}
+		if first, ok := seen[id]; ok {
+			resp.Diagnostics.AddAttributeError(
+				req.Path,
+				"Duplicate allowed VIP",
+				fmt.Sprintf("%s names private IP %s twice, as %q and %q.", req.Path, id, first, value.ValueString()),
+			)
+			continue
+		}
+		seen[id] = value.ValueString()
+	}
 }
 
 func buildPrivateIPAllowedVIPsUpdateBody(

@@ -119,8 +119,8 @@ func TestVolumeDataSourceReadPopulatesStateFromBackend(t *testing.T) {
 	description := "database"
 	iops := 3000
 	volume := sampleVolumeDetail()
-	volume.Description = &description
-	volume.Iops = &iops
+	volume.Description.Set(description)
+	volume.Iops = iops
 
 	requests := 0
 	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {

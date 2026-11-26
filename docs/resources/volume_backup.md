@@ -3,12 +3,12 @@
 page_title: "viettelcloud_volume_backup Resource - viettelcloud"
 subcategory: ""
 description: |-
-  Manage a Viettel Cloud volume backup.
+  Manage a Viettel Cloud volume backup, and restore it into an existing volume.
 ---
 
 # viettelcloud_volume_backup (Resource)
 
-Manage a Viettel Cloud volume backup.
+Manage a Viettel Cloud volume backup, and restore it into an existing volume.
 
 ## Example Usage
 
@@ -17,10 +17,19 @@ variable "volume_id" {
   type = string
 }
 
+# Set after the backup exists to restore it into that volume. The restore
+# overwrites all data on the volume.
+variable "restore_volume_id" {
+  type    = string
+  default = null
+}
+
 resource "viettelcloud_volume_backup" "example" {
   name        = "example-volume-backup"
   description = "Daily recovery point"
   volume      = { id = var.volume_id }
+
+  restore_volume = var.restore_volume_id == null ? null : { id = var.restore_volume_id }
 }
 ```
 
@@ -35,6 +44,8 @@ resource "viettelcloud_volume_backup" "example" {
 ### Optional
 
 - `description` (String) Backup description. Omit it to preserve the current value. Set an empty string to clear it.
+- `restore_volume` (Attributes) Existing volume to restore this backup into. The restore overwrites all data on the volume. Adding it or naming another volume restores; removing it changes nothing. It cannot be set when the backup is created or replaced. To restore into the same volume again, remove it and apply, then add it back. The volume must be in the same region as the backup. Some failed restores end without an error and keep the old data, so check the volume after a restore. (see [below for nested schema](#nestedatt--restore_volume))
+- `timeouts` (Attributes) Maximum durations of operations. A change of timeouts alone sends no request. A delete waits at most 30 minutes. (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
@@ -58,6 +69,23 @@ resource "viettelcloud_volume_backup" "example" {
 Required:
 
 - `id` (String) Volume ID (UUID).
+
+
+<a id="nestedatt--restore_volume"></a>
+### Nested Schema for `restore_volume`
+
+Required:
+
+- `id` (String) Volume ID (UUID).
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) Maximum duration of a create, such as "90m". Defaults to "30m".
+- `update` (String) Maximum duration of an in-place update, including a restore into restore_volume, such as "2h". Defaults to "60m". A restore into a large volume can need more.
 
 ## Import
 

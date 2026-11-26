@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
@@ -57,6 +59,9 @@ func (r *SecurityGroupResource) Schema(_ context.Context, _ resource.SchemaReque
 			"name": schema.StringAttribute{
 				Required:    true,
 				Description: "Name of the security group.",
+				Validators: []validator.String{
+					notBlank{},
+				},
 			},
 			"display_name": schema.StringAttribute{
 				Computed:    true,
@@ -78,7 +83,7 @@ func (r *SecurityGroupResource) Schema(_ context.Context, _ resource.SchemaReque
 				Description: "Project region where the security group is created. Changing it replaces the security group because the update operation cannot move one between regions.",
 				Attributes:  reference.Attributes(reference.Name, "Region name."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"region_id": schema.StringAttribute{
@@ -189,7 +194,12 @@ func (r *SecurityGroupResource) Update(ctx context.Context, req resource.UpdateR
 
 	var sg *networksdk.SecurityGroupSchema
 	var err error
-	if body, changed := buildSecurityGroupUpdateBody(plan, state); changed {
+	body, changed, diags := buildSecurityGroupUpdateBody(plan, state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if changed {
 		sg, err = r.client.PartialUpdateSecurityGroup(ctx, sgID, networksdk.PartialUpdateSecurityGroupParams{ProjectID: r.projectID}, body)
 		if err != nil {
 			resp.Diagnostics.AddError("Error updating security group", err.Error())
@@ -255,10 +265,10 @@ func buildSecurityGroupCreateBody(
 		return body, diags
 	}
 
-	body.Name = plan.Name.ValueString()
+	body.Name = strings.TrimSpace(plan.Name.ValueString())
 	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 
@@ -269,10 +279,15 @@ func buildSecurityGroupCreateBody(
 // sent. An unknown description belongs to a practitioner who left it
 // unconfigured, so the body omits it rather than guess. A known empty string is
 // instead a request to clear the description.
-func buildSecurityGroupUpdateBody(plan, state SecurityGroupResourceModel) (networksdk.SecurityGroupPartialUpdateSchema, bool) {
+func buildSecurityGroupUpdateBody(plan, state SecurityGroupResourceModel) (networksdk.SecurityGroupPartialUpdateSchema, bool, diag.Diagnostics) {
 	var body networksdk.SecurityGroupPartialUpdateSchema
+	var diags diag.Diagnostics
 	changed := false
 
+	if isBlank(plan.Name) {
+		diags.AddError("Missing name", "name must not be blank.")
+		return body, changed, diags
+	}
 	if !plan.Name.IsNull() && !plan.Name.IsUnknown() {
 		// The backend trims the name, and state may hold the practitioner's
 		// untrimmed representation of the same name. Compare what the backend
@@ -282,11 +297,13 @@ func buildSecurityGroupUpdateBody(plan, state SecurityGroupResourceModel) (netwo
 			changed = true
 		}
 	}
-	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !plan.Description.Equal(state.Description) {
-		description := plan.Description.ValueString()
-		body.Description = &description
-		changed = true
+	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
+		// The backend trims the description too, so compare trimmed values.
+		if description := strings.TrimSpace(plan.Description.ValueString()); !compare.SameTrimmed(state.Description, description) {
+			body.Description = &description
+			changed = true
+		}
 	}
 
-	return body, changed
+	return body, changed, diags
 }

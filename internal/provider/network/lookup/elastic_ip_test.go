@@ -50,8 +50,8 @@ func sampleElasticIP(
 		Description: &description,
 		DisplayName: ipAddress,
 		EnableIpv4:  true,
-		IpAddress:   &ipAddress,
-		Status:      &status,
+		IpAddress:   core.NullableFromPtr(&ipAddress),
+		Status:      core.NullableFromPtr(&status),
 		Region: networksdk.NestedRegionSchema{
 			Id:   core.UUID{9},
 			Name: regionName,
@@ -60,7 +60,7 @@ func sampleElasticIP(
 		UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 	if attached {
-		eip.Server = &networksdk.NestedServerSchema{Id: core.UUID{8}, Name: "server"}
+		eip.Server.Set(networksdk.NestedServerSchema{Id: core.UUID{8}, Name: "server"})
 	}
 	return eip
 }
@@ -136,7 +136,7 @@ func TestElasticIPFinderFindMatchesEveryCriterion(t *testing.T) {
 	ipv6 := "2001:db8::10"
 	configuredIPv6 := "2001:0DB8:0000:0000:0000:0000:0000:0010"
 	wanted := sampleElasticIP(core.UUID{10}, "203.0.113.10", "vn-central", networksdk.ElasticIPStatusActive, false)
-	wanted.Ipv6Address = &ipv6
+	wanted.Ipv6Address = core.NullableFromPtr(&ipv6)
 
 	lister := &fakeElasticIPLister{results: []networksdk.ElasticIPSchema{
 		wanted,
@@ -182,6 +182,25 @@ func TestElasticIPFinderFindMatchesAttachedOnly(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(matches) != 1 || matches[0].Id != (core.UUID{11}) {
+		t.Fatalf("unexpected matches: %#v", matches)
+	}
+}
+
+func TestElasticIPFinderFindTreatsNullServerAsAvailable(t *testing.T) {
+	t.Parallel()
+
+	eip := sampleElasticIP(core.UUID{10}, "203.0.113.10", "vn-central", networksdk.ElasticIPStatusActive, false)
+	eip.Server.SetNull()
+	lister := &fakeElasticIPLister{results: []networksdk.ElasticIPSchema{eip}}
+
+	available := true
+	matches, err := NewElasticIPFinder(lister, core.UUID{7}).Find(context.Background(), ElasticIPFilter{
+		Available: &available,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Id != (core.UUID{10}) {
 		t.Fatalf("unexpected matches: %#v", matches)
 	}
 }

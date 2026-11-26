@@ -95,7 +95,7 @@ func (d *VolumeDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (d *VolumeDataSource) getVolume(ctx context.Context, config VolumeDataSourceModel) (*blockstoragesdk.VolumeDetailSchema, diag.Diagnostics) {
+func (d *VolumeDataSource) getVolume(ctx context.Context, config VolumeDataSourceModel) (*blockstoragesdk.VolumeSchema, diag.Diagnostics) {
 	criteria, diags := volumeLookupCriteria(config)
 	if diags.HasError() {
 		return nil, diags
@@ -108,7 +108,7 @@ func (d *VolumeDataSource) getVolume(ctx context.Context, config VolumeDataSourc
 	return d.getVolumeByFilter(ctx, config, criteria)
 }
 
-func (d *VolumeDataSource) getVolumeByIDCriterion(ctx context.Context, config VolumeDataSourceModel) (*blockstoragesdk.VolumeDetailSchema, diag.Diagnostics) {
+func (d *VolumeDataSource) getVolumeByIDCriterion(ctx context.Context, config VolumeDataSourceModel) (*blockstoragesdk.VolumeSchema, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	volumeID, idDiags := parse.UUIDString(config.ID, "id")
 	diags.Append(idDiags...)
@@ -131,7 +131,7 @@ func (d *VolumeDataSource) getVolumeByFilter(
 	ctx context.Context,
 	config VolumeDataSourceModel,
 	criteria volumeCriteria,
-) (*blockstoragesdk.VolumeDetailSchema, diag.Diagnostics) {
+) (*blockstoragesdk.VolumeSchema, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	volumeID, idDiags := parse.OptionalUUIDString(config.ID, "id")
 	diags.Append(idDiags...)
@@ -174,7 +174,7 @@ func (d *VolumeDataSource) getVolumeByFilter(
 	return volume, diags
 }
 
-func (d *VolumeDataSource) getVolumeByID(ctx context.Context, id core.UUID) (*blockstoragesdk.VolumeDetailSchema, error) {
+func (d *VolumeDataSource) getVolumeByID(ctx context.Context, id core.UUID) (*blockstoragesdk.VolumeSchema, error) {
 	return d.client.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: d.projectID})
 }
 
@@ -215,12 +215,12 @@ func volumeLookupCriteria(config VolumeDataSourceModel) (volumeCriteria, diag.Di
 	return criteria, diags
 }
 
-func populateVolumeDataSourceState(volume *blockstoragesdk.VolumeDetailSchema, state *VolumeDataSourceModel) {
+func populateVolumeDataSourceState(volume *blockstoragesdk.VolumeSchema, state *VolumeDataSourceModel) {
 	populateVolumeModel(volume, &state.VolumeModel)
 	state.Zone = types.StringValue(volume.Zone.Name)
 }
 
-func preserveVolumeConfiguredValues(volume *blockstoragesdk.VolumeDetailSchema, config, state *VolumeDataSourceModel) {
+func preserveVolumeConfiguredValues(volume *blockstoragesdk.VolumeSchema, config, state *VolumeDataSourceModel) {
 	if compare.SameUUID(config.ID, volume.Id) {
 		state.ID = config.ID
 	}

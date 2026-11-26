@@ -35,7 +35,7 @@ resource "viettelcloud_key_pair" "uploaded" {
 
 ### Optional
 
-- `public_key` (String) Public key material to upload. On create, omit it to generate a new key pair. Changing a configured value replaces the key pair; removing it from configuration preserves the existing public key.
+- `public_key` (String) Public key material to upload. On create, omit it to generate a new key pair. Changing a configured value replaces the key pair, but adding or removing leading or trailing whitespace does not; removing it from configuration preserves the existing public key.
 
 ### Read-Only
 

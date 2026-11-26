@@ -18,6 +18,7 @@ import (
 	"github.com/viettelcloud-oss/sdks/go/core"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
 
@@ -118,22 +119,20 @@ func dataVolumeResourceAttributeTypes() map[string]attr.Type {
 	}
 }
 
-func populateServerDataVolume(volume *blockstoragesdk.VolumeDetailSchema, attached bool, config *DataVolumeInputModel) diag.Diagnostics {
+func populateServerDataVolume(volume *blockstoragesdk.VolumeSchema, attached bool, config *DataVolumeInputModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 	config.Attached = types.BoolValue(attached)
 	config.Kind = knownStringOrDefault(config.Kind, "new")
-	if id, err := core.ParseUUID(config.ID.ValueString()); err != nil || id != volume.Id {
-		config.ID = types.StringValue(volume.Id.String())
-	}
-	if volume.CreateFrom.VolumeType != nil {
+	config.ID = compare.PreservedUUID(config.ID, volume.Id)
+	if volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); volumeType != nil {
 		var typeDiags diag.Diagnostics
-		config.VolumeType, typeDiags = selector.Refresh(config.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &volume.CreateFrom.VolumeType.Id, volume.CreateFrom.VolumeType.Name)
+		config.VolumeType, typeDiags = selector.Refresh(config.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &volumeType.Id, volumeType.Name)
 		diags.Append(typeDiags...)
 	} else {
 		config.VolumeType = types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())
 	}
 	config.VolumeSize = types.Int64Value(int64(volume.Size))
-	config.IOPS = volumeIOPSValue(volume)
+	config.IOPS = types.Int64Value(int64(volume.Iops))
 	config.DeleteOnTermination = knownBoolOrDefault(config.DeleteOnTermination, dataVolumeKind(*config) == "new")
 	return diags
 }
@@ -170,19 +169,27 @@ func populateServerResourceState(ctx context.Context, server *serversdk.ServerDe
 	}
 
 	configuredName := state.Name
+	configuredDescription := state.Description
+	configuredPowerState := state.PowerState
 	configuredZone := state.Zone
 	configuredUserData := state.UserData
 	configuredBandwidth := state.Bandwidth
 	configuredKeyPair := state.KeyPair
 	configuredPlacementGroup := state.PlacementGroup
+	configuredSecurityGroups := state.SecurityGroups
 	populateServerModel(server, &state.ServerModel)
 	if !configuredName.IsNull() && !configuredName.IsUnknown() && strings.TrimSpace(configuredName.ValueString()) == server.Name {
 		state.Name = configuredName
 	}
-	if server.KeyPair != nil && sameUUIDReference(configuredKeyPair, server.KeyPair.Id) {
+	// The request builders trim description, and the power-state checks trim
+	// power_state, so keep a configured spelling that differs from the backend
+	// value only by outer whitespace.
+	state.Description = compare.PreservedString(configuredDescription, server.Description)
+	state.PowerState = compare.PreservedString(configuredPowerState, string(server.PowerState))
+	if keyPair := core.NullableToPtr(server.KeyPair); keyPair != nil && sameUUIDReference(configuredKeyPair, keyPair.Id) {
 		state.KeyPair = configuredKeyPair
 	}
-	if server.PlacementGroup != nil && sameUUIDReference(configuredPlacementGroup, server.PlacementGroup.Id) {
+	if placementGroup := core.NullableToPtr(server.PlacementGroup); placementGroup != nil && sameUUIDReference(configuredPlacementGroup, placementGroup.Id) {
 		state.PlacementGroup = configuredPlacementGroup
 	}
 	state.Flavor = serverFlavorObject(ctx, state.Flavor, server.Flavor, &diags)
@@ -195,7 +202,7 @@ func populateServerResourceState(ctx context.Context, server *serversdk.ServerDe
 	// inconsistent with the plan. user_data would then replace the server on
 	// every plan, because it cannot be updated in place.
 	state.UserData = preserveEquivalentString(configuredUserData, server.UserData)
-	if server.Bandwidth == nil {
+	if core.NullableToPtr(server.Bandwidth) == nil {
 		state.Bandwidth = knownInt64OrNull(configuredBandwidth)
 	}
 	state.Quantity = types.Int64Value(1)
@@ -203,6 +210,9 @@ func populateServerResourceState(ctx context.Context, server *serversdk.ServerDe
 	state.PrivateIPs = privateIPResourceList(ctx, state.PrivateIPs, server.PrivateIps, false, &diags)
 	state.ElasticIPs = elasticIPResourceList(ctx, state.ElasticIPs, server.ElasticIps, false, &diags)
 	state.SecurityGroups = reference.Set(reference.ID, securityGroupIDs(server))
+	if compare.SameUUIDSet(referenceIDSet(configuredSecurityGroups), referenceIDSet(state.SecurityGroups)) {
+		state.SecurityGroups = configuredSecurityGroups
+	}
 	// The API's attachment order isn't stable across reads.
 	dataVolumes, volumeDiags := types.ListValueFrom(ctx, types.StringType, dataVolumeIDs(server))
 	diags.Append(volumeDiags...)
@@ -215,16 +225,16 @@ func populateServerModel(server *serversdk.ServerDetailSchema, state *ServerMode
 	state.Name = types.StringValue(server.Name)
 	state.Description = types.StringValue(server.Description)
 	state.Zone = reference.Value(reference.Name, types.StringValue(server.Zone.Name))
-	if server.KeyPair != nil {
-		state.KeyPair = reference.Value(reference.ID, types.StringValue(server.KeyPair.Id.String()))
-		state.KeyPairName = types.StringValue(server.KeyPair.Name)
+	if keyPair := core.NullableToPtr(server.KeyPair); keyPair != nil {
+		state.KeyPair = reference.Value(reference.ID, types.StringValue(keyPair.Id.String()))
+		state.KeyPairName = types.StringValue(keyPair.Name)
 	} else {
 		state.KeyPair = reference.Value(reference.ID, types.StringNull())
 		state.KeyPairName = types.StringNull()
 	}
-	if server.PlacementGroup != nil {
-		state.PlacementGroup = reference.Value(reference.ID, types.StringValue(server.PlacementGroup.Id.String()))
-		state.PlacementGroupName = types.StringValue(server.PlacementGroup.Name)
+	if placementGroup := core.NullableToPtr(server.PlacementGroup); placementGroup != nil {
+		state.PlacementGroup = reference.Value(reference.ID, types.StringValue(placementGroup.Id.String()))
+		state.PlacementGroupName = types.StringValue(placementGroup.Name)
 	} else {
 		state.PlacementGroup = reference.Value(reference.ID, types.StringNull())
 		state.PlacementGroupName = types.StringNull()
@@ -234,10 +244,10 @@ func populateServerModel(server *serversdk.ServerDetailSchema, state *ServerMode
 	state.Status = types.StringValue(string(server.Status))
 	state.ServerType = types.StringValue(server.ServerType)
 	state.CreatedAt = types.StringValue(server.CreatedAt.Format(time.RFC3339))
-	if server.Bandwidth == nil {
+	if bandwidth := core.NullableToPtr(server.Bandwidth); bandwidth == nil {
 		state.Bandwidth = types.Int64Null()
 	} else {
-		state.Bandwidth = types.Int64Value(int64(*server.Bandwidth))
+		state.Bandwidth = types.Int64Value(int64(*bandwidth))
 	}
 }
 
@@ -282,7 +292,7 @@ func populateServerPendingState(ctx context.Context, state *ServerResourceModel,
 
 func serverBootStateObject(
 	server *serversdk.ServerDetailSchema,
-	rootVolume *blockstoragesdk.VolumeDetailSchema,
+	rootVolume *blockstoragesdk.VolumeSchema,
 	rootVolumeID core.UUID,
 	bootType string,
 	current BootInputModel,
@@ -302,14 +312,17 @@ func serverBootStateObject(
 		),
 	}
 
+	serverImage := core.NullableToPtr(server.Image)
 	switch bootType {
 	case "image":
 		var imageID *core.UUID
 		imageName := ""
-		if server.Image != nil {
-			imageID, imageName = &server.Image.Id, server.Image.Name
-		} else if rootVolume != nil && rootVolume.CreateFrom.Image != nil {
-			imageID, imageName = &rootVolume.CreateFrom.Image.Id, rootVolume.CreateFrom.Image.Name
+		if serverImage != nil {
+			imageID, imageName = &serverImage.Id, serverImage.Name
+		} else if rootVolume != nil {
+			if rootImage := core.NullableToPtr(rootVolume.CreateFrom.Image); rootImage != nil {
+				imageID, imageName = &rootImage.Id, rootImage.Name
+			}
 		}
 		if imageID == nil && (current.Image.IsNull() || current.Image.IsUnknown()) {
 			diags.AddError("Unable to determine server boot image", "The server and root-volume responses do not identify the image used by this server.")
@@ -320,26 +333,28 @@ func serverBootStateObject(
 		populateBootVolumeState(values, rootVolume, current, diags)
 	case "custom_image":
 		customImageID := ""
-		if server.Image != nil {
-			customImageID = server.Image.Id.String()
-		} else if rootVolume != nil && rootVolume.CreateFrom.CustomImage != nil {
-			customImageID = rootVolume.CreateFrom.CustomImage.Id.String()
+		if serverImage != nil {
+			customImageID = serverImage.Id.String()
+		} else if rootVolume != nil {
+			if rootCustomImage := core.NullableToPtr(rootVolume.CreateFrom.CustomImage); rootCustomImage != nil {
+				customImageID = rootCustomImage.Id.String()
+			}
 		}
 		if customImageID == "" && !knownReferenceCriterion(current.CustomImage, reference.ID) {
 			diags.AddError("Unable to determine server custom image", "The server and root-volume responses do not identify the custom image used by this server.")
 		}
-		values["custom_image"] = preserveEquivalentReference(current.CustomImage, reference.ID, customImageID)
+		values["custom_image"] = preserveEquivalentUUIDReference(current.CustomImage, customImageID)
 		populateBootVolumeState(values, rootVolume, current, diags)
 	case "local_disk":
-		if server.Image != nil {
-			image, imageDiags := selector.Refresh(current.Image, serverselector.ImageAttributeTypes(), &server.Image.Id, server.Image.Name)
+		if serverImage != nil {
+			image, imageDiags := selector.Refresh(current.Image, serverselector.ImageAttributeTypes(), &serverImage.Id, serverImage.Name)
 			diags.Append(imageDiags...)
 			values["image"] = image
 		} else {
 			values["image"] = current.Image
 		}
 	case "volume":
-		values["volume"] = preserveEquivalentReference(current.Volume, reference.ID, rootVolumeID.String())
+		values["volume"] = preserveEquivalentUUIDReference(current.Volume, rootVolumeID.String())
 	default:
 		diags.AddError("Unsupported server boot type", fmt.Sprintf("The server state contains unsupported boot type %q.", bootType))
 	}
@@ -351,7 +366,7 @@ func serverBootStateObject(
 
 func populateBootVolumeState(
 	values map[string]attr.Value,
-	volume *blockstoragesdk.VolumeDetailSchema,
+	volume *blockstoragesdk.VolumeSchema,
 	current BootInputModel,
 	diags *diag.Diagnostics,
 ) {
@@ -361,8 +376,8 @@ func populateBootVolumeState(
 		values["iops"] = current.IOPS
 		return
 	}
-	if volume.CreateFrom.VolumeType != nil {
-		volumeType, typeDiags := selector.Refresh(current.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &volume.CreateFrom.VolumeType.Id, volume.CreateFrom.VolumeType.Name)
+	if createdVolumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); createdVolumeType != nil {
+		volumeType, typeDiags := selector.Refresh(current.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &createdVolumeType.Id, createdVolumeType.Name)
 		diags.Append(typeDiags...)
 		values["volume_type"] = volumeType
 	} else {
@@ -375,11 +390,7 @@ func populateBootVolumeState(
 		values["volume_type"] = current.VolumeType
 	}
 	values["volume_size"] = types.Int64Value(int64(volume.Size))
-	if volume.Iops != nil {
-		values["iops"] = types.Int64Value(int64(*volume.Iops))
-	} else {
-		values["iops"] = knownInt64OrNull(current.IOPS)
-	}
+	values["iops"] = types.Int64Value(int64(volume.Iops))
 }
 
 // knownBootObject replaces the computed boot values Terraform planned as
@@ -461,17 +472,17 @@ func selectServerBootType(current types.String, inferred string, hasRootVolume b
 	return inferred
 }
 
-func inferServerBootType(server *serversdk.ServerDetailSchema, rootVolume *blockstoragesdk.VolumeDetailSchema) string {
+func inferServerBootType(server *serversdk.ServerDetailSchema, rootVolume *blockstoragesdk.VolumeSchema) string {
 	if rootVolume == nil {
-		if server.Image != nil {
+		if core.NullableToPtr(server.Image) != nil {
 			return "local_disk"
 		}
 		return ""
 	}
-	if rootVolume.CreateFrom.CustomImage != nil {
+	if core.NullableToPtr(rootVolume.CreateFrom.CustomImage) != nil {
 		return "custom_image"
 	}
-	if rootVolume.CreateFrom.Image != nil {
+	if core.NullableToPtr(rootVolume.CreateFrom.Image) != nil {
 		return "image"
 	}
 	return "volume"
@@ -494,13 +505,6 @@ func serverRootVolumeID(server *serversdk.ServerDetailSchema) (core.UUID, bool) 
 	return core.UUID{}, false
 }
 
-func volumeIOPSValue(volume *blockstoragesdk.VolumeDetailSchema) types.Int64 {
-	if volume.Iops == nil {
-		return types.Int64Null()
-	}
-	return types.Int64Value(int64(*volume.Iops))
-}
-
 // --- Attachment and flavor state ---
 
 func privateIPResourceList(
@@ -519,8 +523,7 @@ func privateIPResourceList(
 		}
 	}
 	matches, used := matchAttachmentIDs(len(configs), len(values), func(configIndex, valueIndex int) bool {
-		id := configs[configIndex].ID
-		return !id.IsNull() && !id.IsUnknown() && id.ValueString() == values[valueIndex].Id.String()
+		return compare.SameUUID(configs[configIndex].ID, values[valueIndex].Id)
 	}, func(configIndex int) bool {
 		id := configs[configIndex].ID
 		return !id.IsNull() && !id.IsUnknown()
@@ -553,13 +556,9 @@ func privateIPResourceObject(config PrivateIPInputModel, value *serversdk.Nested
 	ipAddress := types.StringNull()
 	macAddress := types.StringNull()
 	if value != nil {
-		id = types.StringValue(value.Id.String())
-		if value.IpAddress != nil {
-			ipAddress = types.StringValue(*value.IpAddress)
-		}
-		if value.MacAddress != nil {
-			macAddress = types.StringValue(*value.MacAddress)
-		}
+		id = compare.PreservedUUID(config.ID, value.Id)
+		ipAddress = types.StringPointerValue(core.NullableToPtr(value.IpAddress))
+		macAddress = types.StringPointerValue(core.NullableToPtr(value.MacAddress))
 	}
 	result, valueDiags := types.ObjectValue(privateIPResourceAttributeTypes(), map[string]attr.Value{
 		"kind": kind, "id": id, "subnet": knownReference(config.Subnet, reference.ID, subnetCIDR),
@@ -586,8 +585,7 @@ func elasticIPResourceList(
 		}
 	}
 	matches, used := matchAttachmentIDs(len(configs), len(values), func(configIndex, valueIndex int) bool {
-		id := configs[configIndex].ID
-		return !id.IsNull() && !id.IsUnknown() && id.ValueString() == values[valueIndex].Id.String()
+		return compare.SameUUID(configs[configIndex].ID, values[valueIndex].Id)
 	}, func(configIndex int) bool {
 		id := configs[configIndex].ID
 		return !id.IsNull() && !id.IsUnknown()
@@ -621,13 +619,9 @@ func elasticIPResourceObject(config ElasticIPInputModel, value *serversdk.Nested
 	ipv6 := types.StringNull()
 	status := types.StringNull()
 	if value != nil {
-		id = types.StringValue(value.Id.String())
-		if value.IpAddress != nil {
-			ipv4 = types.StringValue(*value.IpAddress)
-		}
-		if value.Ipv6Address != nil {
-			ipv6 = types.StringValue(*value.Ipv6Address)
-		}
+		id = compare.PreservedUUID(config.ID, value.Id)
+		ipv4 = types.StringPointerValue(core.NullableToPtr(value.IpAddress))
+		ipv6 = types.StringPointerValue(core.NullableToPtr(value.Ipv6Address))
 		status = types.StringValue(string(value.Status))
 	}
 	result, valueDiags := types.ObjectValue(elasticIPResourceAttributeTypes(), map[string]attr.Value{
@@ -765,13 +759,29 @@ func preserveEquivalentReference(current types.Object, criterion, backend string
 	return reference.Value(criterion, preserveEquivalentString(reference.Get(current, criterion), backend))
 }
 
+// preserveEquivalentUUIDReference keeps the configured spelling of an ID
+// reference when it names the backend UUID, such as with outer whitespace or
+// in upper case.
+func preserveEquivalentUUIDReference(current types.Object, backend string) types.Object {
+	if id, err := core.ParseUUID(backend); err == nil && sameUUIDReference(current, id) {
+		return current
+	}
+	return preserveEquivalentReference(current, reference.ID, backend)
+}
+
 // sameUUIDReference reports whether a configured ID reference names id. The
-// comparison ignores surrounding whitespace and UUID letter case, which the
-// backend normalizes.
+// replace modifiers on key_pair and placement_group use the same comparison.
 func sameUUIDReference(configured types.Object, id core.UUID) bool {
-	configuredID := reference.Get(configured, reference.ID)
-	return !configuredID.IsNull() && !configuredID.IsUnknown() &&
-		strings.EqualFold(strings.TrimSpace(configuredID.ValueString()), id.String())
+	return compare.SameUUID(reference.Get(configured, reference.ID), id)
+}
+
+// sameOptionalUUIDReference reports whether two ID references name the same
+// UUID, or both carry no ID.
+func sameOptionalUUIDReference(left, right types.Object) bool {
+	if referenceCriterion(left, reference.ID) == "" || referenceCriterion(right, reference.ID) == "" {
+		return referenceCriterion(left, reference.ID) == referenceCriterion(right, reference.ID)
+	}
+	return compare.SameUUIDString(reference.Get(left, reference.ID), reference.Get(right, reference.ID))
 }
 
 func knownStringOrDefault(value types.String, fallback string) types.String {

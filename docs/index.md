@@ -16,7 +16,7 @@ terraform {
   required_providers {
     viettelcloud = {
       source  = "viettelcloud-oss/viettelcloud"
-      version = "~> 0.1.1"
+      version = "~> 0.3.0"
     }
   }
 }

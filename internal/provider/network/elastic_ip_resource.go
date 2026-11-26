@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -14,7 +17,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -67,7 +69,7 @@ func (r *ElasticIPResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Description: "Project region where the Elastic IP is created.",
 				Attributes:  reference.Attributes(reference.Name, "Region name."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"description": schema.StringAttribute{
@@ -298,10 +300,10 @@ func (r *ElasticIPResource) waitUntilReady(
 		if eip == nil {
 			return nil, fmt.Errorf("not found yet: %w", wait.ErrNotReady)
 		}
-		if ipv4 && (eip.IpAddress == nil || *eip.IpAddress == "") {
+		if ipAddress := core.NullableToPtr(eip.IpAddress); ipv4 && (ipAddress == nil || *ipAddress == "") {
 			return nil, fmt.Errorf("no IPv4 assigned yet: %w", wait.ErrNotReady)
 		}
-		if ipv6 && (eip.Ipv6Address == nil || *eip.Ipv6Address == "") {
+		if ipv6Address := core.NullableToPtr(eip.Ipv6Address); ipv6 && (ipv6Address == nil || *ipv6Address == "") {
 			return nil, fmt.Errorf("no IPv6 assigned yet: %w", wait.ErrNotReady)
 		}
 		return eip, nil
@@ -320,11 +322,14 @@ func buildElasticIPUpdateBody(
 ) (networksdk.ElasticIPPartialUpdateSchema, bool) {
 	var body networksdk.ElasticIPPartialUpdateSchema
 
-	if plan.Description.IsNull() || plan.Description.IsUnknown() || plan.Description.Equal(state.Description) {
+	if plan.Description.IsNull() || plan.Description.IsUnknown() {
 		return body, false
 	}
-
-	description := plan.Description.ValueString()
+	// The API trims the description, so compare trimmed values.
+	description := strings.TrimSpace(plan.Description.ValueString())
+	if compare.SameTrimmed(state.Description, description) {
+		return body, false
+	}
 	body.Description = &description
 	return body, true
 }
@@ -360,7 +365,7 @@ func buildElasticIPCreateBody(
 
 	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	if !plan.EnableIPv4.IsNull() && !plan.EnableIPv4.IsUnknown() {

@@ -44,27 +44,32 @@ func (f ElasticIPFilter) matches(eip *networksdk.ElasticIPSchema) bool {
 	if f.ID != nil && eip.Id != *f.ID {
 		return false
 	}
-	if address := finder.Trim(f.IPAddress); address != "" && (eip.IpAddress == nil || *eip.IpAddress != address) {
-		return false
-	}
-	if address := finder.Trim(f.IPv6Address); address != "" {
-		if eip.Ipv6Address == nil {
+	if address := finder.Trim(f.IPAddress); address != "" {
+		if ipAddress := core.NullableToPtr(eip.IpAddress); ipAddress == nil || *ipAddress != address {
 			return false
 		}
-		candidate, _ := NormalizeElasticIPIPv6Address(*eip.Ipv6Address)
+	}
+	if address := finder.Trim(f.IPv6Address); address != "" {
+		ipv6Address := core.NullableToPtr(eip.Ipv6Address)
+		if ipv6Address == nil {
+			return false
+		}
+		candidate, _ := NormalizeElasticIPIPv6Address(*ipv6Address)
 		if candidate != address {
 			return false
 		}
 	}
-	if status := finder.Trim(f.Status); status != "" && (eip.Status == nil || string(*eip.Status) != status) {
-		return false
+	if status := finder.Trim(f.Status); status != "" {
+		if current := core.NullableToPtr(eip.Status); current == nil || string(*current) != status {
+			return false
+		}
 	}
 	if region := finder.Trim(f.Region); region != "" && eip.Region.Name != region {
 		return false
 	}
 	// The response carries no availability field: an Elastic IP is available
 	// exactly while no server holds it.
-	if f.Available != nil && *f.Available == (eip.Server != nil) {
+	if f.Available != nil && *f.Available == (core.NullableToPtr(eip.Server) != nil) {
 		return false
 	}
 	return true
@@ -130,12 +135,12 @@ func (f *ElasticIPFinder) Resolve(ctx context.Context, filter ElasticIPFilter) (
 
 func elasticIPSummary(eip networksdk.ElasticIPSchema) string {
 	address := ""
-	if eip.IpAddress != nil {
-		address = *eip.IpAddress
+	if value := core.NullableToPtr(eip.IpAddress); value != nil {
+		address = *value
 	}
 	ipv6Address := ""
-	if eip.Ipv6Address != nil {
-		ipv6Address = *eip.Ipv6Address
+	if value := core.NullableToPtr(eip.Ipv6Address); value != nil {
+		ipv6Address = *value
 	}
 	return fmt.Sprintf(
 		"id=%s (ip_address=%q, ipv6_address=%q, region=%q)",

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -239,25 +240,24 @@ func preserveConfiguredElasticIPValues(
 	if eip == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == eip.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, eip.Id) {
+		state.ID = config.ID
 	}
-	if !config.IPAddress.IsNull() && !config.IPAddress.IsUnknown() && eip.IpAddress != nil &&
-		strings.TrimSpace(config.IPAddress.ValueString()) == *eip.IpAddress {
+	ipAddress, ipv6Address, status := core.NullableToPtr(eip.IpAddress), core.NullableToPtr(eip.Ipv6Address), core.NullableToPtr(eip.Status)
+	if !config.IPAddress.IsNull() && !config.IPAddress.IsUnknown() && ipAddress != nil &&
+		strings.TrimSpace(config.IPAddress.ValueString()) == *ipAddress {
 		state.IPAddress = config.IPAddress
 	}
-	if !config.IPv6Address.IsNull() && !config.IPv6Address.IsUnknown() && eip.Ipv6Address != nil &&
+	if !config.IPv6Address.IsNull() && !config.IPv6Address.IsUnknown() && ipv6Address != nil &&
 		strings.TrimSpace(config.IPv6Address.ValueString()) != "" {
 		configured, configuredOK := networklookup.NormalizeElasticIPIPv6Address(config.IPv6Address.ValueString())
-		backend, backendOK := networklookup.NormalizeElasticIPIPv6Address(*eip.Ipv6Address)
+		backend, backendOK := networklookup.NormalizeElasticIPIPv6Address(*ipv6Address)
 		if configuredOK && backendOK && configured == backend {
 			state.IPv6Address = config.IPv6Address
 		}
 	}
-	if !config.Status.IsNull() && !config.Status.IsUnknown() && eip.Status != nil &&
-		strings.TrimSpace(config.Status.ValueString()) == string(*eip.Status) {
+	if !config.Status.IsNull() && !config.Status.IsUnknown() && status != nil &&
+		strings.TrimSpace(config.Status.ValueString()) == string(*status) {
 		state.Status = config.Status
 	}
 	if !config.Region.IsNull() && !config.Region.IsUnknown() && strings.TrimSpace(config.Region.ValueString()) == eip.Region.Name {

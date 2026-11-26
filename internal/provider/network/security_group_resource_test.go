@@ -393,6 +393,97 @@ func TestSecurityGroupCreateSendsResolvedRegionAndMapsResponse(t *testing.T) {
 	}
 }
 
+func TestSecurityGroupCreateTrimsNameAndDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	projectID := core.UUID{1}
+	regionID := core.UUID{2}
+	sgID := core.UUID{3}
+	httpClient := &http.Client{Transport: securityGroupResourceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		response := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v2/projects/"+projectID.String()+"/regions/":
+			response.Body = io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"count":1,"next":null,"previous":null,"results":[{"region":{"id":%q,"name":"vn-central","description":""},"services":[]}]}`,
+				regionID.String(),
+			)))
+		case req.Method == http.MethodPost && req.URL.Path == "/v2/network/security-groups/":
+			var body networksdk.SecurityGroupCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if body.Name != "web" || body.Description == nil || *body.Description != "Managed by Terraform" {
+				t.Fatalf("create name=%q description=%v, want trimmed web and Managed by Terraform", body.Name, body.Description)
+			}
+			response.StatusCode = http.StatusCreated
+			response.Body = io.NopCloser(strings.NewReader(securityGroupResponseJSON(sgID, projectID, regionID)))
+		case req.Method == http.MethodGet && req.URL.Path == "/v2/network/security-groups/"+sgID.String()+"/":
+			response.Body = io.NopCloser(strings.NewReader(securityGroupResponseJSON(sgID, projectID, regionID)))
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+		}
+		return response, nil
+	})}
+
+	networkClient, err := networksdk.NewClient("https://network.test", networksdk.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("create network client: %v", err)
+	}
+	projectClient, err := projectsdk.NewClient("https://project.test", projectsdk.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("create project client: %v", err)
+	}
+	resourceUnderTest := &SecurityGroupResource{client: networkClient, project: projectClient, projectID: projectID}
+
+	var schemaResponse resource.SchemaResponse
+	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
+	const paddedName = " web "
+	const paddedDescription = " Managed by Terraform "
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	if diags := plan.Set(context.Background(), &SecurityGroupResourceModel{
+		SecurityGroupModel: SecurityGroupModel{
+			ID:          types.StringUnknown(),
+			Name:        types.StringValue(paddedName),
+			DisplayName: types.StringUnknown(),
+			Description: types.StringValue(paddedDescription),
+			IsDefault:   types.BoolUnknown(),
+			RegionID:    types.StringUnknown(),
+			ProjectID:   types.StringUnknown(),
+			CreatedAt:   types.StringUnknown(),
+			UpdatedAt:   types.StringUnknown(),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
+	}); diags.HasError() {
+		t.Fatalf("set plan: %v", diags)
+	}
+
+	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	resourceUnderTest.Create(context.Background(), resource.CreateRequest{Plan: plan}, &createResponse)
+	if createResponse.Diagnostics.HasError() {
+		t.Fatalf("unexpected create diagnostics: %v", createResponse.Diagnostics)
+	}
+	readResponse := resource.ReadResponse{State: createResponse.State}
+	resourceUnderTest.Read(context.Background(), resource.ReadRequest{State: createResponse.State}, &readResponse)
+	if readResponse.Diagnostics.HasError() {
+		t.Fatalf("unexpected read diagnostics: %v", readResponse.Diagnostics)
+	}
+
+	for step, state := range map[string]tfsdk.State{"create": createResponse.State, "read": readResponse.State} {
+		var model SecurityGroupResourceModel
+		if diags := state.Get(context.Background(), &model); diags.HasError() {
+			t.Fatalf("get state after %s: %v", step, diags)
+		}
+		if model.Name.ValueString() != paddedName || model.Description.ValueString() != paddedDescription {
+			t.Fatalf("state after %s: name=%q description=%q, want configured %q and %q",
+				step, model.Name.ValueString(), model.Description.ValueString(), paddedName, paddedDescription)
+		}
+	}
+}
+
 func TestSecurityGroupReadResponses(t *testing.T) {
 	t.Parallel()
 
@@ -479,6 +570,7 @@ func TestBuildSecurityGroupUpdateBody(t *testing.T) {
 		wantNameSet        bool
 		wantDescription    string
 		wantDescriptionSet bool
+		wantError          bool
 	}{
 		{
 			name:        "renaming sends only the name",
@@ -526,9 +618,28 @@ func TestBuildSecurityGroupUpdateBody(t *testing.T) {
 			state: SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
 		},
 		{
+			name:  "a description differing only by surrounding whitespace is not a change",
+			plan:  SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("  managed  ")},
+			state: SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
+		},
+		{
+			name:               "a changed padded description is sent trimmed",
+			plan:               SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("  updated  ")},
+			state:              SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
+			wantChanged:        true,
+			wantDescription:    "updated",
+			wantDescriptionSet: true,
+		},
+		{
 			name:  "an unchanged security group sends nothing",
 			plan:  SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
 			state: SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
+		},
+		{
+			name:      "a name that is blank after the trim is rejected",
+			plan:      SecurityGroupModel{Name: types.StringValue("   "), Description: types.StringValue("managed")},
+			state:     SecurityGroupModel{Name: types.StringValue("web"), Description: types.StringValue("managed")},
+			wantError: true,
 		},
 	}
 
@@ -536,10 +647,13 @@ func TestBuildSecurityGroupUpdateBody(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			body, changed := buildSecurityGroupUpdateBody(
+			body, changed, diags := buildSecurityGroupUpdateBody(
 				SecurityGroupResourceModel{SecurityGroupModel: tt.plan},
 				SecurityGroupResourceModel{SecurityGroupModel: tt.state},
 			)
+			if diags.HasError() != tt.wantError {
+				t.Fatalf("diags = %v, want error %t", diags, tt.wantError)
+			}
 			if changed != tt.wantChanged {
 				t.Fatalf("changed = %t, want %t", changed, tt.wantChanged)
 			}

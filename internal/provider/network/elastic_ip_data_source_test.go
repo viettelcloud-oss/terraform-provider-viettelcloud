@@ -124,14 +124,15 @@ func TestElasticIPDataSourceReadByID(t *testing.T) {
 		return http.StatusOK, elasticIPDataSourceJSON("Managed by Terraform", "203.0.113.10")
 	})
 
+	configuredID := "  " + elasticIPDataSourceTestUUID.String() + "  "
 	state := readElasticIPDataSource(t, dataSource, ElasticIPDataSourceModel{
-		ElasticIPModel: ElasticIPModel{ID: types.StringValue(elasticIPDataSourceTestUUID.String())},
+		ElasticIPModel: ElasticIPModel{ID: types.StringValue(configuredID)},
 	})
 
 	if len(requests()) != 1 {
 		t.Fatalf("expected a single direct read, got %d requests", len(requests()))
 	}
-	if state.ID.ValueString() != elasticIPDataSourceTestUUID.String() ||
+	if state.ID.ValueString() != configuredID ||
 		state.IPAddress.ValueString() != "203.0.113.10" ||
 		state.Region.ValueString() != "vn-central" ||
 		state.Status.ValueString() != "active" ||

@@ -10,21 +10,23 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	blockstoragesdk "github.com/viettelcloud-oss/sdks/go/blockstorage"
 	"github.com/viettelcloud-oss/sdks/go/core"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
 var (
-	_ resource.Resource                = &VolumeSnapshotResource{}
-	_ resource.ResourceWithImportState = &VolumeSnapshotResource{}
+	_ resource.Resource                   = &VolumeSnapshotResource{}
+	_ resource.ResourceWithImportState    = &VolumeSnapshotResource{}
+	_ resource.ResourceWithValidateConfig = &VolumeSnapshotResource{}
 )
 
 const (
@@ -56,7 +58,7 @@ func (r *VolumeSnapshotResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Required:      true,
 				Description:   "Source volume. Changing it replaces the snapshot.",
 				Attributes:    reference.Attributes(reference.ID, "Volume ID (UUID)."),
-				PlanModifiers: []planmodifier.Object{objectplanmodifier.RequiresReplace()},
+				PlanModifiers: []planmodifier.Object{replace.Reference(reference.ID, compare.SameUUIDString)},
 			},
 			"volume_name": schema.StringAttribute{Computed: true, Description: "Name of the source volume."},
 			"size":        schema.Int64Attribute{Computed: true, Description: "Snapshot size in GiB."},
@@ -83,6 +85,18 @@ func (r *VolumeSnapshotResource) Configure(_ context.Context, req resource.Confi
 	r.client, r.projectID = data.BlockStorage, data.ProjectID
 }
 
+func (r *VolumeSnapshotResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config VolumeSnapshotResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if volumeID := reference.Get(config.Volume, reference.ID); !volumeID.IsNull() && !volumeID.IsUnknown() {
+		_, diags := parse.UUIDString(volumeID, "volume.id")
+		resp.Diagnostics.Append(diags...)
+	}
+}
+
 func (r *VolumeSnapshotResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan VolumeSnapshotResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -100,7 +114,7 @@ func (r *VolumeSnapshotResource) Create(ctx context.Context, req resource.Create
 	}
 	body := blockstoragesdk.VolumeSnapshotCreateSchema{Name: strings.TrimSpace(plan.Name.ValueString()), VolumeId: volumeID}
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		value := plan.Description.ValueString()
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	created, err := r.client.CreateVolumeSnapshot(ctx, blockstoragesdk.CreateVolumeSnapshotParams{ProjectID: r.projectID}, body)
@@ -216,7 +230,7 @@ func (r *VolumeSnapshotResource) Delete(ctx context.Context, req resource.Delete
 }
 
 func (r *VolumeSnapshotResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	id, err := core.ParseUUID(strings.TrimSpace(req.ID))
+	id, err := parse.UUID(req.ID)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid volume snapshot import ID", err.Error())
 		return
@@ -269,18 +283,19 @@ func buildVolumeSnapshotPatch(plan, state VolumeSnapshotModel) blockstoragesdk.V
 		value := strings.TrimSpace(plan.Name.ValueString())
 		body.Name = &value
 	}
-	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !plan.Description.Equal(state.Description) {
-		value := plan.Description.ValueString()
+	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !compare.SameTrimmed(state.Description, plan.Description.ValueString()) {
+		value := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &value
 	}
 	return body
 }
 
 func volumeSnapshotStatus(snapshot *blockstoragesdk.VolumeSnapshotSchema) blockstoragesdk.SnapshotStatus {
-	if snapshot.Status == nil {
+	status := core.NullableToPtr(snapshot.Status)
+	if status == nil {
 		return ""
 	}
-	return *snapshot.Status
+	return *status
 }
 
 func volumeSnapshotPatchApplied(snapshot *blockstoragesdk.VolumeSnapshotSchema, patch *blockstoragesdk.VolumeSnapshotPartialUpdateSchema) bool {
@@ -290,5 +305,5 @@ func volumeSnapshotPatchApplied(snapshot *blockstoragesdk.VolumeSnapshotSchema, 
 	if patch.Name != nil && snapshot.Name != *patch.Name {
 		return false
 	}
-	return patch.Description == nil || snapshot.Description != nil && *snapshot.Description == *patch.Description
+	return patch.Description == nil || snapshot.Description != nil && strings.TrimSpace(*snapshot.Description) == strings.TrimSpace(*patch.Description)
 }

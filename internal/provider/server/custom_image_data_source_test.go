@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
@@ -19,7 +20,7 @@ func TestCustomImageDataSourceSchemaConfigureRead(t *testing.T) {
 	for _, byID := range []bool{true, false} {
 		t.Run(map[bool]string{true: "id", false: "filters"}[byID], func(t *testing.T) {
 			image := customImageFixture()
-			image.Owner = &serversdk.NestedUserSchema{Id: image.Id, Username: "image-owner"}
+			image.Owner = core.NullableFromPtr(&serversdk.NestedUserSchema{Id: image.Id, Username: "image-owner"})
 			client := customImageClient(t, func(w http.ResponseWriter, req *http.Request) {
 				if req.Header.Get("Project-ID") != placementGroupProjectID.String() {
 					t.Error("wrong project")
@@ -30,7 +31,8 @@ func TestCustomImageDataSourceSchemaConfigureRead(t *testing.T) {
 					}
 					writeCustomImageResponse(t, w, image)
 				} else {
-					if req.URL.Query().Get("name") != "image-a" || req.URL.Query().Get("region") != "region-a" {
+					query := req.URL.Query()
+					if query.Get("name") != "image-a" || query.Get("region") != "region-a" || query.Get("state") != "enabled" || query.Get("status") != "active" {
 						t.Error(req.URL.String())
 					}
 					_ = json.NewEncoder(w).Encode(serversdk.PagedCustomImageSchema{Count: 1, Results: []serversdk.CustomImageSchema{*image}})
@@ -58,10 +60,12 @@ func TestCustomImageDataSourceSchemaConfigureRead(t *testing.T) {
 			}
 			model := CustomImageDataSourceModel{SharedProjectIDs: types.SetNull(types.StringType)}
 			if byID {
-				model.ID = types.StringValue(image.Id.String())
+				model.ID = types.StringValue("  " + image.Id.String() + " ")
 			} else {
 				model.Name = types.StringValue(" image-a ")
 				model.Region = types.StringValue(" region-a ")
+				model.State = types.StringValue(" enabled ")
+				model.Status = types.StringValue(" active\n")
 			}
 			config := tfsdk.Config{Schema: schemaResponse.Schema}
 			state := tfsdk.State{Schema: schemaResponse.Schema}
@@ -76,10 +80,17 @@ func TestCustomImageDataSourceSchemaConfigureRead(t *testing.T) {
 			}
 			var got CustomImageDataSourceModel
 			_ = response.State.Get(context.Background(), &got)
-			if got.Project.ValueString() != image.Project.Name || got.OwnerID.ValueString() != image.Owner.Id.String() || got.Owner.ValueString() != image.Owner.Username {
+			if got.Project.ValueString() != image.Project.Name || got.OwnerID.ValueString() != image.Owner.MustGet().Id.String() || got.Owner.ValueString() != image.Owner.MustGet().Username {
 				t.Fatalf("ownership outputs differ from the API: %#v", got)
 			}
-			if got.ID.ValueString() != image.Id.String() || got.Status.ValueString() != "active" || (!byID && (got.Name.ValueString() != " image-a " || got.Region.ValueString() != " region-a ")) {
+			if byID && got.ID.ValueString() != "  "+image.Id.String()+" " {
+				t.Fatalf("id %q, want the configured spelling", got.ID.ValueString())
+			}
+			if !byID && (got.ID.ValueString() != image.Id.String() || got.Status.ValueString() != " active\n" || got.State.ValueString() != " enabled " ||
+				got.Name.ValueString() != " image-a " || got.Region.ValueString() != " region-a ") {
+				t.Fatal(got)
+			}
+			if byID && got.Status.ValueString() != "active" {
 				t.Fatal(got)
 			}
 		})

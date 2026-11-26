@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/viettelcloud-oss/sdks/go/core"
@@ -66,7 +67,7 @@ func (r *VPCResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"cidr": schema.StringAttribute{
 				Required: true,
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					replace.String(compare.SameTrimmedString),
 				},
 				Description: "IPv4 network CIDR, e.g. 10.0.0.0/16.",
 			},
@@ -75,7 +76,7 @@ func (r *VPCResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Description: "Project region where the VPC is created.",
 				Attributes:  reference.Attributes(reference.Name, "Region name."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"display_name": schema.StringAttribute{
@@ -238,11 +239,11 @@ func buildVPCCreateBody(
 	}
 
 	body.Name = strings.TrimSpace(plan.Name.ValueString())
-	body.Cidr = plan.CIDR.ValueString()
+	body.Cidr = strings.TrimSpace(plan.CIDR.ValueString())
 	body.RegionId = regionID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
-		body.Description = &description
+		description := strings.TrimSpace(plan.Description.ValueString())
+		body.Description.Set(description)
 	}
 	return body, diags
 }
@@ -250,8 +251,8 @@ func buildVPCCreateBody(
 func buildVPCUpdateBody(plan VPCResourceModel) networksdk.VPCUpdateSchema {
 	body := networksdk.VPCUpdateSchema{Name: strings.TrimSpace(plan.Name.ValueString())}
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
-		body.Description = &description
+		description := strings.TrimSpace(plan.Description.ValueString())
+		body.Description.Set(description)
 	}
 	return body
 }

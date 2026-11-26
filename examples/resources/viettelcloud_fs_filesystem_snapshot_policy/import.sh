@@ -1,0 +1,1 @@
+terraform import viettelcloud_fs_filesystem_snapshot_policy.nightly 00000000-0000-0000-0000-000000000001

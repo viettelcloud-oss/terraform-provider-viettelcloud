@@ -37,6 +37,50 @@
 #   run "importVolume_selectorCreatedVolume_backendFieldsReturned" {
 #   run "changeSelectorsToCriteria_namedSelectorImportOwner_updatedWithoutRetypeOrReplace" {
 
+# Chain snapshot policy (state_key "snapshot-policy"): one volume and two disabled
+# policies. The volume gets a policy, switches it, loses it, and ends with a policy
+# attached so teardown deletes a volume that still has one.
+#   run "createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy" {
+#   run "attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace" {
+#   run "planAgain_attachedSnapshotPolicy_stateStable" {
+#   run "changeSnapshotPolicy_volumeWithPolicy_policySwitchedInPlace" {
+#   run "removeSnapshotPolicy_volumeWithPolicy_policyDetachedInPlace" {
+#   run "attachSnapshotPolicy_detachedVolume_policyAttachedForTeardown" {
+# Chain snapshot policy import (state_key "snapshot-policy-import-source" ->
+# "snapshot-policy-import"; plan-only import).
+#   run "createVolumeWithPolicies_importChainFixture_volumeCreated" {
+#   run "attachSnapshotPolicy_importChainVolume_policyAttachedInPlace" {
+#   run "importVolume_policyAttachedVolume_snapshotPolicyReturned" {
+# The create and replace rejection (AC30), a policy from another region (AC34),
+# drift outside Terraform (AC35 to AC37), and a destroy that snapshots block
+# (AC40) are N/A here. They are provider diagnostics or API refusals that unit
+# tests cover.
+# Chain backup policy (state_key "backup-policy"; plan-only import
+# "backup-policy-import"; applied import "backup-policy-unmanaged").
+# Two backup policies and one volume that moves between them. The volume is
+# created without a policy, because backup_policy is rejected at creation. The
+# chain ends after it destroys a volume that has a policy attached, and it reads
+# both policies again. The state "backup-policy-unmanaged" imports the volume.
+# It first attaches the second policy outside the chain state, and later it
+# removes the policy that its configuration does not declare. No run of this
+# chain has parallel = true. The three states change the same volume, so the
+# runs must keep file order, also where a run does not reference the run before
+# it, such as the refresh-only run after the second-state attach.
+#   run "createVolume_noBackupPolicy_volumeCreatedWithoutPolicy" {
+#   run "attachBackupPolicy_existingVolume_policyAttachedInPlace" {
+#   run "planAgain_attachedBackupPolicy_stateStable" {
+#   run "importVolume_attachedBackupPolicy_policyReturned" {
+#   run "changeBackupPolicy_existingVolume_secondPolicyAttachedInPlace" {
+#   run "detachBackupPolicy_attachedVolume_policyRemovedInPlace" {
+#   run "attachBackupPolicy_detachedVolume_policyAttachedAgain" {
+#   run "attachOtherBackupPolicy_importedVolume_secondPolicyAttachedOutsideState" {
+#   run "refreshOnly_otherPolicyAttachedOutsideState_driftShown" {
+#   run "attachConfiguredBackupPolicy_driftedVolume_firstPolicyRestoredInPlace" {
+#   run "removeUnmanagedBackupPolicy_importedVolumeWithoutPolicyConfig_policyDetached" {
+#   run "reattachBackupPolicy_policyRemovedOutsideState_policyAttachedAgain" {
+#   run "destroyVolume_policyAttached_volumeDeletedPoliciesKept" {
+#   run "planAgain_volumeDestroyed_policiesExistWithoutVolumes" {
+
 provider "viettelcloud" {
   endpoint   = var.api_endpoint
   token      = var.token
@@ -89,7 +133,16 @@ variable "volume_iops" {
 variable "alternate_volume_type" {
   description = "Criteria of a second ready volume type for retyping, without encryption or multiple attachments."
   type        = object({ name = optional(string), disk_type = optional(string), speed = optional(string), multiattach = optional(bool), encryption_key_size = optional(string) })
-  default     = { name = "hdd_io1", encryption_key_size = "0", multiattach = false }
+  default     = { name = "ssd_st1", encryption_key_size = "0", multiattach = false }
+}
+
+# The backup policy chain creates its policies in this region. It must be the
+# region that contains var.zone, because the API attaches a policy only to a
+# volume of the same region.
+variable "backup_policy_region" {
+  description = "Region that contains the test zone, for the backup policies of the policy chain."
+  type        = string
+  default     = "vn-central-1"
 }
 
 variables {
@@ -1445,5 +1498,491 @@ run "changeSelectorsToCriteria_namedSelectorImportOwner_updatedWithoutRetypeOrRe
       viettelcloud_volume.volume["selected"].create_from.volume_type == merge(var.selector_volume_type, { id = run.changeSelectorsToNames_selectorImportOwner_identityPreserved.volumes["selected"].source_volume_type.id })
     )
     error_message = "Alternate criteria changed the import owner or its catalog identities."
+  }
+}
+
+# Region of the test zone, where the snapshot policy chains create their policies.
+variable "snapshot_policy_region" {
+  description = "Region of the test zone. The snapshot policies are created there."
+  type        = string
+  default     = "vn-central-1"
+}
+
+# The policies are disabled, which keeps the volume free of snapshots. The run
+# attaches no policy because a plan that creates the volume rejects snapshot_policy.
+run "createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = null
+  }
+  assert {
+    condition     = viettelcloud_volume.volume.snapshot_policy == null && length(viettelcloud_volume_snapshot_policy.policy) == 2 && viettelcloud_volume.volume.status == "available"
+    error_message = "The volume must start without a snapshot policy."
+  }
+}
+
+# AC31: adding the attribute updates the volume in place.
+run "attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume.id == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume.created_at == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.volume.created_at &&
+      viettelcloud_volume.volume.snapshot_policy.id == viettelcloud_volume_snapshot_policy.policy["first"].id
+    )
+    error_message = "Attaching a snapshot policy replaced the volume or attached another policy."
+  }
+}
+
+run "planAgain_attachedSnapshotPolicy_stateStable" {
+  command   = plan
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume.id == run.attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace.volume.id &&
+      viettelcloud_volume.volume.status == run.attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace.volume.status &&
+      viettelcloud_volume.volume.snapshot_policy == run.attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace.volume.snapshot_policy &&
+      viettelcloud_volume.volume.created_at == run.attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace.volume.created_at
+    )
+    error_message = "Re-planning the attached volume proposed a change."
+  }
+}
+
+# AC32: another policy of the same region replaces the first one in place.
+run "changeSnapshotPolicy_volumeWithPolicy_policySwitchedInPlace" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = "second"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume.id == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume.snapshot_policy.id == viettelcloud_volume_snapshot_policy.policy["second"].id &&
+      viettelcloud_volume.volume.snapshot_policy.id != run.attachSnapshotPolicy_volumeWithoutPolicy_policyAttachedInPlace.volume.snapshot_policy.id
+    )
+    error_message = "Switching the snapshot policy replaced the volume or kept the first policy."
+  }
+}
+
+# AC33: removing the attribute detaches the policy. The volume and both
+# policies stay.
+run "removeSnapshotPolicy_volumeWithPolicy_policyDetachedInPlace" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = null
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume.id == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume.snapshot_policy == null &&
+      viettelcloud_volume_snapshot_policy.policy["first"].id == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.policy_ids["first"] &&
+      viettelcloud_volume_snapshot_policy.policy["second"].id == run.createVolumeWithPolicies_noPolicyAttached_volumeCreatedWithoutPolicy.policy_ids["second"]
+    )
+    error_message = "Removing snapshot_policy must detach the policy and keep the volume and both policies."
+  }
+}
+
+# AC39: teardown deletes a volume that still has a policy. The policy is
+# disabled, so the volume has no snapshot that blocks the delete.
+run "attachSnapshotPolicy_detachedVolume_policyAttachedForTeardown" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = "first"
+  }
+  assert {
+    condition     = viettelcloud_volume.volume.snapshot_policy.id == viettelcloud_volume_snapshot_policy.policy["first"].id
+    error_message = "The volume must end the chain with a snapshot policy attached."
+  }
+}
+
+# Chain snapshot policy import. State key "snapshot-policy-import-source" owns
+# the volume and its cleanup, and run
+# "importVolume_policyAttachedVolume_snapshotPolicyReturned" only plans.
+run "createVolumeWithPolicies_importChainFixture_volumeCreated" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy-import-source"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy-import"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = null
+  }
+  assert {
+    condition     = viettelcloud_volume.volume.snapshot_policy == null
+    error_message = "The import source volume must start without a snapshot policy."
+  }
+}
+
+run "attachSnapshotPolicy_importChainVolume_policyAttachedInPlace" {
+  command   = apply
+  parallel  = true
+  state_key = "snapshot-policy-import-source"
+  module { source = "./fixtures/volume/snapshot_policy" }
+  variables {
+    name     = "tf-test-volume-snapshot-policy-import"
+    size     = 30
+    region   = var.snapshot_policy_region
+    attached = "first"
+  }
+  assert {
+    condition     = viettelcloud_volume.volume.id == run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume_id && viettelcloud_volume.volume.snapshot_policy.id == viettelcloud_volume_snapshot_policy.policy["first"].id
+    error_message = "The import source volume must hold the first policy."
+  }
+}
+
+# AC38: the import refresh fills snapshot_policy from the volume. The planned
+# snapshot_policy comes from configuration, so status and volume_type prove the
+# refresh: a planned change to snapshot_policy would leave both unknown.
+run "importVolume_policyAttachedVolume_snapshotPolicyReturned" {
+  command   = plan
+  parallel  = true
+  state_key = "snapshot-policy-import"
+  module { source = "./fixtures/volume/snapshot_policy_import" }
+  variables {
+    volume_id          = run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume_id
+    volume_name        = run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume.name
+    volume_size        = run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume.size
+    volume_type        = { name = run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume.volume_type }
+    snapshot_policy_id = run.attachSnapshotPolicy_importChainVolume_policyAttachedInPlace.volume.snapshot_policy.id
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.imported.id == run.createVolumeWithPolicies_importChainFixture_volumeCreated.volume_id &&
+      viettelcloud_volume.imported.snapshot_policy.id == run.attachSnapshotPolicy_importChainVolume_policyAttachedInPlace.volume.snapshot_policy.id &&
+      viettelcloud_volume.imported.status == run.attachSnapshotPolicy_importChainVolume_policyAttachedInPlace.volume.status &&
+      viettelcloud_volume.imported.volume_type == run.attachSnapshotPolicy_importChainVolume_policyAttachedInPlace.volume.volume_type
+    )
+    error_message = "Import did not return the snapshot policy that the volume has, or it planned a change."
+  }
+}
+
+# AC31 setup. The volume starts without a policy, as backup_policy is rejected
+# while a volume is created.
+run "createVolume_noBackupPolicy_volumeCreatedWithoutPolicy" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+  }
+  assert {
+    condition     = viettelcloud_volume.volume[0].backup_policy == null && length(output.policy_ids) == 2
+    error_message = "A new volume must have no backup policy while both policies exist."
+  }
+}
+
+# AC31. Adding backup_policy to an existing volume attaches the policy in place.
+run "attachBackupPolicy_existingVolume_policyAttachedInPlace" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].created_at == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume.created_at &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"]
+    )
+    error_message = "Attaching a backup policy replaced the volume or attached the wrong policy."
+  }
+}
+
+run "planAgain_attachedBackupPolicy_stateStable" {
+  command   = plan
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition     = output.volume == run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume
+    error_message = "Re-planning with the policy attached proposed a change to the volume."
+  }
+}
+
+# AC38. The import configuration declares the attached policy. A plan that keeps
+# created_at known proves that the refresh returned backup_policy and that the
+# import plans no change.
+run "importVolume_attachedBackupPolicy_policyReturned" {
+  command   = plan
+  state_key = "backup-policy-import"
+  module { source = "./fixtures/volume/backup_policy_import" }
+  variables {
+    volume_id        = run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume_id
+    volume_name      = run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume.name
+    volume_size      = run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume.size
+    volume_type_name = run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume.volume_type
+    policy_id        = run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"]
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.imported.id == run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume_id &&
+      viettelcloud_volume.imported.backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"] &&
+      viettelcloud_volume.imported.created_at == run.attachBackupPolicy_existingVolume_policyAttachedInPlace.volume.created_at
+    )
+    error_message = "Import did not return the attached backup policy, or it planned a change."
+  }
+}
+
+# AC32. Pointing backup_policy at the second policy changes the attachment in
+# place.
+run "changeBackupPolicy_existingVolume_secondPolicyAttachedInPlace" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "second"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["second"]
+    )
+    error_message = "Changing backup_policy replaced the volume or kept the first policy."
+  }
+}
+
+# AC33. Removing backup_policy detaches the policy. Both policies stay.
+run "detachBackupPolicy_attachedVolume_policyRemovedInPlace" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].backup_policy == null &&
+      output.policy_ids == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids
+    )
+    error_message = "Detaching the backup policy replaced the volume or removed a policy."
+  }
+}
+
+# AC31. Attaches the first policy again, so the next runs act on a volume that
+# has a policy.
+run "attachBackupPolicy_detachedVolume_policyAttachedAgain" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"]
+    )
+    error_message = "Attaching the policy again did not restore the attachment."
+  }
+}
+
+# AC36 setup. The state "backup-policy-unmanaged" imports the volume and
+# attaches the second policy, while the state "backup-policy" still holds the
+# first policy.
+run "attachOtherBackupPolicy_importedVolume_secondPolicyAttachedOutsideState" {
+  command   = apply
+  state_key = "backup-policy-unmanaged"
+  module { source = "./fixtures/volume/backup_policy_unmanaged" }
+  variables {
+    volume_id        = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume_id
+    volume_name      = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.name
+    volume_size      = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.size
+    volume_type_name = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.volume_type
+    backup_policy_id = run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["second"]
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.imported.id == run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume_id &&
+      viettelcloud_volume.imported.created_at == run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.created_at &&
+      viettelcloud_volume.imported.backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["second"]
+    )
+    error_message = "The second state did not attach the second policy, or it replaced the volume."
+  }
+}
+
+# AC36. A refresh of the state "backup-policy" shows the second policy that
+# the state "backup-policy-unmanaged" attached.
+run "refreshOnly_otherPolicyAttachedOutsideState_driftShown" {
+  command   = plan
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  plan_options {
+    mode = refresh-only
+  }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["second"]
+    )
+    error_message = "The refresh did not show the policy that was attached outside this state."
+  }
+}
+
+# AC36. The apply moves the volume back to the first policy, the one in the
+# configuration, in place. State after the apply comes from the API response.
+run "attachConfiguredBackupPolicy_driftedVolume_firstPolicyRestoredInPlace" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].created_at == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume.created_at &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"]
+    )
+    error_message = "The apply did not attach the configured policy again, or it replaced the volume."
+  }
+}
+
+# AC37. The configuration of this state has no backup_policy, while the volume
+# has the first policy that this state does not declare. The apply removes it.
+run "removeUnmanagedBackupPolicy_importedVolumeWithoutPolicyConfig_policyDetached" {
+  command   = apply
+  state_key = "backup-policy-unmanaged"
+  module { source = "./fixtures/volume/backup_policy_unmanaged" }
+  variables {
+    volume_id        = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume_id
+    volume_name      = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.name
+    volume_size      = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.size
+    volume_type_name = run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.volume_type
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.imported.id == run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume_id &&
+      viettelcloud_volume.imported.created_at == run.attachBackupPolicy_detachedVolume_policyAttachedAgain.volume.created_at &&
+      viettelcloud_volume.imported.backup_policy == null
+    )
+    error_message = "The apply did not remove the policy that the configuration does not declare, or it replaced the volume."
+  }
+}
+
+# AC35. The policy was removed outside this state. The refresh shows the drift,
+# and the apply attaches the policy again, so the volume has a policy before it
+# is destroyed.
+run "reattachBackupPolicy_policyRemovedOutsideState_policyAttachedAgain" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region      = var.backup_policy_region
+    volume_name = "tf-test-volume-backup-policy"
+    attached    = "first"
+  }
+  assert {
+    condition = (
+      viettelcloud_volume.volume[0].id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.volume_id &&
+      viettelcloud_volume.volume[0].backup_policy.id == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids["first"]
+    )
+    error_message = "The refresh did not show the removed policy, or the apply did not attach it again."
+  }
+}
+
+# AC39. Destroys the volume while the first policy is attached. Both policies
+# stay in state. The next run reads them again.
+run "destroyVolume_policyAttached_volumeDeletedPoliciesKept" {
+  command   = apply
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region        = var.backup_policy_region
+    volume_name   = "tf-test-volume-backup-policy"
+    attached      = "first"
+    create_volume = false
+  }
+  assert {
+    condition = (
+      output.volume_id == null &&
+      output.policy_ids == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids
+    )
+    error_message = "The volume still exists after the destroy, or a policy changed."
+  }
+}
+
+# AC39. A new plan reads each policy from the API: both exist and no volume uses
+# them. The chain teardown then deletes the policies.
+run "planAgain_volumeDestroyed_policiesExistWithoutVolumes" {
+  command   = plan
+  state_key = "backup-policy"
+  module { source = "./fixtures/volume/backup_policy" }
+  variables {
+    region        = var.backup_policy_region
+    volume_name   = "tf-test-volume-backup-policy"
+    attached      = "first"
+    create_volume = false
+  }
+  assert {
+    condition = (
+      output.policy_ids == run.createVolume_noBackupPolicy_volumeCreatedWithoutPolicy.policy_ids &&
+      output.policy_volume_counts["first"] == 0 &&
+      output.policy_volume_counts["second"] == 0
+    )
+    error_message = "A policy is gone after the volume destroy, or it still counts a volume."
   }
 }

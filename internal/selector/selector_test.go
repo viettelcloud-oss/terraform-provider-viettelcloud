@@ -240,3 +240,21 @@ func TestRefresh(t *testing.T) {
 		t.Fatalf("drift hidden: %v %v", decision, diags)
 	}
 }
+
+func TestRefreshCriterionNamesReportedEntryByCriterion(t *testing.T) {
+	t.Parallel()
+	attributeTypes := map[string]attr.Type{"version": types.StringType, "id": types.StringType}
+	id, other := core.UUID{1}, core.UUID{2}
+	prior := types.ObjectValueMust(attributeTypes, map[string]attr.Value{"version": types.StringValue(" 16 "), "id": types.StringValue(id.String())})
+	kept, diags := RefreshCriterion(prior, attributeTypes, &id, "version", "16.4")
+	if diags.HasError() || !kept.Equal(prior) {
+		t.Fatalf("same ID must keep the configured criterion: %v %v", kept, diags)
+	}
+	want := types.ObjectValueMust(attributeTypes, map[string]attr.Value{"version": types.StringValue("16.4"), "id": types.StringValue(other.String())})
+	for name, prior := range map[string]types.Object{"import": types.ObjectNull(attributeTypes), "outside change": prior} {
+		got, diags := RefreshCriterion(prior, attributeTypes, &other, "version", "16.4")
+		if diags.HasError() || !got.Equal(want) {
+			t.Fatalf("%s: got %v diagnostics %v want %v", name, got, diags, want)
+		}
+	}
+}

@@ -37,8 +37,8 @@ func TestVolumeSnapshotFinderExactFiltersAndCardinality(t *testing.T) {
 	name, zone := " snapshot ", " zone-a "
 	status := blockstoragesdk.SnapshotStatusAvailable
 	lister := &fakeVolumeSnapshotLister{values: []blockstoragesdk.VolumeSnapshotSchema{
-		{Id: targetID, Name: "snapshot", Volume: blockstoragesdk.NestedVolumeSchema{Id: volumeID}, Zone: blockstoragesdk.NestedZoneSchema{Name: "zone-a"}, Status: &status},
-		{Id: core.UUID{4}, Name: "snapshot", Volume: blockstoragesdk.NestedVolumeSchema{Id: core.UUID{2}}, Zone: blockstoragesdk.NestedZoneSchema{Name: "zone-a"}, Status: &status},
+		{Id: targetID, Name: "snapshot", Volume: blockstoragesdk.NestedVolumeSchema{Id: volumeID}, Zone: blockstoragesdk.NestedZoneSchema{Name: "zone-a"}, Status: core.NullableFromPtr(&status)},
+		{Id: core.UUID{4}, Name: "snapshot", Volume: blockstoragesdk.NestedVolumeSchema{Id: core.UUID{2}}, Zone: blockstoragesdk.NestedZoneSchema{Name: "zone-a"}, Status: core.NullableFromPtr(&status)},
 	}}
 	finder := NewVolumeSnapshotFinder(lister, projectID)
 	got, err := finder.Resolve(context.Background(), VolumeSnapshotFilter{ID: &targetID, Name: &name, VolumeID: &volumeID, Zone: &zone, Status: &status})

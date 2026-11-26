@@ -31,6 +31,7 @@ import (
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	blockstoragelookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage/lookup"
 	networklookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/network/lookup"
@@ -38,6 +39,7 @@ import (
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/wait"
 )
 
@@ -47,6 +49,9 @@ const (
 	// transientBackendErrorCode identifies a backend refusal that may succeed
 	// when retried after the upstream service recovers.
 	transientBackendErrorCode = "provider_error"
+	// resourceBusyErrorCode identifies a refusal because another operation
+	// holds the resource. It clears when that operation finishes.
+	resourceBusyErrorCode = "resource_busy"
 )
 
 // elasticIPAttachTimeout bounds retries after a server-side attach refusal.
@@ -234,7 +239,7 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Attributes: map[string]schema.Attribute{
 					"boot_type": schema.StringAttribute{
 						Required: true, Description: "Boot source type.",
-						PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+						PlanModifiers: []planmodifier.String{replace.String(compare.SameTrimmedString)},
 					},
 					"image": imageSelector,
 					"custom_image": schema.SingleNestedAttribute{
@@ -246,7 +251,7 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 						Optional:      true,
 						Description:   "Existing boot volume. Required for the volume boot type.",
 						Attributes:    reference.Attributes(reference.ID, "Volume ID (UUID)."),
-						PlanModifiers: []planmodifier.Object{objectplanmodifier.RequiresReplace()},
+						PlanModifiers: []planmodifier.Object{replace.Reference(reference.ID, compare.SameUUIDString)},
 					},
 					"volume_type": bootVolumeType,
 					"volume_size": schema.Int64Attribute{
@@ -289,7 +294,7 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Description: "Project zone that hosts the server.",
 				Attributes:  reference.PreservedAttributes(reference.Name, "Exact zone name."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplaceIfConfigured(),
+					replace.ReferenceIfConfigured(reference.Name, compare.SameTrimmedString),
 				},
 			},
 			"key_pair": schema.SingleNestedAttribute{
@@ -299,7 +304,7 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Attributes:  reference.PreservedAttributes(reference.ID, "Key pair ID (UUID)."),
 				PlanModifiers: []planmodifier.Object{
 					objectplanmodifier.UseStateForUnknown(),
-					objectplanmodifier.RequiresReplaceIfConfigured(),
+					replace.ReferenceIfConfigured(reference.ID, compare.SameUUIDString),
 				},
 			},
 			"key_pair_name": schema.StringAttribute{
@@ -316,7 +321,7 @@ func (r *ServerResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Attributes:  reference.PreservedAttributes(reference.ID, "Placement group ID (UUID)."),
 				PlanModifiers: []planmodifier.Object{
 					objectplanmodifier.UseStateForUnknown(),
-					objectplanmodifier.RequiresReplaceIfConfigured(),
+					replace.ReferenceIfConfigured(reference.ID, compare.SameUUIDString),
 				},
 			},
 			"placement_group_name": schema.StringAttribute{
@@ -516,6 +521,10 @@ func (r *ServerResource) ValidateConfig(ctx context.Context, req resource.Valida
 		"placement_group.id",
 		&resp.Diagnostics,
 	)
+	seen := make(map[string]int)
+	for i, id := range reference.Strings(config.SecurityGroups, reference.ID) {
+		rejectDuplicateID(id, path.Root("security_groups"), "security_groups", i, seen, &resp.Diagnostics)
+	}
 }
 
 // ModifyPlan removes computed-only updates after the attribute modifiers have
@@ -629,6 +638,9 @@ func (r *ServerResource) Create(ctx context.Context, req resource.CreateRequest,
 	if attached != nil {
 		server = attached
 	}
+	// The pending state cleared power_state. Restore the configured value so
+	// the refresh keeps its spelling when only outer whitespace differs.
+	plan.PowerState = desiredPowerState
 	resp.Diagnostics.Append(r.refreshServerResourceState(ctx, server, &plan)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -708,7 +720,7 @@ func (r *ServerResource) Update(ctx context.Context, req resource.UpdateRequest,
 		imageFinder := serverlookup.NewImageFinder(r.client, r.projectID)
 		rebuildBody, expectedImageID, bootDiags = buildServerRebuildBody(ctx, plan.Boot, r.projectID, imageFinder.Resolve)
 		resp.Diagnostics.Append(bootDiags...)
-		if !resp.Diagnostics.HasError() && rebuildBody.ImageId != nil {
+		if !resp.Diagnostics.HasError() && rebuildBody.ImageId.IsSpecified() {
 			var boot BootInputModel
 			resp.Diagnostics.Append(plan.Boot.As(ctx, &boot, basetypes.ObjectAsOptions{})...)
 			var prior BootInputModel
@@ -912,7 +924,8 @@ func (r *ServerResource) waitUntilNotPending(ctx context.Context, id core.UUID) 
 
 func (r *ServerResource) waitUntilBandwidth(ctx context.Context, id core.UUID, expected int) error {
 	return r.waitForServer(ctx, id, "bandwidth update", func(server *serversdk.ServerDetailSchema) (bool, error) {
-		return server.Bandwidth != nil && *server.Bandwidth == expected && !serverIsBusy(server), nil
+		bandwidth := core.NullableToPtr(server.Bandwidth)
+		return bandwidth != nil && *bandwidth == expected && !serverIsBusy(server), nil
 	})
 }
 
@@ -1102,7 +1115,7 @@ func (r *ServerResource) planSelectors(ctx context.Context, req resource.ModifyP
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		if planned.BootType.Equal(prior.BootType) {
+		if compare.SameTrimmedString(planned.BootType, prior.BootType) {
 			switch normalizedString(planned.BootType) {
 			case "image", "local_disk":
 				decide(planned.Image, prior.Image, path.Root("boot").AtName("image"), true, -1)
@@ -1154,8 +1167,8 @@ func (r *ServerResource) currentSelectorID(ctx context.Context, state ServerReso
 	if server == nil {
 		return core.UUID{}, fmt.Errorf("server response is empty")
 	}
-	if kind == "image" && server.Image != nil {
-		return server.Image.Id, nil
+	if image := core.NullableToPtr(server.Image); kind == "image" && image != nil {
+		return image.Id, nil
 	}
 	volumeID, found := serverRootVolumeID(server)
 	if index >= 0 {
@@ -1174,7 +1187,7 @@ func (r *ServerResource) currentSelectorID(ctx context.Context, state ServerReso
 		if index >= len(ids) {
 			return core.UUID{}, fmt.Errorf("data volume %d is missing", index)
 		}
-		volumeID, err = core.ParseUUID(ids[index])
+		volumeID, err = parse.UUID(ids[index])
 		found = err == nil
 	}
 	if !found {
@@ -1185,11 +1198,11 @@ func (r *ServerResource) currentSelectorID(ctx context.Context, state ServerReso
 		return core.UUID{}, err
 	}
 	if volume != nil {
-		if kind == "image" && volume.CreateFrom.Image != nil {
-			return volume.CreateFrom.Image.Id, nil
+		if image := core.NullableToPtr(volume.CreateFrom.Image); kind == "image" && image != nil {
+			return image.Id, nil
 		}
-		if kind == "volume_type" && volume.CreateFrom.VolumeType != nil {
-			return volume.CreateFrom.VolumeType.Id, nil
+		if volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); kind == "volume_type" && volumeType != nil {
+			return volumeType.Id, nil
 		}
 	}
 	return core.UUID{}, fmt.Errorf("server volume %s: %w", kind, selector.ErrNoIdentity)
@@ -1211,8 +1224,7 @@ func (r *ServerResource) refreshServerDataVolumeState(ctx context.Context, serve
 		}
 	}
 	matches, used := matchAttachmentIDs(len(configured), len(attachments), func(i, j int) bool {
-		id, err := core.ParseUUID(configured[i].ID.ValueString())
-		return err == nil && id == attachments[j].Volume.Id
+		return compare.SameUUID(configured[i].ID, attachments[j].Volume.Id)
 	}, func(i int) bool { return !configured[i].ID.IsNull() && !configured[i].ID.IsUnknown() })
 	result := make([]DataVolumeInputModel, 0, len(attachments))
 	for i, config := range configured {
@@ -1227,7 +1239,7 @@ func (r *ServerResource) refreshServerDataVolumeState(ctx context.Context, serve
 			// A new volume remains owned when allocation succeeds but attach
 			// fails. Retaining it lets the next update retry with the same ID.
 			if dataVolumeKind(config) == "new" && !config.ID.IsNull() && !config.ID.IsUnknown() {
-				id, _ := core.ParseUUID(config.ID.ValueString())
+				id, _ := parse.UUID(config.ID.ValueString())
 				volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
 				if errors.Is(err, blockstoragesdk.ErrNotFound) {
 					continue
@@ -1369,11 +1381,15 @@ func (r *ServerResource) buildDataVolumeUpdatePlan(ctx context.Context, plan, st
 				}
 				if pending && !selector.Equal(config.VolumeType, old.VolumeType) || known && (!currentKnown || selectedID != currentID) {
 					volume, err := r.blockStorageClient.GetVolume(ctx, id, blockstoragesdk.GetVolumeParams{ProjectID: r.projectID})
-					if err != nil || volume == nil || volume.CreateFrom.VolumeType == nil {
+					var volumeType *blockstoragesdk.NestedVolumeTypeSchema
+					if err == nil && volume != nil {
+						volumeType = core.NullableToPtr(volume.CreateFrom.VolumeType)
+					}
+					if volumeType == nil {
 						diags.AddError("Error reading data volume before type change", fmt.Sprintf("Volume %s does not identify its type: %v", id, err))
 						continue
 					}
-					currentID = volume.CreateFrom.VolumeType.Id
+					currentID = volumeType.Id
 					if !known {
 						zoneID := volume.Zone.Id
 						volumeType, typeDiags := blockstorageselector.ResolveVolumeType(ctx, config.VolumeType, fmt.Sprintf("data_volumes[%d].volume_type", i), &zoneID, int(config.VolumeSize.ValueInt64()), blockstoragelookup.NewVolumeTypeFinder(r.blockStorageClient).ResolveForCreate)
@@ -1461,7 +1477,7 @@ func dataVolumesAfterUpdate(plan *dataVolumeUpdatePlan, server *serversdk.Server
 		}
 	}
 	for _, config := range plan.detachConfigs {
-		if id, err := core.ParseUUID(config.ID.ValueString()); err == nil {
+		if id, err := parse.UUID(config.ID.ValueString()); err == nil {
 			if _, ok := attached[id]; ok {
 				volumes = append(volumes, config)
 			}
@@ -1507,8 +1523,7 @@ func (r *ServerResource) buildNewDataVolumeBody(ctx context.Context, state Serve
 		diags.AddError("Error building data volume source", err.Error())
 	}
 	if !config.IOPS.IsNull() && !config.IOPS.IsUnknown() {
-		iops := int(config.IOPS.ValueInt64())
-		body.Iops = &iops
+		body.Iops.Set(int(config.IOPS.ValueInt64()))
 	}
 	return body, diags
 }
@@ -1727,8 +1742,9 @@ func (r *ServerResource) waitUntilDataVolumeProperties(ctx context.Context, upda
 		if serverVolumeStatusFailed(volume.Status) {
 			return false, fmt.Errorf("volume %s entered terminal status %s", update.id, volume.Status)
 		}
-		typeMatches := update.volumeTypeID == core.NilUUID || volume.CreateFrom.VolumeType != nil && volume.CreateFrom.VolumeType.Id == update.volumeTypeID
-		iopsMatch := update.iops == nil || volume.Iops != nil && *volume.Iops == *update.iops
+		volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType)
+		typeMatches := update.volumeTypeID == core.NilUUID || volumeType != nil && volumeType.Id == update.volumeTypeID
+		iopsMatch := update.iops == nil || volume.Iops == *update.iops
 		if serverVolumeStatusReady(volume.Status) && typeMatches && iopsMatch {
 			return true, nil
 		}
@@ -2061,7 +2077,7 @@ func (r *ServerResource) refreshServerBootState(
 	}
 
 	rootVolumeID, hasRootVolume := serverRootVolumeID(server)
-	var rootVolume *blockstoragesdk.VolumeDetailSchema
+	var rootVolume *blockstoragesdk.VolumeSchema
 	// An explicitly configured existing-volume boot is already unambiguous from
 	// the server attachment ID and does not depend on volume-origin metadata.
 	if hasRootVolume && normalizedString(current.BootType) != "volume" {
@@ -2197,8 +2213,8 @@ func (r *ServerResource) resizeVolume(ctx context.Context, id core.UUID, size in
 // the wait too, rather than polling to the timeout; the honest value is then
 // stored and Terraform reports the mismatch.
 func (r *ServerResource) waitUntilVolumeResized(ctx context.Context, id core.UUID, size int) error {
-	w := wait.New[*blockstoragesdk.VolumeDetailSchema](serverPollInterval, serverOperationTimeout)
-	_, err := w.WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeDetailSchema, error) {
+	w := wait.New[*blockstoragesdk.VolumeSchema](serverPollInterval, serverOperationTimeout)
+	_, err := w.WaitFor(ctx, func(ctx context.Context) (*blockstoragesdk.VolumeSchema, error) {
 		volume, err := r.blockStorageClient.GetVolume(
 			ctx,
 			id,
@@ -2533,7 +2549,8 @@ func (r *ServerResource) rebuildServer(
 
 func (r *ServerResource) waitUntilImage(ctx context.Context, serverID, expectedImageID core.UUID) error {
 	return r.waitForServer(ctx, serverID, "rebuild", func(server *serversdk.ServerDetailSchema) (bool, error) {
-		return server.Image != nil && server.Image.Id == expectedImageID && !serverIsBusy(server), nil
+		image := core.NullableToPtr(server.Image)
+		return image != nil && image.Id == expectedImageID && !serverIsBusy(server), nil
 	})
 }
 
@@ -3065,9 +3082,9 @@ func (r *ServerResource) waitUntilElasticIPAllocated(
 			return struct{}{}, err
 		case elasticIP == nil:
 			return struct{}{}, fmt.Errorf("the API returned an empty response: %w", wait.ErrNotReady)
-		case enableIPv4 && (elasticIP.IpAddress == nil || *elasticIP.IpAddress == ""):
+		case enableIPv4 && elasticIP.IpAddress.GetOrEmpty() == "":
 			return struct{}{}, fmt.Errorf("no IPv4 assigned yet: %w", wait.ErrNotReady)
-		case enableIPv6 && (elasticIP.Ipv6Address == nil || *elasticIP.Ipv6Address == ""):
+		case enableIPv6 && elasticIP.Ipv6Address.GetOrEmpty() == "":
 			return struct{}{}, fmt.Errorf("no IPv6 assigned yet: %w", wait.ErrNotReady)
 		}
 		return struct{}{}, nil
@@ -3452,8 +3469,8 @@ func buildServerUpdateBody(plan, state ServerResourceModel) (serversdk.ServerPar
 		body.Name = &name
 	}
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() &&
-		(state.Description.IsNull() || state.Description.IsUnknown() || !plan.Description.Equal(state.Description)) {
-		description := plan.Description.ValueString()
+		!compare.SameTrimmed(state.Description, plan.Description.ValueString()) {
+		description := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &description
 	}
 	return body, body.Name != nil || body.Description != nil, diags
@@ -3660,14 +3677,14 @@ func buildServerRebuildBody(
 		image, imageDiags := serverselector.ResolveImage(ctx, boot.Image, "boot.image", resolveImage)
 		diags.Append(imageDiags...)
 		if !imageDiags.HasError() {
-			body.ImageId = &image.Id
+			body.ImageId.Set(image.Id)
 			return body, image.Id, diags
 		}
 	case "custom_image":
 		imageID, imageDiags := parse.UUIDString(reference.Get(boot.CustomImage, reference.ID), "boot.custom_image.id")
 		diags.Append(imageDiags...)
 		if !imageDiags.HasError() {
-			body.CustomImageId = &imageID
+			body.CustomImageId.Set(imageID)
 			return body, imageID, diags
 		}
 	default:
@@ -3733,7 +3750,7 @@ func bootSourceChanged(ctx context.Context, plan, state ServerResourceModel) (bo
 	case "image", "local_disk":
 		return selector.Pending(plannedBoot.Image), diags
 	case "custom_image":
-		return referenceCriterion(plannedBoot.CustomImage, reference.ID) != referenceCriterion(priorBoot.CustomImage, reference.ID), diags
+		return !sameOptionalUUIDReference(plannedBoot.CustomImage, priorBoot.CustomImage), diags
 	default:
 		return false, diags
 	}
@@ -3741,7 +3758,8 @@ func bootSourceChanged(ctx context.Context, plan, state ServerResourceModel) (bo
 
 func securityGroupsChanged(plan, state ServerResourceModel) bool {
 	return !plan.SecurityGroups.IsNull() && !plan.SecurityGroups.IsUnknown() &&
-		!plan.SecurityGroups.Equal(state.SecurityGroups)
+		!plan.SecurityGroups.Equal(state.SecurityGroups) &&
+		!compare.SameUUIDSet(referenceIDSet(plan.SecurityGroups), referenceIDSet(state.SecurityGroups))
 }
 
 func validateDesiredPowerState(value types.String) diag.Diagnostics {
@@ -3780,12 +3798,18 @@ func powerStateChanged(plan, state ServerResourceModel) bool {
 		normalizedString(plan.PowerState) != normalizedString(state.PowerState)
 }
 
+// serverOperationInProgress reports whether the backend refused the request
+// because another operation holds the server. Backends that predate the
+// resource_busy code send code conflict with the message matched here.
 func serverOperationInProgress(err error) bool {
 	var apiErr *serversdk.APIError
 	if !errors.Is(err, serversdk.ErrConflict) || !errors.As(err, &apiErr) {
 		return false
 	}
 	for _, detail := range apiErr.Errors {
+		if detail.Code == resourceBusyErrorCode {
+			return true
+		}
 		if detail.Code == "conflict" && strings.Contains(strings.ToLower(detail.Message), "another operation running on this server") {
 			return true
 		}
@@ -3931,7 +3955,7 @@ func boolValueOrDefault(value types.Bool, fallback bool) bool {
 // attachment that does have one moments later.
 func privateIPAddressesAssigned(privateIPs []serversdk.NestedPrivateIPSchema) bool {
 	for _, privateIP := range privateIPs {
-		if privateIP.IpAddress == nil {
+		if core.NullableToPtr(privateIP.IpAddress) == nil {
 			return false
 		}
 	}
@@ -3942,7 +3966,7 @@ func privateIPAddressesAssigned(privateIPs []serversdk.NestedPrivateIPSchema) bo
 // Either address family satisfies it because an elastic IP can be IPv6 only.
 func elasticIPAddressesAssigned(elasticIPs []serversdk.NestedElasticIPSchema) bool {
 	for _, elasticIP := range elasticIPs {
-		if elasticIP.IpAddress == nil && elasticIP.Ipv6Address == nil {
+		if core.NullableToPtr(elasticIP.IpAddress) == nil && core.NullableToPtr(elasticIP.Ipv6Address) == nil {
 			return false
 		}
 	}
@@ -4100,10 +4124,10 @@ func privateIPPlanIdentityEqual(left, right PrivateIPInputModel) bool {
 		return false
 	}
 	if normalizedString(left.Kind) == "subnet" {
-		return referenceCriterion(left.Subnet, reference.ID) == referenceCriterion(right.Subnet, reference.ID) &&
+		return sameOptionalUUIDReference(left.Subnet, right.Subnet) &&
 			referenceCriterion(left.Subnet, subnetCIDR) == referenceCriterion(right.Subnet, subnetCIDR)
 	}
-	return normalizedString(left.ID) != "" && normalizedString(left.ID) == normalizedString(right.ID)
+	return compare.SameUUIDString(left.ID, right.ID)
 }
 
 func elasticIPPlanIdentityEqual(left, right ElasticIPInputModel) bool {
@@ -4117,7 +4141,7 @@ func elasticIPPlanIdentityEqual(left, right ElasticIPInputModel) bool {
 		return boolValueOrDefault(left.EnableIPv4, true) == boolValueOrDefault(right.EnableIPv4, true) &&
 			boolValueOrDefault(left.EnableIPv6, false) == boolValueOrDefault(right.EnableIPv6, false)
 	}
-	return normalizedString(left.ID) != "" && normalizedString(left.ID) == normalizedString(right.ID)
+	return compare.SameUUIDString(left.ID, right.ID)
 }
 
 // --- Create request construction ---
@@ -4205,13 +4229,13 @@ func matchDataVolumeConfigs(planned, prior []DataVolumeInputModel) ([]int, []boo
 		if config.ID.IsNull() || config.ID.IsUnknown() {
 			continue
 		}
-		id, err := core.ParseUUID(config.ID.ValueString())
+		id, err := parse.UUID(config.ID.ValueString())
 		if err != nil {
 			diags.AddAttributeError(path.Root("data_volumes").AtListIndex(i).AtName("id"), "Invalid data volume ID", err.Error())
 			continue
 		}
 		for j := range prior {
-			oldID, oldErr := core.ParseUUID(prior[j].ID.ValueString())
+			oldID, oldErr := parse.UUID(prior[j].ID.ValueString())
 			if oldErr == nil && id == oldID {
 				if used[j] {
 					diags.AddError("Duplicate data volume ID", fmt.Sprintf("data_volumes[%d] refers to a volume that another entry already uses.", i))
@@ -4307,11 +4331,7 @@ func validateServerDataVolumes(ctx context.Context, value types.List, diags *dia
 		default:
 			diags.AddAttributeError(element.AtName("kind"), "Invalid data volume kind", "kind must be new or existing.")
 		}
-		duplicateID := config.ID
-		if id, err := core.ParseUUID(config.ID.ValueString()); err == nil {
-			duplicateID = types.StringValue(id.String())
-		}
-		rejectDuplicateID(duplicateID, element.AtName("id"), "data_volumes", i, seen, diags)
+		rejectDuplicateID(config.ID, element.AtName("id"), "data_volumes", i, seen, diags)
 	}
 }
 
@@ -4332,9 +4352,11 @@ func buildServerCreateBody(
 		body.Name = strings.TrimSpace(plan.Name.ValueString())
 	}
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
+		description := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &description
 	}
+	// user_data is sent as configured: its whitespace is part of the cloud-init
+	// or base64 content.
 	if !plan.UserData.IsNull() && !plan.UserData.IsUnknown() {
 		userData := plan.UserData.ValueString()
 		body.UserData = &userData
@@ -4356,24 +4378,25 @@ func buildServerCreateBody(
 		zone, zoneDiags := resolveConfiguredName(ctx, zoneName, "zone.name", "zone", resolveZone)
 		diags.Append(zoneDiags...)
 		if !zoneDiags.HasError() {
-			body.ZoneId = &zone.Id
+			body.ZoneId.Set(zone.Id)
 		}
 	}
 	if keyPair := reference.Get(plan.KeyPair, reference.ID); !keyPair.IsNull() && !keyPair.IsUnknown() {
 		keyPairID, idDiags := parse.UUIDString(keyPair, "key_pair.id")
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
-			body.KeyPairId = &keyPairID
+			body.KeyPairId.Set(keyPairID)
 		}
 	}
 	if placementGroup := reference.Get(plan.PlacementGroup, reference.ID); !placementGroup.IsNull() && !placementGroup.IsUnknown() {
 		placementGroupID, idDiags := parse.UUIDString(placementGroup, "placement_group.id")
 		diags.Append(idDiags...)
 		if !idDiags.HasError() {
-			body.PlacementGroupId = &placementGroupID
+			body.PlacementGroupId.Set(placementGroupID)
 		}
 	}
-	body.Flavor = buildFlavor(ctx, plan.Flavor, body.ZoneId, resolveFlavor, &diags)
+	zoneID := core.NullableToPtr(body.ZoneId)
+	body.Flavor = buildFlavor(ctx, plan.Flavor, zoneID, resolveFlavor, &diags)
 
 	var boot BootInputModel
 	if plan.Boot.IsNull() || plan.Boot.IsUnknown() {
@@ -4382,14 +4405,14 @@ func buildServerCreateBody(
 		bootDiags := plan.Boot.As(ctx, &boot, basetypes.ObjectAsOptions{})
 		diags.Append(bootDiags...)
 		if !bootDiags.HasError() {
-			bootBody, valueDiags := buildBoot(ctx, boot, body.ZoneId, resolveImage, resolveVolumeType)
+			bootBody, valueDiags := buildBoot(ctx, boot, zoneID, resolveImage, resolveVolumeType)
 			diags.Append(valueDiags...)
 			body.Boot = bootBody
 		}
 	}
 
 	buildPrivateIPs(ctx, plan.PrivateIPs, &body, resolveSubnet, &diags)
-	buildDataVolumes(ctx, plan.DataVolumes, &body, body.ZoneId, resolveVolumeType, &diags)
+	buildDataVolumes(ctx, plan.DataVolumes, &body, zoneID, resolveVolumeType, &diags)
 	buildElasticIPs(ctx, plan.ElasticIPs, &body, &diags)
 	buildSecurityGroups(plan.SecurityGroups, &body, &diags)
 	return body, diags
@@ -4482,8 +4505,7 @@ func buildBoot(
 			ImageId: image.Id, VolumeTypeId: volumeType.Id, VolumeSize: int(boot.VolumeSize.ValueInt64()),
 		}
 		if !boot.IOPS.IsNull() && !boot.IOPS.IsUnknown() {
-			iops := int(boot.IOPS.ValueInt64())
-			value.Iops = &iops
+			value.Iops.Set(int(boot.IOPS.ValueInt64()))
 		}
 		appendUnionDiagnostic(&diags, result.FromServerBootFromImage(value), "boot")
 	case "custom_image":
@@ -4497,8 +4519,7 @@ func buildBoot(
 			CustomImageId: customImageID, VolumeTypeId: volumeType.Id, VolumeSize: int(boot.VolumeSize.ValueInt64()),
 		}
 		if !boot.IOPS.IsNull() && !boot.IOPS.IsUnknown() {
-			iops := int(boot.IOPS.ValueInt64())
-			value.Iops = &iops
+			value.Iops.Set(int(boot.IOPS.ValueInt64()))
 		}
 		appendUnionDiagnostic(&diags, result.FromServerBootFromCustomImage(value), "boot")
 	case "local_disk":
@@ -4640,8 +4661,7 @@ func buildDataVolumes(
 		}
 		item := serversdk.ServerDataVolume{VolumeTypeId: volumeType.Id, VolumeSize: int(config.VolumeSize.ValueInt64())}
 		if !config.IOPS.IsNull() && !config.IOPS.IsUnknown() {
-			iops := int(config.IOPS.ValueInt64())
-			item.Iops = &iops
+			item.Iops.Set(int(config.IOPS.ValueInt64()))
 		}
 		items = append(items, item)
 	}
@@ -5056,11 +5076,16 @@ func requirePositiveInt64(value types.Int64, attribute path.Path, name string, d
 	}
 }
 
+// rejectDuplicateID reports a second list entry that names the same UUID, in
+// any spelling, as an earlier entry.
 func rejectDuplicateID(value types.String, attribute path.Path, list string, index int, seen map[string]int, diags *diag.Diagnostics) {
 	if value.IsNull() || value.IsUnknown() {
 		return
 	}
 	id := normalizedString(value)
+	if parsed, err := parse.UUID(id); err == nil {
+		id = parsed.String()
+	}
 	if first, ok := seen[id]; ok {
 		diags.AddAttributeError(
 			attribute,

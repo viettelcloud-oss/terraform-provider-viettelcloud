@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
@@ -44,26 +45,26 @@ func populateSecurityGroupRuleModel(rule *networksdk.SecurityGroupRuleSchema, m 
 	m.CreatedAt = types.StringValue(rule.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(rule.UpdatedAt.Format(time.RFC3339))
 
-	if rule.Protocol != nil {
-		m.Protocol = types.StringValue(string(*rule.Protocol))
+	if protocol := core.NullableToPtr(rule.Protocol); protocol != nil {
+		m.Protocol = types.StringValue(string(*protocol))
 	} else {
 		m.Protocol = types.StringNull()
 	}
 
-	if rule.Ethertype != nil {
-		m.Ethertype = types.StringValue(string(*rule.Ethertype))
+	if ethertype := core.NullableToPtr(rule.Ethertype); ethertype != nil {
+		m.Ethertype = types.StringValue(string(*ethertype))
 	} else {
 		m.Ethertype = types.StringNull()
 	}
 
-	if rule.PortRangeMin != nil {
-		m.PortRangeMin = types.Int64Value(int64(*rule.PortRangeMin))
+	if portRangeMin := core.NullableToPtr(rule.PortRangeMin); portRangeMin != nil {
+		m.PortRangeMin = types.Int64Value(int64(*portRangeMin))
 	} else {
 		m.PortRangeMin = types.Int64Null()
 	}
 
-	if rule.PortRangeMax != nil {
-		m.PortRangeMax = types.Int64Value(int64(*rule.PortRangeMax))
+	if portRangeMax := core.NullableToPtr(rule.PortRangeMax); portRangeMax != nil {
+		m.PortRangeMax = types.Int64Value(int64(*portRangeMax))
 	} else {
 		m.PortRangeMax = types.Int64Null()
 	}
@@ -90,8 +91,10 @@ func populateSecurityGroupRuleResourceState(rule *networksdk.SecurityGroupRuleSc
 	configuredDirection := state.Direction
 	configuredProtocol := state.Protocol
 	configuredRemoteIPPrefix := state.RemoteIPPrefix
+	configuredDescription := state.Description
 
 	populateSecurityGroupRuleModel(rule, state)
+	state.Description = preservedNullableString(configuredDescription, state.Description)
 
 	if compare.SameUUID(reference.Get(configuredSecurityGroup, reference.ID), rule.SecurityGroup.Id) {
 		state.SecurityGroup = configuredSecurityGroup
@@ -99,11 +102,10 @@ func populateSecurityGroupRuleResourceState(rule *networksdk.SecurityGroupRuleSc
 	if sameNormalizedSGRValue(configuredDirection, string(rule.Direction)) {
 		state.Direction = configuredDirection
 	}
-	if rule.Protocol != nil && sameNormalizedSGRValue(configuredProtocol, string(*rule.Protocol)) {
+	if protocol := core.NullableToPtr(rule.Protocol); protocol != nil && sameNormalizedSGRValue(configuredProtocol, string(*protocol)) {
 		state.Protocol = configuredProtocol
 	}
-	if !configuredRemoteIPPrefix.IsNull() && !configuredRemoteIPPrefix.IsUnknown() &&
-		strings.TrimSpace(configuredRemoteIPPrefix.ValueString()) == rule.RemoteIpPrefix {
+	if compare.SameTrimmed(configuredRemoteIPPrefix, rule.RemoteIpPrefix) {
 		state.RemoteIPPrefix = configuredRemoteIPPrefix
 	}
 }
@@ -116,4 +118,11 @@ func sameNormalizedSGRValue(configured types.String, backend string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(configured.ValueString()), backend)
+}
+
+// sameSGRValueString reports whether two known direction or protocol values
+// name the same backend value. The replace modifiers of direction and protocol
+// use it, so that a change of case or outer whitespace alone keeps the rule.
+func sameSGRValueString(v, w types.String) bool {
+	return !w.IsNull() && !w.IsUnknown() && sameNormalizedSGRValue(v, strings.TrimSpace(w.ValueString()))
 }

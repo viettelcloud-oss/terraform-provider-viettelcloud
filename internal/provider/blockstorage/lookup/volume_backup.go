@@ -35,13 +35,13 @@ func (f VolumeBackupFilter) matches(backup *blockstoragesdk.VolumeBackupSchema) 
 	if name := finder.Trim(f.Name); name != "" && backup.Name != name {
 		return false
 	}
-	if f.VolumeID != nil && (backup.Volume == nil || backup.Volume.Id != *f.VolumeID) {
+	if volume := core.NullableToPtr(backup.Volume); f.VolumeID != nil && (volume == nil || volume.Id != *f.VolumeID) {
 		return false
 	}
-	if f.Status != nil && (backup.Status == nil || *backup.Status != *f.Status) {
+	if status := core.NullableToPtr(backup.Status); f.Status != nil && (status == nil || *status != *f.Status) {
 		return false
 	}
-	if f.Size != nil && (backup.Size == nil || *backup.Size != *f.Size) {
+	if size := core.NullableToPtr(backup.Size); f.Size != nil && (size == nil || *size != *f.Size) {
 		return false
 	}
 	return finder.Trim(f.Region) == "" || backup.Region.Name == finder.Trim(f.Region)

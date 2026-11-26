@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -218,10 +219,8 @@ func preserveConfiguredValues(vpc *networksdk.VPCSchema, config VPCDataSourceMod
 	if vpc == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == vpc.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, vpc.Id) {
+		state.ID = config.ID
 	}
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == vpc.Name {
 		state.Name = config.Name

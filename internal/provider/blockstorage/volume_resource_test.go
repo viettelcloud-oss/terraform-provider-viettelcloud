@@ -36,7 +36,7 @@ func TestVolumeModelsMatchSchemas(t *testing.T) {
 	var resourceResponse resource.SchemaResponse
 	(&VolumeResource{}).Schema(context.Background(), resource.SchemaRequest{}, &resourceResponse)
 	plan := tfsdk.Plan{Schema: resourceResponse.Schema}
-	if diags := plan.Set(context.Background(), &VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
+	if diags := plan.Set(context.Background(), &VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
 		t.Fatalf("resource model does not match schema: %v", diags)
 	}
 }
@@ -55,6 +55,9 @@ func TestVolumeResourceZonePlanModifiers(t *testing.T) {
 	}
 	if planReference(t, replaceIfConfigured, zoneA, zoneA, zoneA).RequiresReplace {
 		t.Fatal("an unchanged configured zone must not replace the volume")
+	}
+	if padded := volumeZone(" zone-a "); planReference(t, replaceIfConfigured, zoneA, padded, padded).RequiresReplace {
+		t.Fatal("outer whitespace in zone.name must not replace the volume")
 	}
 	unknownName := reference.Of(map[string]types.String{reference.Name: types.StringUnknown()})
 	if !planReference(t, replaceIfConfigured, zoneA, unknownName, unknownName).RequiresReplace {
@@ -105,6 +108,10 @@ func TestVolumeResourceCreateFromReferenceSchema(t *testing.T) {
 			}
 			if planReference(t, source.PlanModifiers[0], current, current, current).RequiresReplace {
 				t.Fatalf("an unchanged create_from.%s must not replace the volume", tt.attribute)
+			}
+			respelled := reference.Value(tt.criterion, types.StringValue(" "+strings.ToUpper(tt.current)+" "))
+			if planReference(t, source.PlanModifiers[0], current, respelled, respelled).RequiresReplace {
+				t.Fatalf("another spelling of create_from.%s.%s must not replace the volume", tt.attribute, tt.criterion)
 			}
 			removed := types.ObjectNull(reference.AttributeTypes(tt.criterion))
 			if !planReference(t, source.PlanModifiers[0], current, removed, removed).RequiresReplace {
@@ -184,7 +191,7 @@ func TestValidateVolumeCreateFromConfigNamesReferenceCriteria(t *testing.T) {
 	if diags := validateVolumeCreateFromConfig(ctx, deferred, types.Int64Value(50)); diags.HasError() {
 		t.Fatalf("an unknown reference must be deferred until apply, got %v", diags)
 	}
-	plan := VolumeResourceModel{VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)}, Zone: nullVolumeZone(), CreateFrom: deferred}
+	plan := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)}, Zone: nullVolumeZone(), CreateFrom: deferred}
 	if _, diags := buildVolumeCreateBody(ctx, plan, nil, fixedImageResolver(volumeTestID, nil), fixedVolumeTypeResolver(volumeTestID)); !diags.HasError() ||
 		!strings.Contains(diags[0].Detail(), "create_from.backup") {
 		t.Fatalf("the create path must reject an unresolved foreign reference, got %v", diags)
@@ -196,7 +203,7 @@ func TestVolumeResourceReadAfterImportProducesReferenceObjects(t *testing.T) {
 	ctx := context.Background()
 	volumeSchema := volumeResourceSchema(t)
 	imported := resource.ImportStateResponse{State: tfsdk.State{Schema: volumeSchema}}
-	if diags := imported.State.Set(ctx, &VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
+	if diags := imported.State.Set(ctx, &VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 	(&VolumeResource{}).ImportState(ctx, resource.ImportStateRequest{ID: volumeTestID.String()}, &imported)
@@ -204,7 +211,7 @@ func TestVolumeResourceReadAfterImportProducesReferenceObjects(t *testing.T) {
 		t.Fatalf("import: %v", imported.Diagnostics)
 	}
 	volume := sampleVolumeDetail()
-	volume.CreateFrom.Backup = &blockstoragesdk.NestedVolumeBackupSchema{Id: core.UUID{4}, Name: "nightly"}
+	volume.CreateFrom.Backup = core.NullableFromPtr(&blockstoragesdk.NestedVolumeBackupSchema{Id: core.UUID{4}, Name: "nightly"})
 	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
 		return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(volume)), nil
 	})
@@ -323,6 +330,7 @@ func TestVolumeResourceModifyPlanChecksPlacementBeforeReplacement(t *testing.T) 
 		{name: "unknown zone", currentZone: "zone-b", unknownZone: true},
 		{name: "omitted zone", currentZone: "zone-b", omitZone: true},
 		{name: "unchanged zone", currentZone: "zone-a"},
+		{name: "respelled zone", currentZone: " zone-a "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -352,7 +360,9 @@ func TestVolumeResourceModifyPlanChecksPlacementBeforeReplacement(t *testing.T) 
 			})
 			r := &VolumeResource{client: client, projectClient: projectClient, projectID: volumeTestProjectID}
 			current := VolumeResourceModel{
-				VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100), ZoneID: types.StringValue((core.UUID{7}).String())}, Zone: volumeZone(tt.currentZone),
+				SnapshotPolicy: nullVolumeReference(),
+				BackupPolicy:   nullVolumeReference(),
+				VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100), ZoneID: types.StringValue((core.UUID{7}).String())}, Zone: volumeZone(tt.currentZone),
 				CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
 			}
 			planned := current
@@ -419,7 +429,9 @@ func TestVolumeResourceValidateConfigRejectsInvalidImmutableSource(t *testing.T)
 	(&VolumeResource{}).Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 
 	configModel := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
 		CreateFrom: volumeCreateFromValue(t, "invalid", map[string]attr.Value{
 			"volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
 		}),
@@ -439,12 +451,14 @@ func TestVolumeResourceValidateConfigRejectsInvalidImmutableSource(t *testing.T)
 	}
 }
 
-func TestVolumeResourceValidateConfigRejectsBlankOrUntrimmedZone(t *testing.T) {
+func TestVolumeResourceValidateConfigRejectsBlankZone(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	volumeSchema := volumeResourceSchema(t)
-	for _, zone := range []string{"  ", " zone-a", "zone-a ", "  zone-a  "} {
+	for zone, wantError := range map[string]bool{"": true, "  ": true, " zone-a": false, "  zone-a  ": false} {
 		configModel := VolumeResourceModel{
+			SnapshotPolicy: nullVolumeReference(),
+			BackupPolicy:   nullVolumeReference(),
 			VolumeModel: VolumeModel{
 				Name: types.StringValue("data"), Size: types.Int64Value(50),
 			},
@@ -459,6 +473,12 @@ func TestVolumeResourceValidateConfigRejectsBlankOrUntrimmedZone(t *testing.T) {
 		}
 		var response resource.ValidateConfigResponse
 		(&VolumeResource{}).ValidateConfig(ctx, resource.ValidateConfigRequest{Config: tfsdk.Config(configState)}, &response)
+		if !wantError {
+			if response.Diagnostics.HasError() {
+				t.Fatalf("zone %q: unexpected diagnostics %v", zone, response.Diagnostics)
+			}
+			continue
+		}
 		if !response.Diagnostics.HasError() || response.Diagnostics[0].Summary() != "Invalid volume zone" {
 			t.Fatalf("expected zone diagnostic for %q, got %v", zone, response.Diagnostics)
 		}
@@ -470,7 +490,9 @@ func TestVolumeResourceRejectsSnapshotZoneBeforeCreate(t *testing.T) {
 	ctx := context.Background()
 	volumeSchema := volumeResourceSchema(t)
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("snapshot-volume"), Size: types.Int64Unknown()}, Zone: volumeZone("zone-a"),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("snapshot-volume"), Size: types.Int64Unknown()}, Zone: volumeZone("zone-a"),
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue((core.UUID{5}).String()),
 		}),
@@ -542,9 +564,11 @@ func TestValidateVolumeCreateFromConfigSourceRules(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := VolumeResourceModel{
-				VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: tt.size},
-				CreateFrom:  volumeCreateFromValue(t, tt.sourceType, tt.extra),
-				Zone:        nullVolumeZone(),
+				SnapshotPolicy: nullVolumeReference(),
+				BackupPolicy:   nullVolumeReference(),
+				VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: tt.size},
+				CreateFrom:     volumeCreateFromValue(t, tt.sourceType, tt.extra),
+				Zone:           nullVolumeZone(),
 			}
 			diags := validateVolumeCreateFromConfig(context.Background(), config.CreateFrom, config.Size)
 			if !diags.HasError() {
@@ -570,7 +594,9 @@ func TestValidateVolumeCreateFromConfigSourceRules(t *testing.T) {
 func TestValidateVolumeCreateFromConfigAllowsResizingASnapshotVolume(t *testing.T) {
 	t.Parallel()
 	config := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue((core.UUID{5}).String()),
 		}),
@@ -590,7 +616,9 @@ func TestValidateVolumeCreateFromConfigAllowsResizingASnapshotVolume(t *testing.
 func TestValidateVolumeCreateFromConfigAllowsUnknownValues(t *testing.T) {
 	t.Parallel()
 	config := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Unknown()},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Unknown()},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{
 			"image": testImageSelector(types.StringUnknown()), "volume_type": testVolumeTypeSelector(types.StringUnknown()),
 		}),
@@ -601,9 +629,39 @@ func TestValidateVolumeCreateFromConfigAllowsUnknownValues(t *testing.T) {
 	}
 }
 
+func TestVolumeSourceReplacedIgnoresSpelling(t *testing.T) {
+	t.Parallel()
+	id := volumeTestID.String()
+	current := volumeSource{SourceType: types.StringValue(volumeSourceTypeSnapshot), CustomImageID: types.StringNull(), SnapshotID: types.StringValue(id), BackupID: types.StringNull()}
+	tests := map[string]struct {
+		change func(*volumeSource)
+		want   bool
+	}{
+		"unchanged":             {change: func(*volumeSource) {}},
+		"source type respelled": {change: func(s *volumeSource) { s.SourceType = types.StringValue(" snapshot ") }},
+		"snapshot ID respelled": {change: func(s *volumeSource) { s.SnapshotID = types.StringValue("  " + strings.ToUpper(id) + " ") }},
+		"another source type":   {change: func(s *volumeSource) { s.SourceType = types.StringValue(volumeSourceTypeBackup) }, want: true},
+		"another snapshot":      {change: func(s *volumeSource) { s.SnapshotID = types.StringValue((core.UUID{4}).String()) }, want: true},
+		"unknown snapshot":      {change: func(s *volumeSource) { s.SnapshotID = types.StringUnknown() }, want: true},
+		"custom image added":    {change: func(s *volumeSource) { s.CustomImageID = types.StringValue(id) }, want: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			planned := current
+			tt.change(&planned)
+			if got := volumeSourceReplaced(planned, current); got != tt.want {
+				t.Fatalf("volumeSourceReplaced() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildVolumeCreateBodyEmpty(t *testing.T) {
 	t.Parallel()
 	body, diags := buildVolumeCreateBody(context.Background(), VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
 		VolumeModel: VolumeModel{
 			Name:        types.StringValue("  data  "),
 			Description: types.StringValue("database"),
@@ -622,7 +680,7 @@ func TestBuildVolumeCreateBodyEmpty(t *testing.T) {
 	if err != nil || createFrom.Size != 100 || createFrom.VolumeTypeId != volumeTestID {
 		t.Fatalf("unexpected empty source: %#v err=%v", createFrom, err)
 	}
-	if body.Name != "data" || body.Description == nil || *body.Description != "database" || body.Iops == nil || *body.Iops != 3000 {
+	if iops := core.NullableToPtr(body.Iops); body.Name != "data" || body.Description == nil || *body.Description != "database" || iops == nil || *iops != 3000 {
 		t.Fatalf("unexpected create body: %#v", body)
 	}
 	encoded, err := json.Marshal(body)
@@ -673,9 +731,11 @@ func TestBuildVolumeCreateFromVariants(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			plan := VolumeResourceModel{
-				VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
-				CreateFrom:  volumeCreateFromValue(t, tt.sourceType, tt.extra),
-				Zone:        nullVolumeZone(),
+				SnapshotPolicy: nullVolumeReference(),
+				BackupPolicy:   nullVolumeReference(),
+				VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
+				CreateFrom:     volumeCreateFromValue(t, tt.sourceType, tt.extra),
+				Zone:           nullVolumeZone(),
 			}
 			body, diags := buildVolumeCreateBody(context.Background(), plan, nil, fixedImageResolver(core.UUID{2}, nil), fixedVolumeTypeResolver(volumeTestID))
 			if diags.HasError() {
@@ -689,7 +749,9 @@ func TestBuildVolumeCreateFromVariants(t *testing.T) {
 func TestBuildVolumeCreateFromSnapshotAndValidation(t *testing.T) {
 	t.Parallel()
 	plan := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("snapshot-volume"), Size: types.Int64Unknown()},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("snapshot-volume"), Size: types.Int64Unknown()},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue((core.UUID{5}).String()),
 		}),
@@ -721,7 +783,9 @@ func TestBuildVolumeCreateFromChecksImageMinimumSize(t *testing.T) {
 	t.Parallel()
 	minimum := 60
 	plan := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("image-volume"), Size: types.Int64Value(50)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("image-volume"), Size: types.Int64Value(50)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{
 			"image": testImageSelector(types.StringValue("Ubuntu")), "volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
 		}),
@@ -736,7 +800,9 @@ func TestBuildVolumeCreateFromChecksImageMinimumSize(t *testing.T) {
 func TestBuildVolumeCreateFromImageDelegatesUsabilityToBackend(t *testing.T) {
 	t.Parallel()
 	plan := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("image-volume"), Size: types.Int64Value(50)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("image-volume"), Size: types.Int64Value(50)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{
 			"image": testImageSelector(types.StringValue("Ubuntu")), "volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
 		}),
@@ -757,7 +823,9 @@ func TestBuildVolumeCreateFromImageDelegatesUsabilityToBackend(t *testing.T) {
 func TestBuildVolumeCreateBodyPassesZoneIDToVolumeTypeResolver(t *testing.T) {
 	t.Parallel()
 	plan := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(50)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{
 			"volume_type": testVolumeTypeSelector(types.StringValue("Ceph_HDD")),
 		}),
@@ -778,13 +846,13 @@ func TestBuildVolumeCreateBodyPassesZoneIDToVolumeTypeResolver(t *testing.T) {
 
 func TestPopulateVolumePendingStatePreservesConfiguredZone(t *testing.T) {
 	t.Parallel()
-	configured := VolumeResourceModel{Zone: volumeZone("zone-a")}
+	configured := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), Zone: volumeZone("zone-a")}
 	populateVolumePendingState(&configured, volumeTestID)
 	if !configured.Zone.Equal(volumeZone("zone-a")) {
 		t.Fatalf("pending state changed the configured zone: %v", configured.Zone)
 	}
 
-	unconfigured := VolumeResourceModel{Zone: types.ObjectUnknown(reference.AttributeTypes(reference.Name))}
+	unconfigured := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), Zone: types.ObjectUnknown(reference.AttributeTypes(reference.Name))}
 	populateVolumePendingState(&unconfigured, volumeTestID)
 	if !unconfigured.Zone.IsNull() {
 		t.Fatalf("pending state must clear an unknown computed zone, got %v", unconfigured.Zone)
@@ -795,6 +863,8 @@ func TestBuildVolumeUpdatePlanSparseAndLifecycleRules(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	state := VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
 		VolumeModel: VolumeModel{
 			Name: types.StringValue("before"), Description: types.StringValue("keep"), Size: types.Int64Value(100), IOPS: types.Int64Value(1000),
 		},
@@ -809,7 +879,7 @@ func TestBuildVolumeUpdatePlanSparseAndLifecycleRules(t *testing.T) {
 	// patch body: the backend accepts a size there and silently ignores it.
 	update, diags := buildVolumeUpdatePlan(ctx, plan, state)
 	if diags.HasError() || !update.patch || update.body.Name == nil || *update.body.Name != "after" ||
-		update.body.Description != nil || update.body.Iops != nil || update.body.Size != nil {
+		update.body.Description.IsSpecified() || update.body.Iops != nil || update.body.Size != nil {
 		t.Fatalf("unexpected sparse update: %#v, %v", update, diags)
 	}
 	if update.extendSize == nil || *update.extendSize != 200 {
@@ -819,10 +889,18 @@ func TestBuildVolumeUpdatePlanSparseAndLifecycleRules(t *testing.T) {
 		t.Fatalf("an unchanged volume type must not retype, got %v", update.retypeSelector)
 	}
 
+	// The API trims the name, so a change in outer whitespace only sends nothing.
+	plan = state
+	plan.Name = types.StringValue(" before ")
+	update, diags = buildVolumeUpdatePlan(ctx, plan, state)
+	if diags.HasError() || update.patch || update.body.Name != nil {
+		t.Fatalf("a respelled name must not patch, got %#v, %v", update, diags)
+	}
+
 	plan = state
 	plan.Description = types.StringValue("")
 	update, diags = buildVolumeUpdatePlan(ctx, plan, state)
-	if diags.HasError() || !update.patch || update.body.Description == nil || *update.body.Description != "" || update.extendSize != nil {
+	if description := core.NullableToPtr(update.body.Description); diags.HasError() || !update.patch || description == nil || *description != "" || update.extendSize != nil {
 		t.Fatalf("expected explicit description clear without a resize, got %#v, %v", update, diags)
 	}
 
@@ -886,14 +964,18 @@ func TestVolumeResourceModifyPlanReportsSizeRulesBeforeApply(t *testing.T) {
 	}
 	empty := func(size int64) VolumeResourceModel {
 		return VolumeResourceModel{
-			VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(size)},
-			CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
-			Zone:        nullVolumeZone(),
+			SnapshotPolicy: nullVolumeReference(),
+			BackupPolicy:   nullVolumeReference(),
+			VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(size)},
+			CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
+			Zone:           nullVolumeZone(),
 		}
 	}
 	image := func(name string, size int64) VolumeResourceModel {
 		return VolumeResourceModel{
-			VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(size)},
+			SnapshotPolicy: nullVolumeReference(),
+			BackupPolicy:   nullVolumeReference(),
+			VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(size)},
 			CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{
 				"image": selector.WithID(testImageSelector(types.StringValue(name)), types.StringValue((core.UUID{3}).String())), "volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String())),
 			}),
@@ -902,7 +984,9 @@ func TestVolumeResourceModifyPlanReportsSizeRulesBeforeApply(t *testing.T) {
 	}
 	snapshot := func(size types.Int64) VolumeResourceModel {
 		return VolumeResourceModel{
-			VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: size},
+			SnapshotPolicy: nullVolumeReference(),
+			BackupPolicy:   nullVolumeReference(),
+			VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: size},
 			CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 				"snapshot": types.StringValue(volumeTestID.String()),
 			}),
@@ -1016,6 +1100,8 @@ func TestVolumeResourceModifyPlanWithdrawsValuesARetypeCanMove(t *testing.T) {
 	}), projectID: volumeTestProjectID}
 
 	current := VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
 		VolumeModel: VolumeModel{
 			ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100),
 			ZoneID: types.StringValue((core.UUID{8}).String()), Encrypted: types.BoolValue(false),
@@ -1137,12 +1223,14 @@ func TestPopulateVolumeResourceStateAndImportSource(t *testing.T) {
 	encrypted := true
 	iops := 3000
 	volume := sampleVolumeDetail()
-	volume.Description = &description
-	volume.Encrypted = &encrypted
-	volume.Iops = &iops
-	volume.CreateFrom.Image = &blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"}
+	volume.Description.Set(description)
+	volume.Encrypted.Set(encrypted)
+	volume.Iops = iops
+	volume.CreateFrom.Image = core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"})
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("  data  ")}, Zone: volumeZone("zone-a"),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("  data  ")}, Zone: volumeZone("zone-a"),
 		CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()),
 	}
 	if diags := populateVolumeResourceState(context.Background(), volume, &state); diags.HasError() {
@@ -1161,11 +1249,13 @@ func TestPopulateVolumeResourceStateAndImportSource(t *testing.T) {
 func TestPopulateVolumeResourceStateMapsClearedDescription(t *testing.T) {
 	t.Parallel()
 	volume := sampleVolumeDetail()
-	volume.Description = new("")
+	volume.Description.Set("")
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Description: types.StringValue("")},
-		CreateFrom:  types.ObjectNull(volumeCreateFromAttributeTypes()),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Description: types.StringValue("")},
+		CreateFrom:     types.ObjectNull(volumeCreateFromAttributeTypes()),
+		Zone:           nullVolumeZone(),
 	}
 	if diags := populateVolumeResourceState(context.Background(), volume, &state); diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
@@ -1177,9 +1267,11 @@ func TestPopulateVolumeResourceStateMapsClearedDescription(t *testing.T) {
 	// A nil SDK value stays null instead of borrowing the configured empty value.
 	volume.Description = nil
 	missing := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Description: types.StringValue("")},
-		CreateFrom:  types.ObjectNull(volumeCreateFromAttributeTypes()),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Description: types.StringValue("")},
+		CreateFrom:     types.ObjectNull(volumeCreateFromAttributeTypes()),
+		Zone:           nullVolumeZone(),
 	}
 	if diags := populateVolumeResourceState(context.Background(), volume, &missing); diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
@@ -1192,11 +1284,13 @@ func TestPopulateVolumeResourceStateMapsClearedDescription(t *testing.T) {
 func TestPopulateVolumeResourceStateRefreshesCreateFrom(t *testing.T) {
 	t.Parallel()
 	volume := sampleVolumeDetail()
-	volume.CreateFrom.VolumeType = &blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{7}, Name: "Standard"}
+	volume.CreateFrom.VolumeType = core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{7}, Name: "Standard"})
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data")},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data")},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
+		Zone:           nullVolumeZone(),
 	}
 	if diags := populateVolumeResourceState(context.Background(), volume, &state); diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
@@ -1213,9 +1307,11 @@ func TestPopulateVolumeResourceStatePreservesConfiguredSourceRepresentation(t *t
 	snapshotID := core.UUID{5}
 	volume := sampleVolumeDetail()
 	volume.CreateFrom.VolumeType = nil
-	volume.CreateFrom.Snapshot = &blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"}
+	volume.CreateFrom.Snapshot = core.NullableFromPtr(&blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"})
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data")},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data")},
 		CreateFrom: volumeCreateFromValue(t, "  snapshot  ", map[string]attr.Value{
 			"snapshot": types.StringValue(strings.ToUpper(snapshotID.String())),
 		}),
@@ -1237,16 +1333,18 @@ func TestPopulateVolumeResourceStateMultipleOrigins(t *testing.T) {
 	t.Parallel()
 	snapshotID := core.UUID{5}
 	volume := sampleVolumeDetail()
-	volume.CreateFrom.Image = &blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"}
-	volume.CreateFrom.Snapshot = &blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"}
+	volume.CreateFrom.Image = core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"})
+	volume.CreateFrom.Snapshot = core.NullableFromPtr(&blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"})
 
-	imported := VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}
+	imported := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}
 	diags := populateVolumeResourceState(context.Background(), volume, &imported)
 	if !diags.HasError() || diags[0].Summary() != "Ambiguous volume source" {
 		t.Fatalf("expected an ambiguous-source diagnostic instead of a silent guess, got %v", diags)
 	}
 
 	configured := VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue(snapshotID.String()),
 		}),
@@ -1274,7 +1372,9 @@ func TestPopulateVolumeResourceStateKeepsAKnownSourceWhenNoneIsReported(t *testi
 	volume.CreateFrom = blockstoragesdk.NestedVolumeOriginSchema{}
 
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data")},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data")},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue(snapshotID.String()),
 		}),
@@ -1290,7 +1390,7 @@ func TestPopulateVolumeResourceStateKeepsAKnownSourceWhenNoneIsReported(t *testi
 
 	// A volume with nothing recorded on either side, such as a first import, is
 	// the one case where "empty" is the honest answer.
-	imported := VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}
+	imported := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}
 	if diags := populateVolumeResourceState(context.Background(), volume, &imported); diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
@@ -1307,11 +1407,13 @@ func TestPopulateVolumeResourceStatePreservesAlternateUUIDSpellings(t *testing.T
 	snapshotID := core.UUID{5}
 	volume := sampleVolumeDetail()
 	volume.CreateFrom.VolumeType = nil
-	volume.CreateFrom.Snapshot = &blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"}
+	volume.CreateFrom.Snapshot = core.NullableFromPtr(&blockstoragesdk.NestedVolumeSnapshotSchema{Id: snapshotID, Name: "nightly"})
 
 	braced := "{" + snapshotID.String() + "}"
 	state := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data")},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data")},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue(braced),
 		}),
@@ -1326,7 +1428,9 @@ func TestPopulateVolumeResourceStatePreservesAlternateUUIDSpellings(t *testing.T
 
 	// An ID that parses but names something else is still drift.
 	other := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data")},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data")},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeSnapshot, map[string]attr.Value{
 			"snapshot": types.StringValue("{" + (core.UUID{6}).String() + "}"),
 		}),
@@ -1446,7 +1550,7 @@ func TestVolumePatchWaiterWaitsForTheRequestedFields(t *testing.T) {
 		volume := sampleVolumeDetail()
 		if polls > 0 {
 			volume.Name = name
-			volume.Iops = &iops
+			volume.Iops = iops
 		}
 		polls++
 		return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(volume)), nil
@@ -1478,7 +1582,7 @@ func TestVolumeResourceRetypesInPlace(t *testing.T) {
 	ctx := context.Background()
 	volumeSchema := volumeResourceSchema(t)
 	current := sampleVolumeDetail()
-	current.CreateFrom.VolumeType = &blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{7}, Name: "Standard"}
+	current.CreateFrom.VolumeType = core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{7}, Name: "Standard"})
 
 	requests := 0
 	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
@@ -1514,9 +1618,11 @@ func TestVolumeResourceRetypesInPlace(t *testing.T) {
 	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: 5 * time.Second}
 
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100), ZoneID: types.StringValue((core.UUID{8}).String())},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Standard")), types.StringValue((core.UUID{7}).String()))}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100), ZoneID: types.StringValue((core.UUID{8}).String())},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Standard")), types.StringValue((core.UUID{7}).String()))}),
+		Zone:           nullVolumeZone(),
 	}
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -1573,6 +1679,8 @@ func TestVolumeResourceRetypeScopesConfiguredZone(t *testing.T) {
 	})
 	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: 5 * time.Second}
 	model := VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
 		VolumeModel: VolumeModel{
 			ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100),
 			ZoneID: types.StringValue(zoneID.String()),
@@ -1614,9 +1722,11 @@ func TestVolumeResourceReportsRetypeFailure(t *testing.T) {
 	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: time.Second}
 
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Standard")), types.StringValue((core.UUID{7}).String()))}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Standard")), types.StringValue((core.UUID{7}).String()))}),
+		Zone:           nullVolumeZone(),
 	}
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -1648,9 +1758,11 @@ func TestVolumeResourceReportsResizeFailure(t *testing.T) {
 	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: time.Second}
 
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
+		Zone:           nullVolumeZone(),
 	}
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -1710,7 +1822,7 @@ func TestVolumeResourceCreateWithConfiguredZone(t *testing.T) {
 				t.Errorf("unexpected volume create source: %#v, error=%v", source, err)
 			}
 			return testHTTPResponse(req, http.StatusCreated, volumeDetailJSON(sampleVolumeDetail())), nil
-		case 3, 4:
+		case 3, 4, 5:
 			if req.Method != http.MethodGet || req.URL.Path != "/v2/block-storage/volumes/"+volumeTestID.String()+"/" {
 				t.Errorf("unexpected volume read request: %s %s", req.Method, req.URL)
 			}
@@ -1721,8 +1833,11 @@ func TestVolumeResourceCreateWithConfiguredZone(t *testing.T) {
 		}
 	})
 	r := &VolumeResource{client: client, projectClient: projectClient, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: 5 * time.Second}
+	// The zone lookup trims the name, and state keeps the configured spelling.
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: volumeZone("zone-a"),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: volumeZone(" zone-a "),
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
 	}
 	plan := tfsdk.Plan{Schema: volumeSchema}
@@ -1738,10 +1853,15 @@ func TestVolumeResourceCreateWithConfiguredZone(t *testing.T) {
 	if diags := response.State.Get(ctx, &state); diags.HasError() {
 		t.Fatalf("get created state: %v", diags)
 	}
-	if state.ID.ValueString() != volumeTestID.String() || !state.Zone.Equal(volumeZone("zone-a")) || state.ZoneID.ValueString() != zoneID.String() {
+	if state.ID.ValueString() != volumeTestID.String() || !state.Zone.Equal(volumeZone(" zone-a ")) || state.ZoneID.ValueString() != zoneID.String() {
 		t.Fatalf("unexpected created state: %#v", state)
 	}
-	if projectCalls != 1 || blockCalls != 4 {
+	read := resource.ReadResponse{State: response.State}
+	r.Read(ctx, resource.ReadRequest{State: response.State}, &read)
+	if diags := read.State.Get(ctx, &state); read.Diagnostics.HasError() || diags.HasError() || !state.Zone.Equal(volumeZone(" zone-a ")) {
+		t.Fatalf("read must keep the configured zone spelling: %v %v %v", state.Zone, read.Diagnostics, diags)
+	}
+	if projectCalls != 1 || blockCalls != 5 {
 		t.Fatalf("unexpected request counts: project=%d block=%d", projectCalls, blockCalls)
 	}
 }
@@ -1775,7 +1895,9 @@ func TestVolumeResourceCreateReportsZoneLookupFailures(t *testing.T) {
 			})
 			r := &VolumeResource{client: client, projectClient: projectClient, projectID: volumeTestProjectID}
 			model := VolumeResourceModel{
-				VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: volumeZone("zone-a"),
+				SnapshotPolicy: nullVolumeReference(),
+				BackupPolicy:   nullVolumeReference(),
+				VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: volumeZone("zone-a"),
 				CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
 			}
 			plan := tfsdk.Plan{Schema: volumeSchema}
@@ -1803,11 +1925,11 @@ func TestVolumeResourceLifecycleUsesPublicSDK(t *testing.T) {
 	patched := sampleVolumeDetail()
 	patched.Size = 30
 	patched.Name = "data-after"
-	patched.Description = &updatedDescription
+	patched.Description.Set(updatedDescription)
 	updated := sampleVolumeDetail()
 	updated.Size = 40
 	updated.Name = patched.Name
-	updated.Description = &updatedDescription
+	updated.Description.Set(updatedDescription)
 
 	requests := 0
 	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
@@ -1887,7 +2009,9 @@ func TestVolumeResourceLifecycleUsesPublicSDK(t *testing.T) {
 
 	plan := tfsdk.Plan{Schema: volumeSchema}
 	if diags := plan.Set(ctx, &VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{
 			"volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
 		}),
@@ -1972,7 +2096,9 @@ func TestVolumeResourceCreatePreservesIDWhenWaiterFails(t *testing.T) {
 
 	plan := tfsdk.Plan{Schema: volumeSchema}
 	if diags := plan.Set(ctx, &VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
 		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{
 			"volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
 		}),
@@ -2009,9 +2135,11 @@ func TestVolumeResourceReadRemovesMissingVolumeAndDeleteAcceptsNotFound(t *testi
 
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data")},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data")},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
+		Zone:           nullVolumeZone(),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -2046,9 +2174,11 @@ func TestVolumeResourceReportsAPIErrors(t *testing.T) {
 
 	plan := tfsdk.Plan{Schema: volumeSchema}
 	if diags := plan.Set(ctx, &VolumeResourceModel{
-		VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
+		Zone:           nullVolumeZone(),
 	}); diags.HasError() {
 		t.Fatalf("set create plan: %v", diags)
 	}
@@ -2060,9 +2190,11 @@ func TestVolumeResourceReportsAPIErrors(t *testing.T) {
 
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(30)},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(30)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
+		Zone:           nullVolumeZone(),
 	}); diags.HasError() {
 		t.Fatalf("set state: %v", diags)
 	}
@@ -2082,6 +2214,48 @@ func TestVolumeResourceReportsAPIErrors(t *testing.T) {
 	}
 }
 
+// The API refuses with 400 while snapshots that a snapshot policy created
+// remain, and the provider must not delete those snapshots itself.
+func TestVolumeResourceDeleteReportsRemainingSnapshots(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	volumeSchema := volumeResourceSchema(t)
+	requests := 0
+	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
+		requests++
+		if req.Method != http.MethodDelete || !strings.Contains(req.URL.Path, volumeTestID.String()) {
+			t.Errorf("expected only the volume DELETE, got %s %s", req.Method, req.URL.Path)
+		}
+		return testHTTPResponse(req, http.StatusBadRequest, `{"errors":[{"location":"","code":"invalid_input","message":"You must delete all Snapshots created from this Volume before deleting it."}]}`), nil
+	})
+	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: time.Second}
+
+	state := tfsdk.State{Schema: volumeSchema}
+	if diags := state.Set(ctx, &VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(30)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": types.StringValue("Premium")}),
+		Zone:           nullVolumeZone(),
+	}); diags.HasError() {
+		t.Fatalf("set state: %v", diags)
+	}
+	response := resource.DeleteResponse{State: state}
+	r.Delete(ctx, resource.DeleteRequest{State: state}, &response)
+	if !response.Diagnostics.HasError() || response.Diagnostics[0].Summary() != "Error deleting volume" {
+		t.Fatalf("expected a delete error diagnostic, got %v", response.Diagnostics)
+	}
+	if detail := response.Diagnostics[0].Detail(); !strings.Contains(detail, "You must delete all Snapshots created from this Volume before deleting it.") {
+		t.Fatalf("expected the API message in the diagnostic, got %q", detail)
+	}
+	if response.State.Raw.IsNull() {
+		t.Fatal("a refused delete must keep the volume in state")
+	}
+	if requests != 1 {
+		t.Fatalf("expected one DELETE request and no wait, got %d requests", requests)
+	}
+}
+
 func TestVolumeResourceUpdateWithoutChangesSkipsWrite(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -2097,9 +2271,11 @@ func TestVolumeResourceUpdateWithoutChangesSkipsWrite(t *testing.T) {
 	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: time.Second}
 
 	model := VolumeResourceModel{
-		VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
-		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String())), types.StringValue((core.UUID{2}).String()))}),
-		Zone:        nullVolumeZone(),
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)},
+		CreateFrom:     volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String())), types.StringValue((core.UUID{2}).String()))}),
+		Zone:           nullVolumeZone(),
 	}
 	state := tfsdk.State{Schema: volumeSchema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -2125,7 +2301,7 @@ func TestVolumeImportState(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	(&VolumeResource{}).Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
 	response := resource.ImportStateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
-	if diags := response.State.Set(context.Background(), &VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
+	if diags := response.State.Set(context.Background(), &VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
 		t.Fatalf("initialize import state: %v", diags)
 	}
 	(&VolumeResource{}).ImportState(context.Background(), resource.ImportStateRequest{ID: volumeTestID.String()}, &response)
@@ -2154,7 +2330,7 @@ func TestVolumeImportStateCompositeID(t *testing.T) {
 	newResponse := func(t *testing.T) resource.ImportStateResponse {
 		t.Helper()
 		response := resource.ImportStateResponse{State: tfsdk.State{Schema: volumeSchema}}
-		if diags := response.State.Set(ctx, &VolumeResourceModel{CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
+		if diags := response.State.Set(ctx, &VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), CreateFrom: types.ObjectNull(volumeCreateFromAttributeTypes()), Zone: nullVolumeZone()}); diags.HasError() {
 			t.Fatalf("initialize import state: %v", diags)
 		}
 		return response
@@ -2180,8 +2356,8 @@ func TestVolumeImportStateCompositeID(t *testing.T) {
 	// The seeded source type then lets Read pick the intended origin out of an
 	// otherwise ambiguous response.
 	volume := sampleVolumeDetail()
-	volume.CreateFrom.Image = &blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"}
-	volume.CreateFrom.Snapshot = &blockstoragesdk.NestedVolumeSnapshotSchema{Id: core.UUID{5}, Name: "nightly"}
+	volume.CreateFrom.Image = core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: core.UUID{3}, Name: "Ubuntu"})
+	volume.CreateFrom.Snapshot = core.NullableFromPtr(&blockstoragesdk.NestedVolumeSnapshotSchema{Id: core.UUID{5}, Name: "nightly"})
 	if diags := populateVolumeResourceState(ctx, volume, &imported); diags.HasError() {
 		t.Fatalf("a seeded source type must disambiguate the response: %v", diags)
 	}
@@ -2235,7 +2411,7 @@ func TestVolumeCreateAndRetypeUseTypedSelectors(t *testing.T) {
 		return serversdk.ImageSchema{Id: core.UUID{1}}, nil
 	}, func(_ context.Context, req blockstoragelookup.VolumeTypeResolveRequest) (blockstoragesdk.VolumeTypeSchema, error) {
 		f := req.Filter
-		if f.Name != nil || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || string(*f.Speed) != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.RequestedSize != 30 || req.ZoneID != &zone {
+		if f.Name != nil || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || *f.Speed != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.RequestedSize != 30 || req.ZoneID != &zone {
 			t.Fatalf("unexpected type criteria: %#v", req)
 		}
 		return blockstoragesdk.VolumeTypeSchema{Id: core.UUID{2}}, nil
@@ -2247,7 +2423,7 @@ func TestVolumeCreateAndRetypeUseTypedSelectors(t *testing.T) {
 	if err != nil || fromImage.ImageId != (core.UUID{1}) || fromImage.VolumeTypeId != (core.UUID{2}) {
 		t.Fatalf("wrong SDK body: %#v, %v", fromImage, err)
 	}
-	current := VolumeResourceModel{VolumeModel: VolumeModel{Name: types.StringValue("volume"), Size: types.Int64Value(30)}, CreateFrom: source}
+	current := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{Name: types.StringValue("volume"), Size: types.Int64Value(30)}, CreateFrom: source}
 	planned := current
 	changed := volumeType.Attributes()
 	changed["speed"] = types.StringValue("50k")
@@ -2265,7 +2441,7 @@ func TestVolumeCreateAndRetypeUseTypedSelectors(t *testing.T) {
 func TestVolumeUpdateRejectsUnknownSelectorBeforeMutation(t *testing.T) {
 	t.Parallel()
 	for _, value := range []types.Object{types.ObjectUnknown(blockstorageselector.VolumeTypeAttributeTypes()), types.ObjectValueMust(blockstorageselector.VolumeTypeAttributeTypes(), map[string]attr.Value{"id": types.StringNull(), "name": types.StringNull(), "disk_type": types.StringUnknown(), "speed": types.StringNull(), "multiattach": types.BoolValue(false), "encryption_key_size": types.StringNull()})} {
-		state := VolumeResourceModel{VolumeModel: VolumeModel{Name: types.StringValue("before"), Size: types.Int64Value(30)}, CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))})}
+		state := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{Name: types.StringValue("before"), Size: types.Int64Value(30)}, CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))})}
 		plan := state
 		plan.Name = types.StringValue("after")
 		plan.CreateFrom = volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": value})
@@ -2335,7 +2511,7 @@ func TestVolumeSelectorModifyPlanUsesIdentity(t *testing.T) {
 				r := &VolumeResource{client: blockClient, server: serverClient, projectID: volumeTestProjectID}
 				image := selector.WithID(testImageSelector(types.StringValue("ubuntu")), types.StringValue(imageID.String()))
 				volumeType := selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue(typeID.String()))
-				current := VolumeResourceModel{VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("volume"), Size: types.Int64Value(30), ZoneID: types.StringValue((core.UUID{8}).String()), Encrypted: types.BoolValue(false)}, Zone: volumeZone("zone-a"), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
+				current := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("volume"), Size: types.Int64Value(30), ZoneID: types.StringValue((core.UUID{8}).String()), Encrypted: types.BoolValue(false)}, Zone: volumeZone("zone-a"), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
 				attrs := blockstorageselector.VolumeTypeAttributeTypes()
 				prior := volumeType
 				currentID := typeID
@@ -2409,10 +2585,12 @@ func TestVolumeReadAndUpdateDoNotReadCatalog(t *testing.T) {
 	imageID, typeID := core.UUID{3}, core.UUID{2}
 	image := selectorTestCriteria(serverselector.ImageAttributeTypes(), map[string]attr.Value{"os": types.StringValue("Ubuntu"), "type": types.StringValue("server"), "id": types.StringValue(imageID.String())})
 	volumeType := selectorTestCriteria(blockstorageselector.VolumeTypeAttributeTypes(), map[string]attr.Value{"disk_type": types.StringValue("ssd"), "encryption_key_size": types.StringValue("0"), "id": types.StringValue(typeID.String())})
-	model := VolumeResourceModel{VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
+	model := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
 	volume := sampleVolumeDetail()
-	volume.CreateFrom.Image = &blockstoragesdk.NestedImageSchema{Id: imageID, Name: "ubuntu", Os: "Changed metadata"}
-	volume.CreateFrom.VolumeType.DiskType = blockstoragesdk.VolumeTypeDiskTypeHdd
+	volume.CreateFrom.Image = core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: imageID, Name: "ubuntu", Os: "Changed metadata"})
+	sourceVolumeType := core.NullableToPtr(volume.CreateFrom.VolumeType)
+	sourceVolumeType.DiskType = blockstoragesdk.VolumeTypeDiskTypeHdd
+	volume.CreateFrom.VolumeType.Set(*sourceVolumeType)
 	calls := 0
 	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
 		calls++
@@ -2480,7 +2658,7 @@ func TestVolumeUpdateResolvedCurrentIDSkipsRetype(t *testing.T) {
 		return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(sampleVolumeDetail())), nil
 	})}
 	priorType := selectorTestCriteria(blockstorageselector.VolumeTypeAttributeTypes(), map[string]attr.Value{"disk_type": types.StringValue("ssd"), "id": types.StringValue((core.UUID{2}).String())})
-	model := VolumeResourceModel{VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": priorType})}
+	model := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": priorType})}
 	schema := volumeResourceSchema(t)
 	state := tfsdk.State{Schema: schema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -2520,7 +2698,7 @@ func TestVolumePlanKeepsUnidentifiedImageFromEarlierState(t *testing.T) {
 		return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(volume)), nil
 	})}
 	volumeType := selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))
-	model := VolumeResourceModel{VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": testImageSelector(types.StringValue("ubuntu")), "volume_type": volumeType})}
+	model := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{ID: types.StringValue(volumeTestID.String()), Name: types.StringValue("data"), Size: types.Int64Value(100)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": testImageSelector(types.StringValue("ubuntu")), "volume_type": volumeType})}
 	schema := volumeResourceSchema(t)
 	state := tfsdk.State{Schema: schema}
 	if diags := state.Set(ctx, &model); diags.HasError() {
@@ -2548,7 +2726,7 @@ func TestVolumeCreateRecordsIDsWithoutCatalogRefresh(t *testing.T) {
 	imageID := core.UUID{3}
 	volume := sampleVolumeDetail()
 	volume.Size = 30
-	volume.CreateFrom.Image = &blockstoragesdk.NestedImageSchema{Id: imageID, Name: "ubuntu"}
+	volume.CreateFrom.Image = core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: imageID, Name: "ubuntu"})
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		catalog := strings.Contains(req.URL.Path, "images") || strings.Contains(req.URL.Path, "volume-types")
@@ -2557,7 +2735,7 @@ func TestVolumeCreateRecordsIDsWithoutCatalogRefresh(t *testing.T) {
 		}
 		switch req.URL.Path {
 		case "/v2/server/images/":
-			writeJSONForVolume(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: imageID, Name: "ubuntu", Type: new(serversdk.ImageTypeServer)}}})
+			writeJSONForVolume(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: imageID, Name: "ubuntu", Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}}})
 		case "/v2/block-storage/volume-types/":
 			var entries map[string]any
 			if err := json.Unmarshal([]byte(volumeTypesResponseJSON()), &entries); err != nil {
@@ -2589,7 +2767,7 @@ func TestVolumeCreateRecordsIDsWithoutCatalogRefresh(t *testing.T) {
 	}
 	image := selectorTestCriteria(serverselector.ImageAttributeTypes(), map[string]attr.Value{"type": types.StringValue("server"), "id": types.StringUnknown()})
 	volumeType := selectorTestCriteria(blockstorageselector.VolumeTypeAttributeTypes(), map[string]attr.Value{"name": types.StringValue("Premium"), "encryption_key_size": types.StringValue("0"), "id": types.StringUnknown()})
-	model := VolumeResourceModel{VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
+	model := VolumeResourceModel{SnapshotPolicy: nullVolumeReference(), BackupPolicy: nullVolumeReference(), VolumeModel: VolumeModel{Name: types.StringValue("data"), Size: types.Int64Value(30)}, Zone: nullVolumeZone(), CreateFrom: volumeCreateFromValue(t, volumeSourceTypeImage, map[string]attr.Value{"image": image, "volume_type": volumeType})}
 	schema := volumeResourceSchema(t)
 	plan := tfsdk.Plan{Schema: schema}
 	if diags := plan.Set(ctx, &model); diags.HasError() {
@@ -2608,5 +2786,168 @@ func TestVolumeCreateRecordsIDsWithoutCatalogRefresh(t *testing.T) {
 	source := decodeVolumeCreateFrom(t, got.CreateFrom)
 	if !source.Image.Equal(selector.WithID(image, types.StringValue(imageID.String()))) || !source.VolumeType.Equal(selector.WithID(volumeType, types.StringValue((core.UUID{2}).String()))) {
 		t.Fatalf("resolved identities or criteria lost: %v", source)
+	}
+}
+
+// The API trims the description, so the update sends the trimmed value and a
+// change in outer whitespace only sends nothing.
+func TestBuildVolumeUpdatePlanTrimsDescription(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state := VolumeResourceModel{
+		VolumeModel: VolumeModel{Name: types.StringValue("data"), Description: types.StringValue(" saved "), Size: types.Int64Value(100), IOPS: types.Int64Value(1000)},
+		CreateFrom:  volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{"volume_type": selector.WithID(testVolumeTypeSelector(types.StringValue("Premium")), types.StringValue((core.UUID{2}).String()))}),
+		Zone:        nullVolumeZone(),
+	}
+	for _, tt := range []struct {
+		name, description string
+		want              *string
+	}{
+		{"padded change", " after ", new("after")},
+		{"outer whitespace only", "saved", nil},
+		{"whitespace only clears", "  ", new("")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := state
+			plan.Description = types.StringValue(tt.description)
+			update, diags := buildVolumeUpdatePlan(ctx, plan, state)
+			if diags.HasError() {
+				t.Fatalf("update plan: %v", diags)
+			}
+			got := core.NullableToPtr(update.body.Description)
+			if update.patch != (tt.want != nil) || (got == nil) != (tt.want == nil) || (got != nil && *got != *tt.want) {
+				t.Fatalf("patch=%v description=%v, want %v", update.patch, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnappliedVolumePatchFieldsComparesTrimmedDescription(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name, backend string
+		wantPending   bool
+	}{
+		{"backend trimmed", "after", false},
+		{"backend kept padding", " after ", false},
+		{"not applied yet", "before", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			volume := sampleVolumeDetail()
+			volume.Description.Set(tt.backend)
+			var body blockstoragesdk.VolumePartialUpdateSchema
+			body.Description.Set("after")
+			if pending := len(unappliedVolumePatchFields(volume, body)) > 0; pending != tt.wantPending {
+				t.Fatalf("pending=%v, want %v", pending, tt.wantPending)
+			}
+		})
+	}
+}
+
+// The request carries the trimmed description, and state after create, read,
+// and update keeps the configured spelling.
+func TestVolumeResourceTrimsDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	volumeSchema := volumeResourceSchema(t)
+	volume := sampleVolumeDetail()
+	volume.Size = 30
+	itemPath := "/v2/block-storage/volumes/" + volumeTestID.String() + "/"
+	var sent []string
+	// The fake backend trims the description, as the API does.
+	storeDescription := func(req *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode %s body: %v", req.Method, err)
+			return
+		}
+		description, ok := body["description"].(string)
+		if !ok {
+			t.Errorf("%s body has no description: %#v", req.Method, body)
+			return
+		}
+		sent = append(sent, description)
+		volume.Description.Set(strings.TrimSpace(description))
+	}
+	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volume-types/":
+			return testHTTPResponse(req, http.StatusOK, volumeTypesResponseJSON()), nil
+		case req.Method == http.MethodPost && req.URL.Path == "/v2/block-storage/volumes/":
+			storeDescription(req)
+			return testHTTPResponse(req, http.StatusCreated, volumeDetailJSON(volume)), nil
+		case req.Method == http.MethodPatch && req.URL.Path == itemPath:
+			storeDescription(req)
+			return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(volume)), nil
+		case req.Method == http.MethodGet && req.URL.Path == itemPath:
+			return testHTTPResponse(req, http.StatusOK, volumeDetailJSON(volume)), nil
+		default:
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			return testHTTPResponse(req, http.StatusInternalServerError, `{}`), nil
+		}
+	})
+	r := &VolumeResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: 5 * time.Second}
+	description := func(t *testing.T, state tfsdk.State) string {
+		t.Helper()
+		var model VolumeResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		return model.Description.ValueString()
+	}
+
+	plan := tfsdk.Plan{Schema: volumeSchema}
+	if diags := plan.Set(ctx, &VolumeResourceModel{
+		SnapshotPolicy: nullVolumeReference(),
+		BackupPolicy:   nullVolumeReference(),
+		VolumeModel:    VolumeModel{Name: types.StringValue("data"), Description: types.StringValue(" saved "), Size: types.Int64Value(30)},
+		CreateFrom: volumeCreateFromValue(t, volumeSourceTypeEmpty, map[string]attr.Value{
+			"volume_type": testVolumeTypeSelector(types.StringValue("Premium")),
+		}),
+		Zone: nullVolumeZone(),
+	}); diags.HasError() {
+		t.Fatalf("set create plan: %v", diags)
+	}
+	created := resource.CreateResponse{State: tfsdk.State{Schema: volumeSchema}}
+	r.Create(ctx, resource.CreateRequest{Config: tfsdk.Config{Raw: plan.Raw, Schema: volumeSchema}, Plan: plan}, &created)
+	if created.Diagnostics.HasError() {
+		t.Fatalf("create: %v", created.Diagnostics)
+	}
+	if got := description(t, created.State); got != " saved " || strings.Join(sent, "|") != "saved" {
+		t.Fatalf("after create: state %q, sent %q", got, sent)
+	}
+	read := resource.ReadResponse{State: created.State}
+	r.Read(ctx, resource.ReadRequest{State: created.State}, &read)
+	if read.Diagnostics.HasError() || description(t, read.State) != " saved " {
+		t.Fatalf("after read: state %q %v", description(t, read.State), read.Diagnostics)
+	}
+
+	current := read.State
+	for _, step := range []struct {
+		description string
+		wantSent    string
+	}{
+		{" after ", "saved|after"},
+		// A change in outer whitespace only sends no request.
+		{"after", "saved|after"},
+	} {
+		var model VolumeResourceModel
+		if diags := current.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		model.Description = types.StringValue(step.description)
+		updatePlan := tfsdk.Plan{Schema: volumeSchema}
+		if diags := updatePlan.Set(ctx, &model); diags.HasError() {
+			t.Fatalf("set update plan: %v", diags)
+		}
+		updated := resource.UpdateResponse{State: tfsdk.State{Schema: volumeSchema}}
+		r.Update(ctx, resource.UpdateRequest{Plan: updatePlan, State: current}, &updated)
+		if updated.Diagnostics.HasError() {
+			t.Fatalf("update to %q: %v", step.description, updated.Diagnostics)
+		}
+		if got := description(t, updated.State); got != step.description || strings.Join(sent, "|") != step.wantSent {
+			t.Fatalf("after update to %q: state %q, sent %q", step.description, got, sent)
+		}
+		current = updated.State
 	}
 }

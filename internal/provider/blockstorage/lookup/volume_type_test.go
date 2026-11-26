@@ -1,9 +1,14 @@
 package lookup
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"iter"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -124,12 +129,12 @@ func TestVolumeTypeFinderCombinesTypedCriteriaWithoutName(t *testing.T) {
 	zoneID := core.UUID{8}
 	want := testVolumeType(core.UUID{1}, "fast", "ceph", zoneID, true, 500)
 	want.DiskType = blockstoragesdk.LabeledVolumeTypeDiskType{Value: blockstoragesdk.VolumeTypeDiskTypeSsd, Label: new("SSD label")}
-	want.Speed.Value = blockstoragesdk.VolumeTypeSpeed("10k")
+	want.Speed.Value = "10k"
 	want.EncryptionKeySize.Value = blockstoragesdk.VolumeTypeEncryptKeySizeN0
-	filter := VolumeTypeFilter{DiskType: new(blockstoragesdk.VolumeTypeDiskType(" ssd ")), Speed: new(blockstoragesdk.VolumeTypeSpeed(" 10k ")), Multiattach: new(false), EncryptionKeySize: new(blockstoragesdk.VolumeTypeEncryptKeySize(" 0 "))}
+	filter := VolumeTypeFilter{DiskType: new(blockstoragesdk.VolumeTypeDiskType(" ssd ")), Speed: new(" 10k "), Multiattach: new(false), EncryptionKeySize: new(blockstoragesdk.VolumeTypeEncryptKeySize(" 0 "))}
 	wrongDisk, wrongSpeed, wrongAttach, wrongKey := want, want, want, want
 	wrongDisk.DiskType.Value = blockstoragesdk.VolumeTypeDiskTypeHdd
-	wrongSpeed.Speed.Value = blockstoragesdk.VolumeTypeSpeed("50k")
+	wrongSpeed.Speed.Value = "50k"
 	wrongAttach.Multiattach = true
 	wrongKey.EncryptionKeySize.Value = blockstoragesdk.VolumeTypeEncryptKeySizeN256
 	lister := &fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{wrongDisk, wrongSpeed, wrongAttach, wrongKey, want}}
@@ -138,7 +143,7 @@ func TestVolumeTypeFinderCombinesTypedCriteriaWithoutName(t *testing.T) {
 		t.Fatalf("resolve criteria: %#v, %v", got, err)
 	}
 	params := lister.params
-	if params.Name != nil || *params.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || string(*params.Speed) != "10k" || params.Multiattach == nil || *params.Multiattach || *params.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || *params.ZoneId != zoneID {
+	if params.Name != nil || *params.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || *params.Speed != "10k" || params.Multiattach == nil || *params.Multiattach || *params.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || *params.ZoneId != zoneID {
 		t.Fatalf("wrong backend criteria: %#v", params)
 	}
 	for _, criterion := range []string{"disk_type=", "speed=", "multiattach=false", "encryption_key_size="} {
@@ -169,4 +174,52 @@ func TestVolumeTypeFinderCombinesTypedCriteriaWithoutName(t *testing.T) {
 	if _, err := NewVolumeTypeFinder(&fakeVolumeTypeLister{values: []blockstoragesdk.VolumeTypeSchema{want}}).ResolveForCreate(context.Background(), VolumeTypeResolveRequest{Filter: filter, RequestedSize: 1000}); err == nil || !strings.Contains(err.Error(), "maximum size") {
 		t.Fatalf("oversize criterion: %v", err)
 	}
+}
+
+// The SDK types speed as a free-form string, so a value outside the tiers that
+// earlier SDK releases enumerated must reach the backend and match as written.
+func TestVolumeTypeFinderSendsFreeFormSpeedUnchanged(t *testing.T) {
+	t.Parallel()
+	const speed = "7.5k IOPS"
+	want := testVolumeType(core.UUID{1}, "custom", "ceph", core.UUID{8}, true, 500)
+	want.Speed.Value = speed
+	other := want
+	other.Id = core.UUID{2}
+	other.Speed.Value = "10k"
+
+	var gotQuery url.Values
+	client, err := blockstoragesdk.NewClient(
+		"https://blockstorage.test",
+		blockstoragesdk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotQuery = req.URL.Query()
+			body, err := json.Marshal(blockstoragesdk.PagedVolumeTypeSchema{Count: 2, Results: []blockstoragesdk.VolumeTypeSchema{other, want}})
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewReader(body)),
+				Request:    req,
+			}, nil
+		})}),
+		blockstoragesdk.WithRetry(core.NoRetry()),
+	)
+	if err != nil {
+		t.Fatalf("create block storage client: %v", err)
+	}
+
+	got, err := NewVolumeTypeFinder(client).Resolve(context.Background(), VolumeTypeFilter{Speed: new(" " + speed + " ")})
+	if err != nil || got.Id != want.Id {
+		t.Fatalf("resolve free-form speed: got=%#v err=%v", got, err)
+	}
+	if gotQuery.Get("speed") != speed {
+		t.Fatalf("speed query = %q, want %q", gotQuery.Get("speed"), speed)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

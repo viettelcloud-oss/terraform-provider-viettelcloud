@@ -19,7 +19,7 @@ type VolumeTypeLister interface {
 type VolumeTypeFilter struct {
 	Name              *string
 	DiskType          *blockstoragesdk.VolumeTypeDiskType
-	Speed             *blockstoragesdk.VolumeTypeSpeed
+	Speed             *string
 	Multiattach       *bool
 	EncryptionKeySize *blockstoragesdk.VolumeTypeEncryptKeySize
 	BackendName       *string
@@ -29,7 +29,7 @@ type VolumeTypeFilter struct {
 func (f VolumeTypeFilter) String() string {
 	return finder.Criteria(
 		finder.Text("name", f.Name),
-		finder.Text("disk_type", (*string)(f.DiskType)), finder.Text("speed", (*string)(f.Speed)), finder.Part("multiattach", f.Multiattach), finder.Text("encryption_key_size", (*string)(f.EncryptionKeySize)),
+		finder.Text("disk_type", (*string)(f.DiskType)), finder.Text("speed", f.Speed), finder.Part("multiattach", f.Multiattach), finder.Text("encryption_key_size", (*string)(f.EncryptionKeySize)),
 		finder.Text("volume_backend_name", f.BackendName),
 		finder.Part("zone_id", f.ZoneID),
 	)
@@ -45,7 +45,7 @@ func (f VolumeTypeFilter) matches(volumeType *blockstoragesdk.VolumeTypeSchema) 
 	if value := finder.Trim((*string)(f.DiskType)); value != "" && string(volumeType.DiskType.Value) != value {
 		return false
 	}
-	if value := finder.Trim((*string)(f.Speed)); value != "" && string(volumeType.Speed.Value) != value {
+	if value := finder.Trim(f.Speed); value != "" && volumeType.Speed.Value != value {
 		return false
 	}
 	if f.Multiattach != nil && volumeType.Multiattach != *f.Multiattach {
@@ -65,8 +65,8 @@ func (f VolumeTypeFilter) params() blockstoragesdk.ListVolumeTypesParams {
 	if value := finder.Trim((*string)(f.DiskType)); value != "" {
 		params.DiskType = new(blockstoragesdk.VolumeTypeDiskType(value))
 	}
-	if value := finder.Trim((*string)(f.Speed)); value != "" {
-		params.Speed = new(blockstoragesdk.VolumeTypeSpeed(value))
+	if value := finder.Trim(f.Speed); value != "" {
+		params.Speed = &value
 	}
 	if value := finder.Trim((*string)(f.EncryptionKeySize)); value != "" {
 		params.EncryptionKeySize = new(blockstoragesdk.VolumeTypeEncryptKeySize(value))
@@ -110,7 +110,7 @@ func (f *VolumeTypeFinder) ResolveForCreate(
 ) (blockstoragesdk.VolumeTypeSchema, error) {
 	filter := request.Filter
 	filter.ZoneID = request.ZoneID
-	if finder.Trim(filter.Name) == "" && finder.Trim((*string)(filter.DiskType)) == "" && finder.Trim((*string)(filter.Speed)) == "" && filter.Multiattach == nil && finder.Trim((*string)(filter.EncryptionKeySize)) == "" {
+	if finder.Trim(filter.Name) == "" && finder.Trim((*string)(filter.DiskType)) == "" && finder.Trim(filter.Speed) == "" && filter.Multiattach == nil && finder.Trim((*string)(filter.EncryptionKeySize)) == "" {
 		return blockstoragesdk.VolumeTypeSchema{}, fmt.Errorf("volume type criteria must not be empty")
 	}
 	candidates, err := f.Find(ctx, filter)

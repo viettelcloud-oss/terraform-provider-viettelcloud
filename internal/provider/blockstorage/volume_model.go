@@ -39,8 +39,10 @@ type VolumeModel struct {
 // keeps filtering by a plain zone name.
 type VolumeResourceModel struct {
 	VolumeModel
-	Zone       types.Object `tfsdk:"zone"`
-	CreateFrom types.Object `tfsdk:"create_from"`
+	Zone           types.Object `tfsdk:"zone"`
+	CreateFrom     types.Object `tfsdk:"create_from"`
+	SnapshotPolicy types.Object `tfsdk:"snapshot_policy"`
+	BackupPolicy   types.Object `tfsdk:"backup_policy"`
 }
 
 type VolumeDataSourceModel struct {
@@ -122,7 +124,7 @@ func volumeCreateFromObject(values map[string]types.String, image, volumeType ty
 	return types.ObjectValue(volumeCreateFromAttributeTypes(), attributes)
 }
 
-func populateVolumeModel(volume *blockstoragesdk.VolumeDetailSchema, state *VolumeModel) {
+func populateVolumeModel(volume *blockstoragesdk.VolumeSchema, state *VolumeModel) {
 	if volume == nil {
 		return
 	}
@@ -138,20 +140,17 @@ func populateVolumeModel(volume *blockstoragesdk.VolumeDetailSchema, state *Volu
 	state.UpdatedAt = types.StringValue(volume.UpdatedAt.Format(time.RFC3339))
 
 	state.Description = types.StringNull()
-	if volume.Description != nil {
-		state.Description = types.StringValue(*volume.Description)
+	if description := core.NullableToPtr(volume.Description); description != nil {
+		state.Description = types.StringValue(*description)
 	}
 	state.Encrypted = types.BoolNull()
-	if volume.Encrypted != nil {
-		state.Encrypted = types.BoolValue(*volume.Encrypted)
+	if encrypted := core.NullableToPtr(volume.Encrypted); encrypted != nil {
+		state.Encrypted = types.BoolValue(*encrypted)
 	}
-	state.IOPS = types.Int64Null()
-	if volume.Iops != nil {
-		state.IOPS = types.Int64Value(int64(*volume.Iops))
-	}
+	state.IOPS = types.Int64Value(int64(volume.Iops))
 	state.VolumeType = types.StringNull()
-	if volume.CreateFrom.VolumeType != nil {
-		state.VolumeType = types.StringValue(volume.CreateFrom.VolumeType.Name)
+	if volumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); volumeType != nil {
+		state.VolumeType = types.StringValue(volumeType.Name)
 	}
 }
 
@@ -160,18 +159,25 @@ func populateVolumeModel(volume *blockstoragesdk.VolumeDetailSchema, state *Volu
 // object. Leaving create_from at its prior value would let an out-of-band
 // retype produce a state whose two views of the volume type disagree while the
 // plan stays clean.
-func populateVolumeResourceState(ctx context.Context, volume *blockstoragesdk.VolumeDetailSchema, state *VolumeResourceModel) diag.Diagnostics {
+func populateVolumeResourceState(ctx context.Context, volume *blockstoragesdk.VolumeSchema, state *VolumeResourceModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if volume == nil {
 		return diags
 	}
 
 	configuredName := state.Name
+	configuredDescription := state.Description
+	configuredZone := reference.Get(state.Zone, reference.Name)
 	configuredSource := state.CreateFrom
 	populateVolumeModel(volume, &state.VolumeModel)
-	state.Zone = reference.Value(reference.Name, types.StringValue(volume.Zone.Name))
+	state.Zone = reference.Value(reference.Name, compare.PreservedString(configuredZone, volume.Zone.Name))
 	if !configuredName.IsNull() && !configuredName.IsUnknown() && strings.TrimSpace(configuredName.ValueString()) == volume.Name {
 		state.Name = configuredName
+	}
+	// The request trims the description, so keep the configured spelling
+	// when it names the same text.
+	if description := core.NullableToPtr(volume.Description); description != nil {
+		state.Description = compare.PreservedString(configuredDescription, *description)
 	}
 	createFrom, sourceDiags := volumeCreateFromState(ctx, volume, configuredSource)
 	diags.Append(sourceDiags...)
@@ -179,10 +185,12 @@ func populateVolumeResourceState(ctx context.Context, volume *blockstoragesdk.Vo
 		return diags
 	}
 	state.CreateFrom = createFrom
+	state.SnapshotPolicy = volumeSnapshotPolicyState(volume, state.SnapshotPolicy)
+	populateVolumeBackupPolicy(volume, state)
 	return diags
 }
 
-func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDetailSchema, configured types.Object) (types.Object, diag.Diagnostics) {
+func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeSchema, configured types.Object) (types.Object, diag.Diagnostics) {
 	attributeTypes := volumeCreateFromAttributeTypes()
 	prior, diags := volumeCreateFromModel(ctx, configured)
 	if diags.HasError() {
@@ -243,7 +251,8 @@ func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDe
 		sourceType = selected.sourceType
 		values["source_type"] = types.StringValue(selected.sourceType)
 		if selected.sourceType == volumeSourceTypeImage {
-			value, valueDiags := selector.Refresh(prior.Image, serverselector.ImageAttributeTypes(), &volume.CreateFrom.Image.Id, volume.CreateFrom.Image.Name)
+			sourceImage := core.NullableToPtr(volume.CreateFrom.Image)
+			value, valueDiags := selector.Refresh(prior.Image, serverselector.ImageAttributeTypes(), &sourceImage.Id, sourceImage.Name)
 			diags.Append(valueDiags...)
 			image = value
 		} else {
@@ -260,8 +269,8 @@ func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDe
 	}
 	// A snapshot source rejects create_from.volume_type in configuration because
 	// the snapshot picks the type, so the response value stays out of state.
-	if volume.CreateFrom.VolumeType != nil && sourceType != volumeSourceTypeSnapshot {
-		value, valueDiags := selector.Refresh(prior.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &volume.CreateFrom.VolumeType.Id, volume.CreateFrom.VolumeType.Name)
+	if sourceVolumeType := core.NullableToPtr(volume.CreateFrom.VolumeType); sourceVolumeType != nil && sourceType != volumeSourceTypeSnapshot {
+		value, valueDiags := selector.Refresh(prior.VolumeType, blockstorageselector.VolumeTypeAttributeTypes(), &sourceVolumeType.Id, sourceVolumeType.Name)
 		diags.Append(valueDiags...)
 		volumeType = value
 	}
@@ -279,19 +288,19 @@ func volumeCreateFromState(ctx context.Context, volume *blockstoragesdk.VolumeDe
 // NestedVolumeOriginSchema declares each origin field as independent and
 // optional, and carries no discriminator. More than one can therefore be
 // populated at once: a snapshot of a volume that itself came from an image.
-func volumeOrigins(volume *blockstoragesdk.VolumeDetailSchema) []volumeOrigin {
+func volumeOrigins(volume *blockstoragesdk.VolumeSchema) []volumeOrigin {
 	var origins []volumeOrigin
-	if volume.CreateFrom.Image != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeImage, "image", types.StringValue(volume.CreateFrom.Image.Name)})
+	if image := core.NullableToPtr(volume.CreateFrom.Image); image != nil {
+		origins = append(origins, volumeOrigin{volumeSourceTypeImage, "image", types.StringValue(image.Name)})
 	}
-	if volume.CreateFrom.CustomImage != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeCustomImage, "custom_image", types.StringValue(volume.CreateFrom.CustomImage.Id.String())})
+	if customImage := core.NullableToPtr(volume.CreateFrom.CustomImage); customImage != nil {
+		origins = append(origins, volumeOrigin{volumeSourceTypeCustomImage, "custom_image", types.StringValue(customImage.Id.String())})
 	}
-	if volume.CreateFrom.Snapshot != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeSnapshot, "snapshot", types.StringValue(volume.CreateFrom.Snapshot.Id.String())})
+	if snapshot := core.NullableToPtr(volume.CreateFrom.Snapshot); snapshot != nil {
+		origins = append(origins, volumeOrigin{volumeSourceTypeSnapshot, "snapshot", types.StringValue(snapshot.Id.String())})
 	}
-	if volume.CreateFrom.Backup != nil {
-		origins = append(origins, volumeOrigin{volumeSourceTypeBackup, "backup", types.StringValue(volume.CreateFrom.Backup.Id.String())})
+	if backup := core.NullableToPtr(volume.CreateFrom.Backup); backup != nil {
+		origins = append(origins, volumeOrigin{volumeSourceTypeBackup, "backup", types.StringValue(backup.Id.String())})
 	}
 	return origins
 }
@@ -333,13 +342,4 @@ func preserveConfiguredVolumeSource(values map[string]types.String, prior volume
 	keep("custom_image", prior.CustomImageID, sameUUID)
 	keep("snapshot", prior.SnapshotID, sameUUID)
 	keep("backup", prior.BackupID, sameUUID)
-}
-
-// preservedUUID keeps the configured spelling of id, such as upper case or
-// braces, when it names the same object, and the backend's otherwise.
-func preservedUUID(configured types.String, id core.UUID) types.String {
-	if compare.SameUUID(configured, id) {
-		return configured
-	}
-	return types.StringValue(id.String())
 }

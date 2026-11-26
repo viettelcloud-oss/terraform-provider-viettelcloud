@@ -67,9 +67,7 @@ func VolumeTypeFilter(ctx context.Context, value types.Object, field string) (bl
 	if value := selector.Text(m.DiskType); value != nil {
 		filter.DiskType = new(blockstoragesdk.VolumeTypeDiskType(*value))
 	}
-	if value := selector.Text(m.Speed); value != nil {
-		filter.Speed = new(blockstoragesdk.VolumeTypeSpeed(*value))
-	}
+	filter.Speed = selector.Text(m.Speed)
 	if value := selector.Text(m.EncryptionKeySize); value != nil {
 		filter.EncryptionKeySize = new(blockstoragesdk.VolumeTypeEncryptKeySize(*value))
 	}

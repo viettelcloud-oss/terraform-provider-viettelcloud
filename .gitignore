@@ -36,7 +36,9 @@ website/vendor
 
 .env
 integration-tests/*.tfvars
+integration-tests/tests/*.selected.tftest.hcl
 __pycache__/
+.terraformrc.local
 terraform-provider-viettelcloud
 coverage.out
 CLAUDE.md
@@ -45,6 +47,3 @@ AGENTS.md
 # Local Go workspace for co-developing with the SDK
 go.work
 go.work.sum
-
-# SDK checkout that Jenkins makes for the Go containers
-.sdk-mirror/

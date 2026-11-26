@@ -53,7 +53,7 @@ func TestVolumeSnapshotResourceSchemaAndMapping(t *testing.T) {
 	}
 	empty := ""
 	zero := 0
-	snapshot.Description, snapshot.Size, snapshot.Status = &empty, &zero, nil
+	snapshot.Description, snapshot.Size, snapshot.Status = &empty, core.NullableFromPtr(&zero), nil
 	populateVolumeSnapshotModel(snapshot, &model)
 	if model.Description.IsNull() || model.Description.ValueString() != "" || model.Size.IsNull() || model.Size.ValueInt64() != 0 || !model.Status.IsNull() {
 		t.Fatalf("response presence was not preserved: %#v", model)
@@ -78,6 +78,38 @@ func TestPopulateVolumeSnapshotResourceStateRecordsVolumeReference(t *testing.T)
 			populateVolumeSnapshotResourceState(snapshot, &state)
 			if !state.Volume.Equal(volumeIDReference(tt.want)) || state.VolumeName.ValueString() != "data" {
 				t.Fatalf("volume = %v, volume_name = %v, want id %s", state.Volume, state.VolumeName, tt.want)
+			}
+		})
+	}
+}
+
+func TestVolumeSnapshotValidateConfigChecksVolumeID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := snapshotResourceSchema(t)
+	for _, tt := range []struct {
+		name    string
+		volume  types.Object
+		wantErr bool
+	}{
+		{"valid", volumeIDReference(volumeTestID.String()), false},
+		{"padded", volumeIDReference("  " + volumeTestID.String() + " "), false},
+		{"invalid", volumeIDReference("not-a-uuid"), true},
+		{"unknown reference", types.ObjectUnknown(reference.AttributeTypes(reference.ID)), false},
+		{"unknown ID", reference.Of(map[string]types.String{reference.ID: types.StringUnknown()}), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := tfsdk.State{Schema: s}
+			if diags := config.Set(ctx, &VolumeSnapshotResourceModel{VolumeSnapshotModel: VolumeSnapshotModel{Name: types.StringValue("snapshot")}, Volume: tt.volume}); diags.HasError() {
+				t.Fatalf("set config: %v", diags)
+			}
+			var response resource.ValidateConfigResponse
+			(&VolumeSnapshotResource{}).ValidateConfig(ctx, resource.ValidateConfigRequest{Config: tfsdk.Config(config)}, &response)
+			if response.Diagnostics.HasError() != tt.wantErr {
+				t.Fatalf("diagnostics = %v, want error %v", response.Diagnostics, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(response.Diagnostics[0].Detail(), "volume.id") {
+				t.Fatalf("the diagnostic must name volume.id: %v", response.Diagnostics)
 			}
 		})
 	}
@@ -120,6 +152,8 @@ func TestVolumeSnapshotPatchPresenceAndNormalization(t *testing.T) {
 		{"clear", VolumeSnapshotModel{Name: types.StringValue("snapshot"), Description: types.StringValue("")}, nil, new("")},
 		{"rename", VolumeSnapshotModel{Name: types.StringValue(" renamed "), Description: types.StringValue("before")}, new("renamed"), nil},
 		{"equal after trim", VolumeSnapshotModel{Name: types.StringValue(" snapshot "), Description: types.StringValue("before")}, nil, nil},
+		{"padded description", VolumeSnapshotModel{Name: types.StringValue("snapshot"), Description: types.StringValue(" after ")}, nil, new("after")},
+		{"description equal after trim", VolumeSnapshotModel{Name: types.StringValue("snapshot"), Description: types.StringValue(" before ")}, nil, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := buildVolumeSnapshotPatch(tt.plan, prior)
@@ -237,7 +271,7 @@ func TestVolumeSnapshotCreatePreservesIDWhenWaitFails(t *testing.T) {
 		case http.MethodPost:
 			return testHTTPResponse(req, http.StatusCreated, volumeSnapshotJSON(snapshot)), nil
 		case http.MethodGet:
-			snapshot.Status = &status
+			snapshot.Status.Set(status)
 			return testHTTPResponse(req, http.StatusOK, volumeSnapshotJSON(snapshot)), nil
 		default:
 			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
@@ -269,7 +303,7 @@ func TestVolumeSnapshotDeleteStopsOnTerminalFailure(t *testing.T) {
 		s := snapshotResourceSchema(t)
 		snapshot := sampleVolumeSnapshot()
 		status := blockstoragesdk.SnapshotStatusFail
-		snapshot.Status = &status
+		snapshot.Status.Set(status)
 		requests := 0
 		client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
 			requests++
@@ -346,7 +380,7 @@ func TestVolumeSnapshotResourceWaitsForReadyAndFailsTerminalStatus(t *testing.T)
 			if checks > 1 {
 				status = blockstoragesdk.SnapshotStatusAvailable
 			}
-			snapshot.Status = &status
+			snapshot.Status.Set(status)
 			return testHTTPResponse(req, http.StatusOK, volumeSnapshotJSON(snapshot)), nil
 		})
 		r := &VolumeSnapshotResource{client: client, projectID: volumeTestProjectID, pollInterval: volumeSnapshotPollInterval, timeout: volumeSnapshotTimeout}
@@ -363,7 +397,7 @@ func TestVolumeSnapshotResourceWaitsForReadyAndFailsTerminalStatus(t *testing.T)
 		}
 		status := blockstoragesdk.SnapshotStatusFail
 		client = volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
-			snapshot.Status = &status
+			snapshot.Status.Set(status)
 			return testHTTPResponse(req, http.StatusOK, volumeSnapshotJSON(snapshot)), nil
 		})
 		r.client = client
@@ -371,4 +405,119 @@ func TestVolumeSnapshotResourceWaitsForReadyAndFailsTerminalStatus(t *testing.T)
 			t.Fatalf("terminal failure: %v", err)
 		}
 	})
+}
+
+// The request carries the trimmed description, and state after create, read,
+// and update keeps the configured spelling.
+func TestVolumeSnapshotResourceTrimsDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := snapshotResourceSchema(t)
+	snapshot := sampleVolumeSnapshot()
+	itemPath := "/v2/block-storage/volume-snapshots/" + snapshot.Id.String() + "/"
+	var sent []string
+	var sentVolumeID any
+	// The fake backend trims the description, as the API does.
+	storeDescription := func(req *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode %s body: %v", req.Method, err)
+			return
+		}
+		if volumeID, ok := body["volume_id"]; ok {
+			sentVolumeID = volumeID
+		}
+		description, ok := body["description"].(string)
+		if !ok {
+			t.Errorf("%s body has no description: %#v", req.Method, body)
+			return
+		}
+		sent = append(sent, description)
+		snapshot.Description = new(strings.TrimSpace(description))
+	}
+	client := volumeTestClient(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodPost && req.URL.Path == "/v2/block-storage/volume-snapshots/":
+			storeDescription(req)
+			return testHTTPResponse(req, http.StatusCreated, volumeSnapshotJSON(snapshot)), nil
+		case req.Method == http.MethodPatch && req.URL.Path == itemPath:
+			storeDescription(req)
+			return testHTTPResponse(req, http.StatusOK, volumeSnapshotJSON(snapshot)), nil
+		case req.Method == http.MethodGet && req.URL.Path == itemPath:
+			return testHTTPResponse(req, http.StatusOK, volumeSnapshotJSON(snapshot)), nil
+		default:
+			t.Errorf("unexpected request %s %s", req.Method, req.URL)
+			return testHTTPResponse(req, http.StatusInternalServerError, `{}`), nil
+		}
+	})
+	r := &VolumeSnapshotResource{client: client, projectID: volumeTestProjectID, pollInterval: time.Millisecond, timeout: time.Second}
+	description := func(t *testing.T, state tfsdk.State) string {
+		t.Helper()
+		var model VolumeSnapshotResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		return model.Description.ValueString()
+	}
+	paddedVolume := volumeIDReference("  " + volumeTestID.String() + " ")
+	volume := func(t *testing.T, state tfsdk.State) types.Object {
+		t.Helper()
+		var model VolumeSnapshotResourceModel
+		if diags := state.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		return model.Volume
+	}
+
+	plan := tfsdk.Plan{Schema: s}
+	if diags := plan.Set(ctx, &VolumeSnapshotResourceModel{VolumeSnapshotModel: VolumeSnapshotModel{
+		Name: types.StringValue("snapshot"), Description: types.StringValue(" saved "),
+	}, Volume: paddedVolume}); diags.HasError() {
+		t.Fatalf("set create plan: %v", diags)
+	}
+	created := resource.CreateResponse{State: tfsdk.State{Schema: s}}
+	r.Create(ctx, resource.CreateRequest{Config: tfsdk.Config{Raw: plan.Raw, Schema: s}, Plan: plan}, &created)
+	if created.Diagnostics.HasError() {
+		t.Fatalf("create: %v", created.Diagnostics)
+	}
+	if got := description(t, created.State); got != " saved " || strings.Join(sent, "|") != "saved" || sentVolumeID != volumeTestID.String() {
+		t.Fatalf("after create: state %q, sent %q, volume_id %v", got, sent, sentVolumeID)
+	}
+	if got := volume(t, created.State); !got.Equal(paddedVolume) {
+		t.Fatalf("after create: volume %v, want the configured spelling", got)
+	}
+	read := resource.ReadResponse{State: created.State}
+	r.Read(ctx, resource.ReadRequest{State: created.State}, &read)
+	if read.Diagnostics.HasError() || description(t, read.State) != " saved " || !volume(t, read.State).Equal(paddedVolume) {
+		t.Fatalf("after read: state %q volume %v %v", description(t, read.State), volume(t, read.State), read.Diagnostics)
+	}
+
+	current := read.State
+	for _, step := range []struct {
+		description string
+		wantSent    string
+	}{
+		{" after ", "saved|after"},
+		// A change in outer whitespace only sends no request.
+		{"after", "saved|after"},
+	} {
+		var model VolumeSnapshotResourceModel
+		if diags := current.Get(ctx, &model); diags.HasError() {
+			t.Fatalf("get state: %v", diags)
+		}
+		model.Description = types.StringValue(step.description)
+		updatePlan := tfsdk.Plan{Schema: s}
+		if diags := updatePlan.Set(ctx, &model); diags.HasError() {
+			t.Fatalf("set update plan: %v", diags)
+		}
+		updated := resource.UpdateResponse{State: tfsdk.State{Schema: s}}
+		r.Update(ctx, resource.UpdateRequest{Plan: updatePlan, State: current}, &updated)
+		if updated.Diagnostics.HasError() {
+			t.Fatalf("update to %q: %v", step.description, updated.Diagnostics)
+		}
+		if got := description(t, updated.State); got != step.description || strings.Join(sent, "|") != step.wantSent {
+			t.Fatalf("after update to %q: state %q, sent %q", step.description, got, sent)
+		}
+		current = updated.State
+	}
 }

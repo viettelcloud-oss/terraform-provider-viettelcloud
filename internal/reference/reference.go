@@ -21,6 +21,7 @@ import (
 const (
 	ID   = "id"
 	Name = "name"
+	URN  = "urn"
 )
 
 // Attributes returns the nested attributes of a reference that selects the

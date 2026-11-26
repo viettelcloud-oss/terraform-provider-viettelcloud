@@ -73,6 +73,43 @@ func referenceRequiresReplace(
 	return response.RequiresReplace
 }
 
+// stringRequiresReplace runs the plan modifiers of a string attribute on an
+// update from stateValue to planValue, with configValue as the configuration,
+// and reports whether they replace the resource.
+func stringRequiresReplace(
+	t *testing.T,
+	resourceSchema schema.Schema,
+	name string,
+	stateValue, planValue, configValue types.String,
+) bool {
+	t.Helper()
+
+	attribute, ok := resourceSchema.Attributes[name].(schema.StringAttribute)
+	if !ok {
+		t.Fatalf("%s is %T, want a string attribute", name, resourceSchema.Attributes[name])
+	}
+	// The modifiers treat a null state or plan as create or destroy, so the
+	// update is modeled by an object whose attributes are all null.
+	raw := nullAttributesValue(t, resourceSchema)
+
+	request := planmodifier.StringRequest{
+		State:       tfsdk.State{Schema: resourceSchema, Raw: raw},
+		Plan:        tfsdk.Plan{Schema: resourceSchema, Raw: raw},
+		StateValue:  stateValue,
+		PlanValue:   planValue,
+		ConfigValue: configValue,
+	}
+	response := planmodifier.StringResponse{PlanValue: planValue}
+	for _, modifier := range attribute.PlanModifiers {
+		request.PlanValue = response.PlanValue
+		modifier.PlanModifyString(context.Background(), request, &response)
+	}
+	if response.Diagnostics.HasError() {
+		t.Fatalf("plan modifier diagnostics: %v", response.Diagnostics)
+	}
+	return response.RequiresReplace
+}
+
 // readImportedState imports id and then reads the resource, the way Terraform
 // does for `terraform import`. The network API answers every request with
 // body.

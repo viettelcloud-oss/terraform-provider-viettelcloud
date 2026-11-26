@@ -25,7 +25,7 @@ func mockPlacementGroupDataSource(name, description string, policy serversdk.Pla
 		Id:          placementGroupTestUUID,
 		Name:        name,
 		Description: description,
-		Policy:      new(policy),
+		Policy:      core.NullableFromPtr(new(policy)),
 		ServerCount: new(3),
 		Region: serversdk.NestedRegionSchema{
 			Id:   placementGroupTestRegion,
@@ -133,7 +133,7 @@ func TestPlacementGroupDataSourcePreserveConfiguredValues(t *testing.T) {
 	preserveConfiguredPlacementGroupValues(&serversdk.PlacementGroupSchema{
 		Id:      placementGroupTestUUID,
 		Name:    "cluster-a",
-		Policy:  &policy,
+		Policy:  core.NullableFromPtr(&policy),
 		Region:  serversdk.NestedRegionSchema{Id: placementGroupTestRegion, Name: "vn-central"},
 		Project: placementGroupTestProject,
 	}, model, &model)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 )
 
@@ -71,13 +72,13 @@ func populatePrivateIPModel(privateIP *networksdk.PrivateIPSchema, m *PrivateIPM
 	m.CreatedAt = types.StringValue(privateIP.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(privateIP.UpdatedAt.Format(time.RFC3339))
 
-	m.Description = types.StringPointerValue(privateIP.Description)
-	m.IPAddress = types.StringPointerValue(privateIP.IpAddress)
-	m.MACAddress = types.StringPointerValue(privateIP.MacAddress)
+	m.Description = types.StringPointerValue(core.NullableToPtr(privateIP.Description))
+	m.IPAddress = types.StringPointerValue(core.NullableToPtr(privateIP.IpAddress))
+	m.MACAddress = types.StringPointerValue(core.NullableToPtr(privateIP.MacAddress))
 
-	if privateIP.Server != nil {
-		m.ServerID = types.StringValue(privateIP.Server.Id.String())
-		m.ServerName = types.StringValue(privateIP.Server.Name)
+	if server := core.NullableToPtr(privateIP.Server); server != nil {
+		m.ServerID = types.StringValue(server.Id.String())
+		m.ServerName = types.StringValue(server.Name)
 	} else {
 		m.ServerID = types.StringNull()
 		m.ServerName = types.StringNull()
@@ -99,7 +100,7 @@ func populatePrivateIPModel(privateIP *networksdk.PrivateIPSchema, m *PrivateIPM
 		for _, vip := range *privateIP.AttachedVips {
 			values = append(values, types.ObjectValueMust(privateIPAttachedVIPAttributeTypes, map[string]attr.Value{
 				"id":         types.StringValue(vip.Id.String()),
-				"ip_address": types.StringPointerValue(vip.IpAddress),
+				"ip_address": types.StringPointerValue(core.NullableToPtr(vip.IpAddress)),
 			}))
 		}
 		m.AttachedVIPs = types.SetValueMust(attachedVIPType, values)
@@ -128,15 +129,17 @@ func populatePrivateIPResourceState(privateIP *networksdk.PrivateIPSchema, state
 
 	originalIPAddress := state.IPAddress
 	originalMACAddress := state.MACAddress
+	originalDescription := state.Description
 	populatePrivateIPModel(privateIP, &state.PrivateIPModel)
+	state.Description = preservedNullableString(originalDescription, state.Description)
 
 	if !compare.SameUUID(reference.Get(state.Subnet, reference.ID), privateIP.Subnet.Id) {
 		state.Subnet = reference.Value(reference.ID, types.StringValue(privateIP.Subnet.Id.String()))
 	}
-	if privateIP.IpAddress != nil && compare.SameIPAddress(originalIPAddress, *privateIP.IpAddress) {
+	if ipAddress := core.NullableToPtr(privateIP.IpAddress); ipAddress != nil && compare.SameIPAddress(originalIPAddress, *ipAddress) {
 		state.IPAddress = originalIPAddress
 	}
-	if privateIP.MacAddress != nil && compare.SameMACAddress(originalMACAddress, *privateIP.MacAddress) {
+	if macAddress := core.NullableToPtr(privateIP.MacAddress); macAddress != nil && compare.SameMACAddress(originalMACAddress, *macAddress) {
 		state.MACAddress = originalMACAddress
 	}
 

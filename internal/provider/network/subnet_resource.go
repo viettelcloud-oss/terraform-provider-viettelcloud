@@ -7,17 +7,19 @@ import (
 	"strings"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 )
@@ -54,6 +56,9 @@ func (r *SubnetResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"name": schema.StringAttribute{
 				Required:    true,
 				Description: "Name of the subnet.",
+				Validators: []validator.String{
+					notBlank{},
+				},
 			},
 			"description": schema.StringAttribute{
 				Optional:    true,
@@ -63,7 +68,7 @@ func (r *SubnetResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"cidr": schema.StringAttribute{
 				Required: true,
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					replace.String(compare.SameTrimmedString),
 				},
 				Description: "IPv4 network CIDR inside the VPC, e.g. 10.0.1.0/24.",
 			},
@@ -72,7 +77,7 @@ func (r *SubnetResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Description: "VPC where the subnet is created.",
 				Attributes:  reference.Attributes(reference.ID, "VPC ID (UUID)."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.ID, compare.SameUUIDString),
 				},
 			},
 			"vpc_name": schema.StringAttribute{
@@ -238,8 +243,8 @@ func buildSubnetCreateBody(plan SubnetResourceModel) (networksdk.SubnetCreateSch
 	var body networksdk.SubnetCreateSchema
 	var diags diag.Diagnostics
 
-	if plan.Name.IsNull() || plan.Name.IsUnknown() {
-		diags.AddError("Missing subnet name", "name must be configured and known.")
+	if plan.Name.IsNull() || plan.Name.IsUnknown() || isBlank(plan.Name) {
+		diags.AddError("Missing subnet name", "name must be configured, known, and not blank.")
 	}
 	if plan.CIDR.IsNull() || plan.CIDR.IsUnknown() {
 		diags.AddError("Missing subnet CIDR", "cidr must be configured and known.")
@@ -251,10 +256,10 @@ func buildSubnetCreateBody(plan SubnetResourceModel) (networksdk.SubnetCreateSch
 	}
 
 	body.Name = strings.TrimSpace(plan.Name.ValueString())
-	body.Cidr = plan.CIDR.ValueString()
+	body.Cidr = strings.TrimSpace(plan.CIDR.ValueString())
 	body.VpcId = vpcID
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
+		description := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &description
 	}
 	return body, diags
@@ -268,8 +273,8 @@ func buildSubnetUpdateBody(
 	var diags diag.Diagnostics
 	changed := false
 
-	if plan.Name.IsNull() || plan.Name.IsUnknown() {
-		diags.AddError("Missing subnet name", "name must be configured and known.")
+	if plan.Name.IsNull() || plan.Name.IsUnknown() || isBlank(plan.Name) {
+		diags.AddError("Missing subnet name", "name must be configured, known, and not blank.")
 		return body, changed, diags
 	}
 	desiredName := strings.TrimSpace(plan.Name.ValueString())
@@ -278,11 +283,13 @@ func buildSubnetUpdateBody(
 		changed = true
 	}
 
-	if !plan.Description.IsNull() && !plan.Description.IsUnknown() &&
-		(state.Description.IsNull() || state.Description.IsUnknown() || !plan.Description.Equal(state.Description)) {
-		description := plan.Description.ValueString()
-		body.Description = &description
-		changed = true
+	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
+		// The API trims the description, so compare trimmed values.
+		description := strings.TrimSpace(plan.Description.ValueString())
+		if !compare.SameTrimmed(state.Description, description) {
+			body.Description.Set(description)
+			changed = true
+		}
 	}
 	return body, changed, diags
 }

@@ -18,9 +18,11 @@ import (
 	serverselector "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/selector"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
@@ -70,7 +72,7 @@ func sampleVolumeSnapshot() *blockstoragesdk.VolumeSnapshotSchema {
 	status := blockstoragesdk.SnapshotStatusAvailable
 	size := 30
 	return &blockstoragesdk.VolumeSnapshotSchema{
-		Id: core.UUID{3}, Name: "snapshot", Size: &size, Status: &status,
+		Id: core.UUID{3}, Name: "snapshot", Size: core.NullableFromPtr(&size), Status: core.NullableFromPtr(&status),
 		Volume:    blockstoragesdk.NestedVolumeSchema{Id: volumeTestID, Name: "data", Size: size},
 		Project:   blockstoragesdk.NestedProjectSchema{Id: volumeTestProjectID, Name: "project"},
 		Zone:      blockstoragesdk.NestedZoneSchema{Id: core.UUID{8}, Name: "zone-a"},
@@ -96,13 +98,13 @@ func testHTTPResponse(req *http.Request, status int, body string) *http.Response
 	}
 }
 
-func sampleVolumeDetail() *blockstoragesdk.VolumeDetailSchema {
-	return &blockstoragesdk.VolumeDetailSchema{
+func sampleVolumeDetail() *blockstoragesdk.VolumeSchema {
+	return &blockstoragesdk.VolumeSchema{
 		Id: volumeTestID, Name: "data", Size: 100, Status: blockstoragesdk.VolumeStatusAvailable,
 		ProjectId: volumeTestProjectID, Zone: blockstoragesdk.NestedZoneSchema{Id: core.UUID{8}, Name: "zone-a"},
 		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 		CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
-			VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{2}, Name: "Premium"},
+			VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: core.UUID{2}, Name: "Premium"}),
 		},
 	}
 }
@@ -113,7 +115,7 @@ func volumeResponseJSON(status blockstoragesdk.VolumeStatus) string {
 	return volumeDetailJSON(volume)
 }
 
-func volumeDetailJSON(volume *blockstoragesdk.VolumeDetailSchema) string {
+func volumeDetailJSON(volume *blockstoragesdk.VolumeSchema) string {
 	body, err := json.Marshal(volume)
 	if err != nil {
 		panic(fmt.Sprintf("marshal volume response: %v", err))
@@ -134,7 +136,7 @@ func volumeTypesResponseJSON() string {
 			UpdatedAt:         time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 			DiskType:          blockstoragesdk.LabeledVolumeTypeDiskType{Value: blockstoragesdk.VolumeTypeDiskTypeSsd, Label: label("SSD")},
 			EncryptionKeySize: blockstoragesdk.LabeledVolumeTypeEncryptKeySize{Value: blockstoragesdk.VolumeTypeEncryptKeySizeN256},
-			Speed:             blockstoragesdk.LabeledVolumeTypeSpeed{Value: blockstoragesdk.VolumeTypeSpeedN10k},
+			Speed:             blockstoragesdk.LabeledVolumeTypeSpeed{Value: "10k"},
 			State:             blockstoragesdk.LabeledVolumeTypeState{Value: blockstoragesdk.VolumeTypeStateUp},
 			Status:            blockstoragesdk.LabeledVolumeTypeStatus{Value: blockstoragesdk.VolumeTypeStatusEnabled},
 			Zone:              blockstoragesdk.NestedZoneSchema{Id: core.UUID{8}, Name: "zone-a"},
@@ -221,13 +223,13 @@ func testVolumeBackup() *blockstoragesdk.VolumeBackupSchema {
 	size := 30
 	diskType := blockstoragesdk.VolumeTypeDiskTypeSsd
 	return &blockstoragesdk.VolumeBackupSchema{
-		Id: id, Name: "backup", Description: &description, Status: &status, Size: &size,
-		DiskType: &diskType, Expired: false, CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Id: id, Name: "backup", Description: &description, Status: core.NullableFromPtr(&status), Size: core.NullableFromPtr(&size),
+		DiskType: core.NullableFromPtr(&diskType), Expired: false, CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 		Project:   blockstoragesdk.NestedProjectSchema{Id: core.UUID{9}},
 		Region:    blockstoragesdk.NestedRegionSchema{Id: core.UUID{3}, Name: "region"},
-		Volume:    &blockstoragesdk.NestedVolumeSchema{Id: core.UUID{2}, Name: "volume"},
-		Policy:    &blockstoragesdk.NestedVolumeBackupPolicySchema{Id: core.UUID{4}, Name: "policy"},
+		Volume:    core.NullableFromPtr(&blockstoragesdk.NestedVolumeSchema{Id: core.UUID{2}, Name: "volume"}),
+		Policy:    core.NullableFromPtr(&blockstoragesdk.NestedVolumeBackupPolicySchema{Id: core.UUID{4}, Name: "policy"}),
 	}
 }
 
@@ -356,6 +358,10 @@ func assertVolumeIDReference(t *testing.T, attribute schema.Attribute) {
 	if planReference(t, volume.PlanModifiers[0], current, current, current).RequiresReplace {
 		t.Fatal("an unchanged volume.id must not replace the resource")
 	}
+	respelled := volumeIDReference("  " + strings.ToUpper(volumeTestID.String()) + " ")
+	if planReference(t, volume.PlanModifiers[0], current, respelled, respelled).RequiresReplace {
+		t.Fatal("another spelling of volume.id must not replace the resource")
+	}
 	assertUnknownReferenceReplaces(t, volume.PlanModifiers[0], current, reference.ID, "volume")
 }
 
@@ -384,4 +390,169 @@ func nullVolumeZone() types.Object {
 
 func nullVolumeReference() types.Object {
 	return types.ObjectNull(reference.AttributeTypes(reference.ID))
+}
+
+const snapshotPoliciesPath = "/v2/block-storage/snapshot-policies/"
+
+var (
+	snapshotPolicyTestID       = core.UUID{6}
+	snapshotPolicyTestRegionID = core.UUID{7}
+)
+
+// sampleSnapshotPolicy returns a days-of-week policy as the API reports it:
+// the time carries seconds and the description and run times are null. The
+// fields are null explicitly, because an unset nullable encodes as a zero value.
+func sampleSnapshotPolicy(t *testing.T) *blockstoragesdk.SnapshotPolicySchema {
+	t.Helper()
+	var schedule blockstoragesdk.SnapshotPolicyScheduleSchema
+	if err := schedule.FromSnapshotPolicyDaysOfWeekScheduleSchema(blockstoragesdk.SnapshotPolicyDaysOfWeekScheduleSchema{
+		DaysOfWeek: []blockstoragesdk.SnapshotDayOfWeek{blockstoragesdk.SnapshotDayOfWeekMon, blockstoragesdk.SnapshotDayOfWeekFri},
+		Time:       "02:00:00",
+	}); err != nil {
+		t.Fatalf("build schedule: %v", err)
+	}
+	policy := &blockstoragesdk.SnapshotPolicySchema{
+		Id: snapshotPolicyTestID, Name: "nightly", Retention: 1, Schedule: schedule,
+		Status: blockstoragesdk.SnapshotPolicyStatusEnabled, State: blockstoragesdk.SnapshotPolicyStateReady, VolumeCount: 2,
+		Region:    blockstoragesdk.NestedRegionSchema{Id: snapshotPolicyTestRegionID, Name: "vn-central-1"},
+		Project:   blockstoragesdk.NestedProjectSchema{Id: volumeTestProjectID, Name: "project"},
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	}
+	policy.Description.SetNull()
+	policy.LastExecution.SetNull()
+	policy.NextExecution.SetNull()
+	return policy
+}
+
+// sampleSnapshotPolicyWithSchedule returns the sample policy with a schedule
+// of another type, built from raw JSON as the API sends it.
+func sampleSnapshotPolicyWithSchedule(t *testing.T, scheduleJSON string) *blockstoragesdk.SnapshotPolicySchema {
+	t.Helper()
+	policy := sampleSnapshotPolicy(t)
+	if err := json.Unmarshal([]byte(scheduleJSON), &policy.Schedule); err != nil {
+		t.Fatalf("decode schedule: %v", err)
+	}
+	return policy
+}
+
+func snapshotPolicyJSON(t *testing.T, policy *blockstoragesdk.SnapshotPolicySchema) string {
+	t.Helper()
+	body, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatalf("encode snapshot policy: %v", err)
+	}
+	return string(body)
+}
+
+// snapshotPolicyRegionsPage answers the region lookup that resolves
+// vn-central-1 to snapshotPolicyTestRegionID.
+func snapshotPolicyRegionsPage(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
+	page, err := json.Marshal(projectsdk.PagedProjectRegionSchema{Count: 1, Results: []projectsdk.ProjectRegionSchema{{
+		Region: projectsdk.NestedRegionSchema{Id: snapshotPolicyTestRegionID, Name: "vn-central-1"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testHTTPResponse(req, http.StatusOK, string(page))
+}
+
+func snapshotPolicyRegionsPath() string {
+	return "/v2/projects/" + volumeTestProjectID.String() + "/regions/"
+}
+
+func snapshotPolicyScheduleValue(days []string, clock string) types.Object {
+	values := make([]attr.Value, 0, len(days))
+	for _, day := range days {
+		values = append(values, types.StringValue(day))
+	}
+	return types.ObjectValueMust(snapshotPolicyScheduleTypes, map[string]attr.Value{
+		snapshotPolicyDaysOfWeek: types.SetValueMust(types.StringType, values),
+		snapshotPolicyTime:       types.StringValue(clock),
+	})
+}
+
+var (
+	backupPolicyTestID       = core.UUID{6}
+	backupPolicyTestRegionID = core.UUID{7}
+)
+
+const backupPoliciesPath = "/v2/block-storage/volume-backup-policies/"
+
+// backupPolicyFirstExecution is on the hour, as the API requires.
+var backupPolicyFirstExecution = time.Date(2030, 1, 1, 2, 0, 0, 0, time.UTC)
+
+// sampleVolumeBackupPolicy returns a periodic policy with a null description,
+// next execution, and last execution.
+func sampleVolumeBackupPolicy(t *testing.T) *blockstoragesdk.VolumeBackupPolicySchema {
+	t.Helper()
+	var schedule blockstoragesdk.VolumeBackupPolicyScheduleSchema
+	if err := schedule.FromVolumeBackupPolicyPeriodicScheduleSchema(blockstoragesdk.VolumeBackupPolicyPeriodicScheduleSchema{
+		FirstExecution: backupPolicyFirstExecution, Frequency: 2, FrequencyUnit: blockstoragesdk.PolicyFrequencyUnitDay,
+	}); err != nil {
+		t.Fatalf("build periodic schedule: %v", err)
+	}
+	return &blockstoragesdk.VolumeBackupPolicySchema{
+		Id: backupPolicyTestID, Name: "nightly", Retention: 1,
+		Status: blockstoragesdk.VolumeBackupPolicyStatusEnabled, State: blockstoragesdk.VolumeBackupPolicyStateReady, VolumeCount: 2,
+		Description: nullValue[string](), NextExecution: nullValue[time.Time](), LastExecution: nullValue[time.Time](),
+		Schedule:  schedule,
+		Region:    blockstoragesdk.NestedRegionSchema{Id: backupPolicyTestRegionID, Name: "vn-central-1"},
+		Project:   blockstoragesdk.NestedProjectSchema{Id: volumeTestProjectID, Name: "project"},
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+// nullValue returns an explicit null, which an unset core.Nullable cannot
+// stand for: it encodes as the zero value of T.
+func nullValue[T any]() core.Nullable[T] {
+	var value core.Nullable[T]
+	value.SetNull()
+	return value
+}
+
+func volumeBackupPolicyJSON(t *testing.T, policy *blockstoragesdk.VolumeBackupPolicySchema) string {
+	t.Helper()
+	body, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatalf("encode volume backup policy: %v", err)
+	}
+	return string(body)
+}
+
+// periodicScheduleObject returns a periodic schedule object whose days_of_month
+// and time are null.
+func periodicScheduleObject(frequency int64, unit, firstExecution string) types.Object {
+	return scheduleObject(volumeBackupPolicyScheduleModel{
+		ExecutionStrategy: types.StringValue("periodic"), Frequency: types.Int64Value(frequency), FrequencyUnit: types.StringValue(unit),
+		FirstExecution: types.StringValue(firstExecution), DaysOfMonth: types.SetNull(types.Int64Type), Time: types.StringNull(),
+	})
+}
+
+func scheduleObject(model volumeBackupPolicyScheduleModel) types.Object { return model.object() }
+
+// backupPolicyRegionsHandler answers the region lookup that Create and the
+// data source make, and records the name filter that it received.
+func backupPolicyRegionsHandler(t *testing.T, req *http.Request, wantName string) *http.Response {
+	t.Helper()
+	if got := req.URL.Query().Get("name"); got != wantName {
+		t.Errorf("region lookup must filter by %q, got %q", wantName, got)
+	}
+	page, err := json.Marshal(projectsdk.PagedProjectRegionSchema{Count: 1, Results: []projectsdk.ProjectRegionSchema{{
+		Region: projectsdk.NestedRegionSchema{Id: backupPolicyTestRegionID, Name: wantName},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testHTTPResponse(req, http.StatusOK, string(page))
+}
+
+func stringValidationErrors(t *testing.T, validators []validator.String, value string) int {
+	t.Helper()
+	var response validator.StringResponse
+	for _, v := range validators {
+		v.ValidateString(context.Background(), validator.StringRequest{Path: path.Root("value"), ConfigValue: types.StringValue(value)}, &response)
+	}
+	return response.Diagnostics.ErrorsCount()
 }

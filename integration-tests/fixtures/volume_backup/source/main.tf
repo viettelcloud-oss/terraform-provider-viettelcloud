@@ -1,4 +1,6 @@
-# This fixture creates two available volumes for backup lifecycle tests.
+# This fixture creates the available volumes for the backup lifecycle tests.
+# The lifecycle and import chains use two backup sources, and the restore chain
+# uses one backup source and two restore targets.
 terraform {
   required_version = ">= 1.16"
   required_providers {
@@ -10,7 +12,7 @@ variable "volume_type" { type = object({ name = optional(string), disk_type = op
 variable "zone" { type = string }
 
 resource "viettelcloud_volume" "source" {
-  for_each = toset(["primary", "replacement"])
+  for_each = toset(["primary", "replacement", "restore_source", "restore_first", "restore_second"])
   name     = "tf-test-backup-source-${each.key}"
   size     = 30
   zone     = { name = var.zone }

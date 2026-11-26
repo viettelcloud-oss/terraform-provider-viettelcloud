@@ -190,7 +190,7 @@ func TestSubnetDataSourceReadPreservesConfiguredIDRepresentation(t *testing.T) {
 	ctx := context.Background()
 	dsSchema := subnetDataSourceSchema(t)
 	configState := tfsdk.State{Schema: dsSchema}
-	configuredID := strings.ToUpper(subnetTestUUID.String())
+	configuredID := "  " + strings.ToUpper(subnetTestUUID.String()) + " "
 	if diags := configState.Set(ctx, &SubnetDataSourceModel{SubnetModel: SubnetModel{
 		ID: types.StringValue(configuredID),
 	}}); diags.HasError() {
@@ -461,6 +461,20 @@ func TestPreserveConfiguredSubnetValuesUsesChangedBackendValues(t *testing.T) {
 		state.VPCID.ValueString() != subnet.Vpc.Id.String() || state.VPCName.ValueString() != subnet.Vpc.Name ||
 		state.Region.ValueString() != subnet.Region.Name {
 		t.Fatalf("expected backend values, got %#v", state)
+	}
+}
+
+func TestPreserveConfiguredSubnetValuesKeepsPaddedVPCID(t *testing.T) {
+	t.Parallel()
+
+	subnet := mockSubnet("application", "description")
+	configuredVPCID := "  " + subnet.Vpc.Id.String() + "  "
+	var state SubnetDataSourceModel
+	populateSubnetDataSourceState(subnet, &state)
+	preserveConfiguredSubnetValues(subnet, SubnetDataSourceModel{VPCID: types.StringValue(configuredVPCID)}, &state)
+
+	if state.VPCID.ValueString() != configuredVPCID {
+		t.Fatalf("vpc_id = %q, want the configured %q", state.VPCID.ValueString(), configuredVPCID)
 	}
 }
 

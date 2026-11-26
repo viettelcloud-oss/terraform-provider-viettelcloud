@@ -1,0 +1,1 @@
+terraform import viettelcloud_project_member_roles.example 00000000-0000-0000-0000-000000000001

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -161,6 +162,9 @@ func TestServerReferencePlanModifiersReplaceOnlyWhenTheReferenceChanges(t *testi
 	zoneA, zoneB := nameReference(types.StringValue("zone-a")), nameReference(types.StringValue("zone-b"))
 	volumeA, volumeB := idReference(types.StringValue(core.UUID{9}.String())), idReference(types.StringValue(core.UUID{10}.String()))
 	keyPair := idReference(types.StringValue(testKeyPairID.String()))
+	respelledID := func(id core.UUID) types.Object {
+		return idReference(types.StringValue("  " + strings.ToUpper(id.String()) + " "))
+	}
 	unknownName := types.ObjectUnknown(reference.AttributeTypes(reference.Name))
 	unknownID := types.ObjectUnknown(reference.AttributeTypes(reference.ID))
 	nullName := types.ObjectNull(reference.AttributeTypes(reference.Name))
@@ -178,6 +182,10 @@ func TestServerReferencePlanModifiersReplaceOnlyWhenTheReferenceChanges(t *testi
 		{"key_pair changed", attribute(resourceSchema.Attributes["key_pair"]), volumeA, keyPair, volumeA, volumeA, true},
 		{"placement_group omitted keeps state", attribute(resourceSchema.Attributes["placement_group"]), nullID, volumeA, unknownID, volumeA, false},
 		{"boot.volume changed", attribute(boot.Attributes["volume"]), volumeB, volumeA, volumeB, volumeB, true},
+		{"zone respelled", attribute(resourceSchema.Attributes["zone"]), nameReference(types.StringValue(" zone-a ")), zoneA, nameReference(types.StringValue(" zone-a ")), nameReference(types.StringValue(" zone-a ")), false},
+		{"key_pair respelled", attribute(resourceSchema.Attributes["key_pair"]), respelledID(testKeyPairID), keyPair, respelledID(testKeyPairID), respelledID(testKeyPairID), false},
+		{"placement_group respelled", attribute(resourceSchema.Attributes["placement_group"]), respelledID(core.UUID{9}), volumeA, respelledID(core.UUID{9}), respelledID(core.UUID{9}), false},
+		{"boot.volume respelled", attribute(boot.Attributes["volume"]), respelledID(core.UUID{9}), volumeA, respelledID(core.UUID{9}), respelledID(core.UUID{9}), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -194,6 +202,27 @@ func TestServerReferencePlanModifiersReplaceOnlyWhenTheReferenceChanges(t *testi
 					resp.PlanValue, resp.RequiresReplace, resp.Diagnostics, tc.wantPlan, tc.wantReplace)
 			}
 		})
+	}
+}
+
+func TestServerBootTypePlanModifierIgnoresOuterWhitespace(t *testing.T) {
+	t.Parallel()
+	resourceSchema := serverSchema(t)
+	model := emptyServerResourceModel()
+	model.ID = types.StringValue(testServerID.String())
+	model.Name = types.StringValue("server")
+	boot := resourceSchema.Attributes["boot"].(resourceschema.SingleNestedAttribute)
+	bootType := boot.Attributes["boot_type"].(resourceschema.StringAttribute)
+	for planned, want := range map[string]bool{" image ": false, "volume": true} {
+		req := resourceplanmodifier.StringRequest{
+			State: stateFor(t, resourceSchema, model), Plan: planFor(t, resourceSchema, model),
+			ConfigValue: types.StringValue(planned), StateValue: types.StringValue("image"), PlanValue: types.StringValue(planned),
+		}
+		resp := resourceplanmodifier.StringResponse{PlanValue: req.PlanValue}
+		bootType.PlanModifiers[0].PlanModifyString(context.Background(), req, &resp)
+		if resp.RequiresReplace != want {
+			t.Errorf("boot_type image -> %q: replace=%t, want %t", planned, resp.RequiresReplace, want)
+		}
 	}
 }
 
@@ -407,7 +436,7 @@ func TestServerReadReconstructsImportedBootAndDataVolumeState(t *testing.T) {
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, Name: "imported", Description: "",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "small", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
 				Volumes: []serversdk.NestedServerVolumeSchema{
@@ -423,18 +452,18 @@ func TestServerReadReconstructsImportedBootAndDataVolumeState(t *testing.T) {
 				}},
 			})
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volumes/"+rootVolumeID.String()+"/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{
-				Id: rootVolumeID, Bootable: true, Size: 30, Iops: &bootIOPS, Status: blockstoragesdk.VolumeStatusInUse,
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{
+				Id: rootVolumeID, Bootable: true, Size: 30, Iops: bootIOPS, Status: blockstoragesdk.VolumeStatusInUse,
 				CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
-					Image:      &blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
-					VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"},
+					Image:      core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
+					VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}),
 				},
 			})
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volumes/"+dataVolumeID.String()+"/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{
-				Id: dataVolumeID, Size: 50, Iops: &dataIOPS, Status: blockstoragesdk.VolumeStatusInUse,
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{
+				Id: dataVolumeID, Size: 50, Iops: dataIOPS, Status: blockstoragesdk.VolumeStatusInUse,
 				CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
-					VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"},
+					VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}),
 				},
 			})
 		default:
@@ -510,10 +539,10 @@ func TestServerDataVolumeStateResolvesAllocatedIOPS(t *testing.T) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volumes/"+dataVolumeID.String()+"/":
 			reads.Add(1)
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{
-				Id: dataVolumeID, Size: 50, Iops: &allocated, Status: blockstoragesdk.VolumeStatusInUse,
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{
+				Id: dataVolumeID, Size: 50, Iops: allocated, Status: blockstoragesdk.VolumeStatusInUse,
 				CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
-					VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"},
+					VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}),
 				},
 			})
 		default:
@@ -574,8 +603,8 @@ func TestServerDataVolumeStateRefreshesBackendIOPS(t *testing.T) {
 			http.NotFound(w, req)
 			return
 		}
-		writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{
-			Id: dataVolumeID, Size: 60, Iops: &allocated, Status: blockstoragesdk.VolumeStatusInUse,
+		writeJSON(t, w, &blockstoragesdk.VolumeSchema{
+			Id: dataVolumeID, Size: 60, Iops: allocated, Status: blockstoragesdk.VolumeStatusInUse,
 		})
 	}))
 	defer api.Close()
@@ -646,7 +675,7 @@ func TestBuildBootVolumeResizePlanValidatesBackendSize(t *testing.T) {
 				{MountAs: "root", Volume: serversdk.NestedVolumeSchema{Id: rootID}},
 			}})
 		case "/v2/block-storage/volumes/" + rootID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: rootID, Size: 30, Status: blockstoragesdk.VolumeStatusInUse})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: rootID, Size: 30, Status: blockstoragesdk.VolumeStatusInUse})
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 			http.NotFound(w, req)
@@ -684,7 +713,7 @@ func TestBuildDataVolumeUpdatePlanValidatesBackendSize(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
 		case "/v2/block-storage/volumes/" + dataID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: dataID, Size: 50, Status: blockstoragesdk.VolumeStatusInUse})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: dataID, Size: 50, Status: blockstoragesdk.VolumeStatusInUse})
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 			http.NotFound(w, req)
@@ -779,7 +808,7 @@ func TestApplyServerUpdateExtendsVolumesInPlace(t *testing.T) {
 			extended[id] = body.Size
 			w.WriteHeader(http.StatusAccepted)
 		case http.MethodGet:
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: id, Size: extended[id], Status: blockstoragesdk.VolumeStatusInUse})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: id, Size: extended[id], Status: blockstoragesdk.VolumeStatusInUse})
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 			http.NotFound(w, req)
@@ -809,10 +838,10 @@ func TestServerBootStateRequiresImportedVolumeTypeMetadata(t *testing.T) {
 	t.Parallel()
 	var diags diag.Diagnostics
 	boot := serverBootStateObject(
-		&serversdk.ServerDetailSchema{Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}},
-		&blockstoragesdk.VolumeDetailSchema{
+		&serversdk.ServerDetailSchema{Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"})},
+		&blockstoragesdk.VolumeSchema{
 			Size:       30,
-			CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{Image: &blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}},
+			CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{Image: core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"})},
 		},
 		core.UUID{9},
 		"image",
@@ -827,14 +856,14 @@ func TestServerBootStateRequiresImportedVolumeTypeMetadata(t *testing.T) {
 func TestServerBootStatePreservesConfiguredReferences(t *testing.T) {
 	t.Parallel()
 	rootVolumeID := core.UUID{9}
-	rootVolume := &blockstoragesdk.VolumeDetailSchema{
+	rootVolume := &blockstoragesdk.VolumeSchema{
 		Size: 30,
 		CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
-			Image:      &blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
-			VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"},
+			Image:      core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
+			VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}),
 		},
 	}
-	server := &serversdk.ServerDetailSchema{Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}}
+	server := &serversdk.ServerDetailSchema{Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"})}
 	for _, tc := range []struct {
 		name     string
 		bootType string
@@ -905,7 +934,7 @@ func TestBuildServerCreateBody(t *testing.T) {
 	t.Parallel()
 	plan := ServerResourceModel{
 		ServerModel: ServerModel{
-			Name: types.StringValue("  application  "), Description: types.StringValue("application server"),
+			Name: types.StringValue("  application  "), Description: types.StringValue(" application server "),
 			Zone: nameReference(types.StringValue("zone-a")), UserData: types.StringValue("#cloud-config"), Bandwidth: types.Int64Value(100),
 			KeyPair:        idReference(types.StringValue(testKeyPairID.String())),
 			PlacementGroup: idReference(types.StringValue(testPlacementGroupID.String())),
@@ -975,10 +1004,10 @@ func TestBuildServerCreateBody(t *testing.T) {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
 	if body.Name != "application" || body.Description == nil || *body.Description != "application server" ||
-		body.ZoneId == nil || *body.ZoneId != testZoneID || body.Quantity == nil || *body.Quantity != 1 ||
+		!nullableEquals(body.ZoneId, testZoneID) || body.Quantity == nil || *body.Quantity != 1 ||
 		body.Bandwidth == nil || *body.Bandwidth != 100 || body.UserData == nil || *body.UserData != "#cloud-config" ||
-		body.KeyPairId == nil || *body.KeyPairId != testKeyPairID ||
-		body.PlacementGroupId == nil || *body.PlacementGroupId != testPlacementGroupID {
+		!nullableEquals(body.KeyPairId, testKeyPairID) ||
+		!nullableEquals(body.PlacementGroupId, testPlacementGroupID) {
 		t.Fatalf("unexpected create body: %#v", body)
 	}
 	if volumeResolveCalls != 2 {
@@ -989,7 +1018,7 @@ func TestBuildServerCreateBody(t *testing.T) {
 		t.Fatalf("unexpected predefined flavor: %#v, %v", flavor, err)
 	}
 	boot, err := body.Boot.AsServerBootFromImage()
-	if err != nil || boot.ImageId != testImageID || boot.VolumeTypeId != testVolumeTypeID || boot.VolumeSize != 30 || boot.Iops == nil || *boot.Iops != 1000 {
+	if err != nil || boot.ImageId != testImageID || boot.VolumeTypeId != testVolumeTypeID || boot.VolumeSize != 30 || !nullableEquals(boot.Iops, 1000) {
 		t.Fatalf("unexpected image boot: %#v, %v", boot, err)
 	}
 	if body.PrivateIps == nil || len(*body.PrivateIps) != 1 || body.ElasticIps == nil || len(*body.ElasticIps) != 1 ||
@@ -1027,7 +1056,7 @@ func TestBuildServerCreateBodyReadsReferenceObjects(t *testing.T) {
 			if diags.HasError() {
 				t.Fatalf("unexpected diagnostics: %v", diags)
 			}
-			if body.ZoneId != nil || body.KeyPairId != nil || body.PlacementGroupId != nil || body.SecurityGroups != nil {
+			if body.ZoneId.IsSpecified() || body.KeyPairId.IsSpecified() || body.PlacementGroupId.IsSpecified() || body.SecurityGroups != nil {
 				t.Fatalf("expected omitted references to stay out of the request: %#v", body)
 			}
 		})
@@ -1051,7 +1080,7 @@ func TestBuildServerCreateBodyReadsReferenceObjects(t *testing.T) {
 		if diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
 		}
-		if body.ZoneId == nil || *body.ZoneId != testZoneID || body.SecurityGroups == nil ||
+		if !nullableEquals(body.ZoneId, testZoneID) || body.SecurityGroups == nil ||
 			len(*body.SecurityGroups) != 1 || (*body.SecurityGroups)[0].Id != securityGroupID {
 			t.Fatalf("unexpected references in request: %#v", body)
 		}
@@ -1214,6 +1243,126 @@ func TestBuildServerUpdateBody(t *testing.T) {
 	}
 }
 
+func TestBuildServerUpdateBodyComparesTrimmedDescription(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, state, plan string
+		want              *string
+	}{
+		{name: "padded equal value", state: "web", plan: " web "},
+		{name: "padded state", state: " web ", plan: "web"},
+		{name: "padded change", state: "web", plan: " api ", want: new("api")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			state := ServerResourceModel{ServerModel: ServerModel{Name: types.StringValue("server"), Description: types.StringValue(tc.state)}}
+			plan := state
+			plan.Description = types.StringValue(tc.plan)
+			body, changed, diags := buildServerUpdateBody(plan, state)
+			if diags.HasError() {
+				t.Fatalf("unexpected diagnostics: %v", diags)
+			}
+			if tc.want == nil {
+				if changed || body.Description != nil {
+					t.Fatalf("expected no patch, got changed=%v body=%#v", changed, body)
+				}
+				return
+			}
+			if !changed || body.Description == nil || *body.Description != *tc.want {
+				t.Fatalf("expected description %q, got changed=%v body=%#v", *tc.want, changed, body)
+			}
+		})
+	}
+}
+
+func TestServerStateKeepsConfiguredUUIDSpelling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	respelled := func(id core.UUID) types.String {
+		return types.StringValue("  " + strings.ToUpper(id.String()) + " ")
+	}
+	var diags diag.Diagnostics
+
+	privateIP := privateIPValues(testPrivateIPID, false)
+	privateIP["id"] = respelled(testPrivateIPID)
+	privateIPs := privateIPResourceList(ctx, listValue(t, privateIPResourceAttributeTypes(), []map[string]attr.Value{privateIP}),
+		[]serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID}}, false, &diags)
+	elasticIP := elasticIPValues(testElasticIPID, false)
+	elasticIP["id"] = respelled(testElasticIPID)
+	elasticIPs := elasticIPResourceList(ctx, listValue(t, elasticIPResourceAttributeTypes(), []map[string]attr.Value{elasticIP}),
+		[]serversdk.NestedElasticIPSchema{{Id: testElasticIPID, Status: serversdk.ElasticIPStatusActive}}, false, &diags)
+	var gotPrivate []PrivateIPInputModel
+	var gotElastic []ElasticIPInputModel
+	diags.Append(privateIPs.ElementsAs(ctx, &gotPrivate, false)...)
+	diags.Append(elasticIPs.ElementsAs(ctx, &gotElastic, false)...)
+	if diags.HasError() || len(gotPrivate) != 1 || len(gotElastic) != 1 ||
+		!gotPrivate[0].ID.Equal(respelled(testPrivateIPID)) || !gotElastic[0].ID.Equal(respelled(testElasticIPID)) {
+		t.Fatalf("private_ips=%s elastic_ips=%s diagnostics=%v, want the configured ID spelling", privateIPs, elasticIPs, diags)
+	}
+
+	volumeID := core.UUID{31}
+	volume := DataVolumeInputModel{Kind: types.StringValue("existing"), ID: respelled(volumeID), VolumeType: types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())}
+	diags.Append(populateServerDataVolume(&blockstoragesdk.VolumeSchema{Id: volumeID, Size: 10}, true, &volume)...)
+	if diags.HasError() || !volume.ID.Equal(respelled(volumeID)) {
+		t.Fatalf("data volume id=%s diagnostics=%v, want the configured spelling", volume.ID, diags)
+	}
+	other := DataVolumeInputModel{Kind: types.StringValue("existing"), ID: respelled(core.UUID{32}), VolumeType: types.ObjectNull(blockstorageselector.VolumeTypeAttributeTypes())}
+	diags.Append(populateServerDataVolume(&blockstoragesdk.VolumeSchema{Id: volumeID, Size: 10}, true, &other)...)
+	if other.ID.ValueString() != volumeID.String() {
+		t.Fatalf("data volume id=%s, want the backend ID for another volume", other.ID)
+	}
+
+	customImageID := core.UUID{33}
+	server := &serversdk.ServerDetailSchema{Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: customImageID})}
+	for bootType, current := range map[string]BootInputModel{
+		"custom_image": {CustomImage: idReference(respelled(customImageID)), Volume: idReference(types.StringNull()), Image: types.ObjectNull(serverselector.ImageAttributeTypes()), VolumeType: testVolumeTypeSelector(types.StringValue("ssd"))},
+		"volume":       {Volume: idReference(respelled(volumeID)), CustomImage: idReference(types.StringNull()), Image: types.ObjectNull(serverselector.ImageAttributeTypes())},
+	} {
+		current.BootType = types.StringValue(" " + bootType + " ")
+		boot := serverBootStateObject(server, nil, volumeID, bootType, current, &diags)
+		var got BootInputModel
+		diags.Append(boot.As(ctx, &got, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() || !got.CustomImage.Equal(current.CustomImage) || !got.Volume.Equal(current.Volume) || !got.BootType.Equal(current.BootType) {
+			t.Fatalf("boot type %s: state %s diagnostics=%v, want the configured spelling", bootType, boot, diags)
+		}
+	}
+}
+
+func TestPopulateServerResourceStateKeepsPaddedDescriptionAndPowerState(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                            string
+		description, powerState         types.String
+		backendDescription              string
+		backendPowerState               serversdk.ServerPowerState
+		wantDescription, wantPowerState string
+	}{
+		{"padded equal values", types.StringValue(" web "), types.StringValue(" running "), "web", serversdk.ServerPowerStateRunning, " web ", " running "},
+		{"backend drift", types.StringValue(" web "), types.StringValue(" running "), "api", serversdk.ServerPowerStateShutdown, "api", "shutdown"},
+		{"different case is drift", types.StringValue("web"), types.StringValue(" Running "), "web", serversdk.ServerPowerStateRunning, "web", "running"},
+		{"unknown plan", types.StringUnknown(), types.StringUnknown(), "web", serversdk.ServerPowerStateRunning, "web", "running"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			state := emptyServerResourceModel()
+			state.Name = types.StringValue("server")
+			state.Description = tc.description
+			state.PowerState = tc.powerState
+			server := &serversdk.ServerDetailSchema{
+				Id: testServerID, Name: "server", Description: tc.backendDescription, PowerState: tc.backendPowerState,
+				Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "s2.small"},
+				Zone:   serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
+			}
+			if diags := populateServerResourceState(context.Background(), server, &state); diags.HasError() {
+				t.Fatalf("unexpected diagnostics: %v", diags)
+			}
+			if state.Description.ValueString() != tc.wantDescription || state.PowerState.ValueString() != tc.wantPowerState {
+				t.Fatalf("description=%q power_state=%q", state.Description.ValueString(), state.PowerState.ValueString())
+			}
+		})
+	}
+}
+
 func TestPopulateServerResourceStatePreservesAttachmentPolicy(t *testing.T) {
 	t.Parallel()
 	state := ServerResourceModel{
@@ -1236,9 +1385,9 @@ func TestPopulateServerResourceStatePreservesAttachmentPolicy(t *testing.T) {
 		Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "s2.small"},
 		Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 		PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
-		ServerType: "vm", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Bandwidth: &bandwidth,
-		PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: &ipv4}},
-		ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: &publicIP, Status: serversdk.ElasticIPStatusActive}},
+		ServerType: "vm", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Bandwidth: core.NullableFromPtr(&bandwidth),
+		PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: core.NullableFromPtr(&ipv4)}},
+		ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: core.NullableFromPtr(&publicIP), Status: serversdk.ElasticIPStatusActive}},
 		Volumes:    []serversdk.NestedServerVolumeSchema{{MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: core.UUID{9}}}},
 	}
 	diags := populateServerResourceState(context.Background(), server, &state)
@@ -1333,8 +1482,8 @@ func TestServerDeleteRemovesSelectedAttachments(t *testing.T) {
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "s2.small"},
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateShutdown, Status: serversdk.ServerStatusShutoff,
-				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID}},
-				ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID}},
+				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: nullNullable[string]()}},
+				ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: nullNullable[string]()}},
 			})
 		case req.Method == http.MethodDelete && req.URL.Path == "/v2/server/servers/"+testServerID.String()+"/":
 			serverDeleted = true
@@ -1579,9 +1728,9 @@ func TestServerDeleteRemovesTerminatedVolumes(t *testing.T) {
 			serverDeleted = true
 			w.WriteHeader(http.StatusAccepted)
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volumes/"+rootVolumeID.String()+"/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: rootVolumeID, Status: blockstoragesdk.VolumeStatusAvailable})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: rootVolumeID, Status: blockstoragesdk.VolumeStatusAvailable})
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/block-storage/volumes/"+firstDataVolumeID.String()+"/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: firstDataVolumeID, Status: blockstoragesdk.VolumeStatusAvailable})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: firstDataVolumeID, Status: blockstoragesdk.VolumeStatusAvailable})
 		case req.Method == http.MethodDelete && req.URL.Path == "/v2/block-storage/volumes/"+rootVolumeID.String()+"/":
 			if !serverDeleted {
 				t.Errorf("boot volume was deleted before the server")
@@ -1812,7 +1961,7 @@ func testServerDeleteWaitsForVolumeDetach(t *testing.T, scenario string) {
 			case attempt > 2:
 				status = blockstoragesdk.VolumeStatusAvailable
 			}
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: volumeID, Status: status})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: volumeID, Status: status})
 		case req.Method == http.MethodDelete && req.URL.Path == "/v2/block-storage/volumes/"+volumeID.String()+"/":
 			if polls.Load() < 3 {
 				t.Errorf("volume %s was deleted while it still reported in-use", volumeID)
@@ -2002,8 +2151,8 @@ func TestPopulateServerResourceStateMapsKeyPairAndPlacementGroup(t *testing.T) {
 	t.Run("populated from response", func(t *testing.T) {
 		t.Parallel()
 		state := emptyServerResourceModel()
-		configuredKeyPair := idReference(types.StringValue(" " + strings.ToUpper(testKeyPairID.String()) + " "))
-		configuredPlacementGroup := idReference(types.StringValue(" " + testPlacementGroupID.String() + " "))
+		configuredKeyPair := idReference(types.StringValue("  " + strings.ToUpper(testKeyPairID.String()) + " "))
+		configuredPlacementGroup := idReference(types.StringValue("  " + testPlacementGroupID.String() + " "))
 		state.KeyPair = configuredKeyPair
 		state.PlacementGroup = configuredPlacementGroup
 
@@ -2011,8 +2160,8 @@ func TestPopulateServerResourceStateMapsKeyPairAndPlacementGroup(t *testing.T) {
 			Id: testServerID, Name: "application",
 			Flavor:         serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "s2.small"},
 			Zone:           serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
-			KeyPair:        &serversdk.NestedKeyPairSchema{Id: testKeyPairID, Name: "my-keypair"},
-			PlacementGroup: &serversdk.NestedPlacementGroupSchema{Id: testPlacementGroupID, Name: "my-pg"},
+			KeyPair:        core.NullableFromPtr(&serversdk.NestedKeyPairSchema{Id: testKeyPairID, Name: "my-keypair"}),
+			PlacementGroup: core.NullableFromPtr(&serversdk.NestedPlacementGroupSchema{Id: testPlacementGroupID, Name: "my-pg"}),
 		}
 		if diags := populateServerResourceState(context.Background(), server, &state); diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
@@ -2058,7 +2207,7 @@ func TestPopulateServerResourceStateMapsKeyPairAndPlacementGroup(t *testing.T) {
 			Id: testServerID, Name: "application",
 			Flavor:  serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "s2.small"},
 			Zone:    serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
-			KeyPair: &serversdk.NestedKeyPairSchema{Id: testKeyPairID, Name: "my-keypair"},
+			KeyPair: core.NullableFromPtr(&serversdk.NestedKeyPairSchema{Id: testKeyPairID, Name: "my-keypair"}),
 		}
 		if diags := populateServerResourceState(context.Background(), server, &state); diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
@@ -2188,6 +2337,14 @@ func TestUserDataPlanModifiers(t *testing.T) {
 			stateValue:      types.StringValue("#cloud-config\npackages:\n  - nginx\n"),
 			planValue:       types.StringValue("#cloud-config\npackage_update: true\n"),
 			wantPlanValue:   types.StringValue("#cloud-config\npackage_update: true\n"),
+			requiresReplace: true,
+		},
+		{
+			name:            "whitespace-only edit requires replacement",
+			configValue:     types.StringValue("\n#cloud-config\npackages:\n  - nginx\n\n"),
+			stateValue:      types.StringValue("#cloud-config\npackages:\n  - nginx\n"),
+			planValue:       types.StringValue("\n#cloud-config\npackages:\n  - nginx\n\n"),
+			wantPlanValue:   types.StringValue("\n#cloud-config\npackages:\n  - nginx\n\n"),
 			requiresReplace: true,
 		},
 	}
@@ -2331,7 +2488,9 @@ func TestServerOperationWaitsOnlyForExplicitBusyRejections(t *testing.T) {
 		body   string
 		retry  bool
 	}{
-		{"busy", http.StatusConflict, `{"errors":[{"code":"conflict","message":"There is another operation running on this server, retry again later"}]}`, true},
+		{"busy", http.StatusConflict, `{"errors":[{"code":"resource_busy","message":"server is busy, please try again later."}]}`, true},
+		{"busy from an older backend", http.StatusConflict, `{"errors":[{"code":"conflict","message":"There is another operation running on this server, retry again later"}]}`, true},
+		{"failed operation", http.StatusConflict, `{"errors":[{"code":"conflict","message":"The last operation on server failed."}]}`, false},
 		{"unrelated conflict", http.StatusConflict, `{"errors":[{"code":"conflict","message":"The server cannot start in this state"}]}`, false},
 		{"transport failure", http.StatusBadGateway, `{"detail":"upstream unavailable"}`, false},
 	} {
@@ -2705,11 +2864,11 @@ func TestWaitUntilAttachmentsSettledWaitsForALaggingAttach(t *testing.T) {
 			}
 			switch {
 			case polls.Add(1) > 3:
-				server.PrivateIps = []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: &ipv4}}
+				server.PrivateIps = []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: core.NullableFromPtr(&ipv4)}}
 			case polls.Load() > 2:
 				// The attachment surfaces before its address does, and refreshing
 				// state on that response records a null ip_address.
-				server.PrivateIps = []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID}}
+				server.PrivateIps = []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: nullNullable[string]()}}
 			}
 			writeJSON(t, w, server)
 		})
@@ -2720,7 +2879,7 @@ func TestWaitUntilAttachmentsSettledWaitsForALaggingAttach(t *testing.T) {
 		if err != nil {
 			t.Fatalf("wait for attachments: %v", err)
 		}
-		if polls.Load() != 4 || server == nil || len(server.PrivateIps) != 1 || server.PrivateIps[0].IpAddress == nil {
+		if polls.Load() != 4 || server == nil || len(server.PrivateIps) != 1 || core.NullableToPtr(server.PrivateIps[0].IpAddress) == nil {
 			t.Fatalf("waiter returned before the attach surfaced with its address: polls=%d server=%#v", polls.Load(), server)
 		}
 		if waited := time.Since(start); waited != 3*serverPollInterval {
@@ -2737,7 +2896,7 @@ func TestWaitUntilAttachmentsSettledWaitsForALaggingDetach(t *testing.T) {
 		var polls atomic.Int32
 		r := attachmentWaiterResource(t, func(w http.ResponseWriter, _ *http.Request) {
 			publicIP := "203.0.113.10"
-			elasticIPs := []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: &publicIP}, {Id: core.UUID{9}, IpAddress: &publicIP}}
+			elasticIPs := []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: core.NullableFromPtr(&publicIP)}, {Id: core.UUID{9}, IpAddress: core.NullableFromPtr(&publicIP)}}
 			if polls.Add(1) > 1 {
 				elasticIPs = elasticIPs[:1]
 			}
@@ -2773,7 +2932,7 @@ func TestWaitUntilAttachmentsSettledAcceptsAnyCountThePlanLeftOpen(t *testing.T)
 			polls.Add(1)
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
-				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID}, {Id: core.UUID{9}}},
+				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: nullNullable[string]()}, {Id: core.UUID{9}, IpAddress: nullNullable[string]()}},
 			})
 		})
 
@@ -2804,7 +2963,7 @@ func TestWaitUntilAttachmentsSettledReportsTheCountsOnTimeout(t *testing.T) {
 		r := attachmentWaiterResource(t, func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
-				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID}},
+				PrivateIps: []serversdk.NestedPrivateIPSchema{{Id: testPrivateIPID, IpAddress: nullNullable[string]()}},
 			})
 		})
 
@@ -2843,7 +3002,7 @@ func TestServerUpdateResizesFlavorInPlace(t *testing.T) {
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, Name: "application", Description: "",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: vcpus, Ram: ram},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateRunning,
 				Status:     serversdk.ServerStatusActive,
@@ -3128,9 +3287,9 @@ func TestServerUpdateKeepsAppliedChangesWhenALaterRequestFails(t *testing.T) {
 			}
 			bandwidth := 100
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
-				Id: testServerID, Name: name, Bandwidth: &bandwidth,
+				Id: testServerID, Name: name, Bandwidth: core.NullableFromPtr(&bandwidth),
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
 			})
@@ -3195,7 +3354,7 @@ func TestServerUpdateStopsBeforeResizingAndStartsLast(t *testing.T) {
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, Name: "application",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: vcpus, Ram: ram},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState, Status: status,
 			})
@@ -3269,7 +3428,7 @@ func TestServerUpdateRebuildRunningServerStopsRebuildsAndRestarts(t *testing.T) 
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: currentImage, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: currentImage, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -3340,7 +3499,7 @@ func TestServerUpdateRebuildStoppedServerRebuildsWithoutRestart(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: currentImage, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: currentImage, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateShutdown,
 				Status:     serversdk.ServerStatusShutoff,
@@ -3433,7 +3592,7 @@ func TestServerUpdateRebuildStoppedServerStartsWhenRunningRequested(t *testing.T
 					Id:         testServerID,
 					Name:       "server-rebuild-start",
 					Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-					Image:      &serversdk.NestedImageSchema{Id: imageID, Name: "image"},
+					Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: imageID, Name: "image"}),
 					Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 					PowerState: powerState,
 					Status:     status,
@@ -3533,7 +3692,7 @@ func TestServerUpdateRebuildAndLiveResizeRunningServerSingleRestart(t *testing.T
 				Id:         testServerID,
 				Name:       "server-rebuild-resize",
 				Flavor:     currentFlavor,
-				Image:      &serversdk.NestedImageSchema{Id: currentImage, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: currentImage, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -3690,7 +3849,7 @@ func TestServerUpdateRebuildAndOfflineResizeRunningServerSingleRestart(t *testin
 				Id:         testServerID,
 				Name:       "server-rebuild-resize",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: vcpus, Ram: ram},
-				Image:      &serversdk.NestedImageSchema{Id: currentImage, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: currentImage, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -3815,7 +3974,7 @@ func TestServerUpdateRebuildFailedPreservesLiveResize(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild-resize",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: vcpus, Ram: ram},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -3915,7 +4074,7 @@ func TestServerUpdateRebuildWithExplicitShutdownDoesNotRestart(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: currentImage, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: currentImage, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -3998,7 +4157,7 @@ func TestServerUpdateRebuildFailedRestartsRunningServer(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -4072,7 +4231,7 @@ func TestServerUpdateRebuildPausedServerReturnsActionableError(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStatePaused,
 				Status:     serversdk.ServerStatusActive,
@@ -4163,7 +4322,7 @@ func TestServerUpdateRebuildRetriesOnOperationConflict(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-rebuild",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: imageID, Name: "image"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: imageID, Name: "image"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -4222,7 +4381,7 @@ func TestServerUpdateAllowsUnmanagedPowerStateDuringUnrelatedChange(t *testing.T
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, Name: "after",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStatePaused, Status: serversdk.ServerStatusActive,
 			})
@@ -4317,6 +4476,32 @@ func TestFlavorAndBootSourceChangesIgnoreEquivalentWhitespace(t *testing.T) {
 	}
 }
 
+func TestCustomImageBootAndSecurityGroupChangesIgnoreUUIDSpelling(t *testing.T) {
+	t.Parallel()
+	customImageID, otherID := core.UUID{21}, core.UUID{22}
+	boot := func(id string) types.Object {
+		return objectValue(t, bootAttributeTypes(), map[string]attr.Value{
+			"boot_type": types.StringValue("custom_image"), "custom_image": idReference(types.StringValue(id)),
+			"volume": idReference(types.StringNull()), "volume_type": testVolumeTypeSelector(types.StringValue("ssd")),
+			"volume_size": types.Int64Value(30), "iops": types.Int64Null(),
+		})
+	}
+	state := ServerResourceModel{Boot: boot(customImageID.String()), SecurityGroups: reference.Set(reference.ID, []string{customImageID.String()})}
+	for _, tc := range []struct {
+		name, bootID, securityGroupID string
+		want                          bool
+	}{
+		{name: "respelled", bootID: "  " + strings.ToUpper(customImageID.String()) + " ", securityGroupID: "  " + customImageID.String() + "\n"},
+		{name: "changed", bootID: otherID.String(), securityGroupID: otherID.String(), want: true},
+	} {
+		plan := ServerResourceModel{Boot: boot(tc.bootID), SecurityGroups: reference.Set(reference.ID, []string{tc.securityGroupID})}
+		bootChanged, diags := bootSourceChanged(context.Background(), plan, state)
+		if diags.HasError() || bootChanged != tc.want || securityGroupsChanged(plan, state) != tc.want {
+			t.Errorf("%s: boot=%t security_groups=%t diagnostics=%v, want %t", tc.name, bootChanged, securityGroupsChanged(plan, state), diags, tc.want)
+		}
+	}
+}
+
 func TestFlavorChangedAdoptsImportedCustomFamilyWithoutResize(t *testing.T) {
 	t.Parallel()
 	state := ServerResourceModel{Flavor: objectValue(t, flavorAttributeTypes(), map[string]attr.Value{
@@ -4351,7 +4536,7 @@ func TestBuildServerRebuildBody(t *testing.T) {
 			return serversdk.ImageSchema{Id: testImageID}, nil
 		},
 	)
-	if diags.HasError() || body.ImageId == nil || *body.ImageId != testImageID || imageID != testImageID {
+	if diags.HasError() || !nullableEquals(body.ImageId, testImageID) || imageID != testImageID {
 		t.Fatalf("unexpected rebuild body: %#v, image=%s, diagnostics=%v", body, imageID, diags)
 	}
 }
@@ -4713,9 +4898,9 @@ func testUpdatePrivateIPsRecreatesChangedSubnetAttachment(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/servers/"+testServerID.String()+"/":
 			// The allocation gives the provider the exact ID, but the server
 			// can still report that attachment before its address is assigned.
-			privateIP := serversdk.NestedPrivateIPSchema{Id: newPrivateIPID}
+			privateIP := serversdk.NestedPrivateIPSchema{Id: newPrivateIPID, IpAddress: nullNullable[string]()}
 			if polls.Add(1) > 1 {
-				privateIP.IpAddress = &newAddress
+				privateIP.IpAddress = core.NullableFromPtr(&newAddress)
 			}
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id: testServerID, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
@@ -4916,7 +5101,7 @@ func TestWaitUntilElasticIPAllocatedHoldsOutForTheAddress(t *testing.T) {
 				}
 				elasticIP := &networksdk.ElasticIPDetailSchema{Id: testElasticIPID, EnableIpv4: true}
 				if polls.Add(1) > 1 {
-					elasticIP.IpAddress = &address
+					elasticIP.IpAddress = core.NullableFromPtr(&address)
 				}
 				writeJSON(t, w, elasticIP)
 			})),
@@ -5029,7 +5214,7 @@ func TestAttachElasticIPAcceptsARefusalThatHidASuccessfulAttach(t *testing.T) {
 				address := "203.0.113.10"
 				writeJSON(t, w, &serversdk.ServerDetailSchema{
 					Id: testServerID, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive,
-					ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: &address}},
+					ElasticIps: []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: core.NullableFromPtr(&address)}},
 				})
 			default:
 				t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
@@ -5266,6 +5451,24 @@ func TestServerValidateConfigRejectsCommonMistakes(t *testing.T) {
 			summary: "Duplicate private_ips entry",
 		},
 		{
+			name: "the same private IP in another spelling",
+			config: func(config *ServerResourceModel) {
+				respelled := privateIPValues(testPrivateIPID, false)
+				respelled["id"] = types.StringValue("  " + strings.ToUpper(testPrivateIPID.String()) + " ")
+				config.PrivateIPs = listValue(t, privateIPResourceAttributeTypes(), []map[string]attr.Value{
+					privateIPValues(testPrivateIPID, false), respelled,
+				})
+			},
+			summary: "Duplicate private_ips entry",
+		},
+		{
+			name: "the same security group in another spelling",
+			config: func(config *ServerResourceModel) {
+				config.SecurityGroups = reference.Set(reference.ID, []string{testElasticIPID.String(), "  " + testElasticIPID.String() + " "})
+			},
+			summary: "Duplicate security_groups entry",
+		},
+		{
 			name: "new elastic IP with both address families disabled",
 			config: func(config *ServerResourceModel) {
 				config.ElasticIPs = listValue(t, elasticIPResourceAttributeTypes(), []map[string]attr.Value{{
@@ -5456,7 +5659,7 @@ func TestServerUpdateSecurityGroups(t *testing.T) {
 				Id:             testServerID,
 				Name:           "server-sg",
 				Flavor:         serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:          &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:          core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:           serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState:     serversdk.ServerPowerStateRunning,
 				Status:         serversdk.ServerStatusActive,
@@ -5512,7 +5715,7 @@ func TestServerUpdateExplicitPowerStateStart(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-start",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -5567,7 +5770,7 @@ func TestServerUpdateExplicitPowerStateStop(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-stop",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: powerState,
 				Status:     status,
@@ -5628,11 +5831,11 @@ func TestServerUpdateBandwidthSuccess(t *testing.T) {
 				Id:         testServerID,
 				Name:       "server-bw",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateRunning,
 				Status:     serversdk.ServerStatusActive,
-				Bandwidth:  &bw,
+				Bandwidth:  core.NullableFromPtr(&bw),
 			})
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
@@ -5698,15 +5901,15 @@ func TestServerUpdateAttachAndDetachExistingElasticIP(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/servers/"+testServerID.String()+"/":
 			var eips []serversdk.NestedElasticIPSchema
 			if attached.Load() && detached.Load() {
-				eips = []serversdk.NestedElasticIPSchema{{Id: eip2, IpAddress: &publicIP}}
+				eips = []serversdk.NestedElasticIPSchema{{Id: eip2, IpAddress: core.NullableFromPtr(&publicIP)}}
 			} else {
-				eips = []serversdk.NestedElasticIPSchema{{Id: eip1, IpAddress: &publicIP}}
+				eips = []serversdk.NestedElasticIPSchema{{Id: eip1, IpAddress: core.NullableFromPtr(&publicIP)}}
 			}
 			writeJSON(t, w, &serversdk.ServerDetailSchema{
 				Id:         testServerID,
 				Name:       "server-eip",
 				Flavor:     serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4},
-				Image:      &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"},
+				Image:      core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}),
 				Zone:       serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"},
 				PowerState: serversdk.ServerPowerStateRunning,
 				Status:     serversdk.ServerStatusActive,
@@ -6375,8 +6578,8 @@ func TestServerAttachCreatedElasticIP(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/network/elastic-ips/"+eipID.String()+"/":
 			writeJSON(t, w, &networksdk.ElasticIPDetailSchema{
 				Id:          eipID,
-				IpAddress:   &ip,
-				Ipv6Address: &ipv6,
+				IpAddress:   core.NullableFromPtr(&ip),
+				Ipv6Address: core.NullableFromPtr(&ipv6),
 			})
 		case req.Method == http.MethodPost && req.URL.Path == "/v2/server/servers/"+serverID.String()+"/attach-eip/":
 			attached = true
@@ -6610,7 +6813,7 @@ func TestServerDataVolumeResizeRefreshesRecalculatedIOPS(t *testing.T) {
 	api := newDataVolumeTestAPI(t)
 	id := core.UUID{30}
 	oldIOPS, newIOPS := 500, 600
-	api.volumes[id.String()].Iops = &oldIOPS
+	api.volumes[id.String()].Iops = oldIOPS
 	api.volumes[id.String()].Status = blockstoragesdk.VolumeStatusInUse
 	api.attached[id.String()] = true
 	api.resizeIOPS = &newIOPS
@@ -6700,7 +6903,7 @@ func TestServerDataVolumeExplicitIDRemovesAndResizesTheIntendedVolumes(t *testin
 		{"kind": types.StringValue("new"), "id": types.StringValue(first.String()), "volume_type": testVolumeTypeSelector(types.StringValue("ssd")), "volume_size": types.Int64Value(20), "delete_on_termination": types.BoolValue(true)},
 		{"kind": types.StringValue("new"), "id": types.StringValue(second.String()), "volume_type": testVolumeTypeSelector(types.StringValue("ssd")), "volume_size": types.Int64Value(50), "delete_on_termination": types.BoolValue(true)},
 	})
-	api.volumes[second.String()] = &blockstoragesdk.VolumeDetailSchema{Id: second, Size: 50, Status: blockstoragesdk.VolumeStatusInUse, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}}
+	api.volumes[second.String()] = &blockstoragesdk.VolumeSchema{Id: second, Size: 50, Iops: 500, Status: blockstoragesdk.VolumeStatusInUse, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}}
 	api.volumes[first.String()].Status = blockstoragesdk.VolumeStatusInUse
 	api.attached[first.String()] = true
 	api.attached[second.String()] = true
@@ -6731,7 +6934,7 @@ func TestServerDataVolumeExplicitIDRemovesAndResizesTheIntendedVolumes(t *testin
 	if diags := response.PlanValue.ElementsAs(ctx, &expected, false); diags.HasError() || !expected[0].IOPS.IsUnknown() {
 		t.Fatalf("planned=%#v diagnostics=%v", expected, diags)
 	}
-	expected[0].IOPS = types.Int64Null()
+	expected[0].IOPS = types.Int64Value(500)
 	expected[0].VolumeType = selector.WithID(expected[0].VolumeType, types.StringValue(testVolumeTypeID.String()))
 	wantState, diags := types.ListValueFrom(ctx, response.PlanValue.ElementType(ctx), expected)
 	if diags.HasError() {
@@ -6914,7 +7117,7 @@ func TestServerDataVolumeUpdateFollowsReconciliationOrder(t *testing.T) {
 			ctx := context.Background()
 			api := newDataVolumeTestAPI(t)
 			for _, id := range []core.UUID{retyped, existing, resized} {
-				api.volumes[id.String()] = &blockstoragesdk.VolumeDetailSchema{Id: id, Size: 20, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}}
+				api.volumes[id.String()] = &blockstoragesdk.VolumeSchema{Id: id, Size: 20, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}}
 			}
 			for _, id := range test.attached {
 				api.attached[id.String()] = true
@@ -7227,7 +7430,7 @@ func TestServerDataVolumeFailedUpdateKeepsUndetachedVolumeIdentity(t *testing.T)
 	ctx := context.Background()
 	api := newDataVolumeTestAPI(t)
 	owned, existing := core.UUID{30}, core.UUID{31}
-	api.volumes[existing.String()] = &blockstoragesdk.VolumeDetailSchema{Id: existing, Size: 30, Status: blockstoragesdk.VolumeStatusInUse, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}}
+	api.volumes[existing.String()] = &blockstoragesdk.VolumeSchema{Id: existing, Size: 30, Status: blockstoragesdk.VolumeStatusInUse, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}}
 	api.volumes[owned.String()].Status = blockstoragesdk.VolumeStatusInUse
 	api.attached[owned.String()] = true
 	api.attached[existing.String()] = true
@@ -7665,7 +7868,7 @@ func TestServerDataVolumeDeleteWaiterStopsOnTerminalStatus(t *testing.T) {
 						http.NotFound(w, req)
 						return
 					}
-					writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: id, Status: status})
+					writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: id, Status: status})
 				})
 				storage, err := blockstoragesdk.NewClient("https://volume.test", blockstoragesdk.WithHTTPClient(stubHTTPClient(t, handler)), blockstoragesdk.WithRetry(core.NoRetry()))
 				if err != nil {
@@ -7809,7 +8012,7 @@ type dataVolumeTestAPI struct {
 	mu            sync.Mutex
 	name          string
 	resource      *ServerResource
-	volumes       map[string]*blockstoragesdk.VolumeDetailSchema
+	volumes       map[string]*blockstoragesdk.VolumeSchema
 	attached      map[string]bool
 	mutations     []string
 	creates       uint8
@@ -7825,8 +8028,8 @@ type dataVolumeTestAPI struct {
 
 func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 	t.Helper()
-	api := &dataVolumeTestAPI{name: "server", volumes: map[string]*blockstoragesdk.VolumeDetailSchema{}, attached: map[string]bool{}}
-	api.volumes[(core.UUID{30}).String()] = &blockstoragesdk.VolumeDetailSchema{Id: core.UUID{30}, Size: 20, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}}
+	api := &dataVolumeTestAPI{name: "server", volumes: map[string]*blockstoragesdk.VolumeSchema{}, attached: map[string]bool{}}
+	api.volumes[(core.UUID{30}).String()] = &blockstoragesdk.VolumeSchema{Id: core.UUID{30}, Size: 20, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}}
 	client := stubHTTPClient(t, func(w http.ResponseWriter, req *http.Request) {
 		api.mu.Lock()
 		defer api.mu.Unlock()
@@ -7890,12 +8093,12 @@ func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 				t.Fatal(err)
 			}
 			source, err := body.CreateFrom.AsVolumeCreateEmptySchema()
-			if err != nil || source.VolumeTypeId != testVolumeTypeID || source.Size != 20 || body.Name == "" || body.Iops != nil {
+			if err != nil || source.VolumeTypeId != testVolumeTypeID || source.Size != 20 || body.Name == "" || body.Iops.IsSpecified() {
 				t.Fatalf("invalid new volume request: %#v %v", body, err)
 			}
 			api.creates++
 			id := core.UUID{40 + api.creates}
-			volume := &blockstoragesdk.VolumeDetailSchema{Id: id, Size: source.Size, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}}
+			volume := &blockstoragesdk.VolumeSchema{Id: id, Size: source.Size, Status: blockstoragesdk.VolumeStatusAvailable, Zone: blockstoragesdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}}
 			api.volumes[id.String()] = volume
 			w.WriteHeader(http.StatusCreated)
 			writeJSON(t, w, volume)
@@ -7908,7 +8111,7 @@ func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 			if body.VolumeTypeId != (core.UUID{15}) {
 				t.Fatal("unexpected type change")
 			}
-			api.volumes[id].CreateFrom.VolumeType = &blockstoragesdk.NestedVolumeTypeSchema{Id: body.VolumeTypeId, Name: "ssd2"}
+			api.volumes[id].CreateFrom.VolumeType = core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: body.VolumeTypeId, Name: "ssd2"})
 			w.WriteHeader(http.StatusAccepted)
 		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/extend/"):
 			id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/v2/block-storage/volumes/"), "/extend/")
@@ -7921,7 +8124,7 @@ func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 			}
 			api.volumes[id].Size = body.Size
 			if api.resizeIOPS != nil {
-				api.volumes[id].Iops = api.resizeIOPS
+				api.volumes[id].Iops = *api.resizeIOPS
 			}
 			w.WriteHeader(http.StatusAccepted)
 		case req.Method == http.MethodPatch && strings.HasPrefix(req.URL.Path, "/v2/block-storage/volumes/"):
@@ -7934,7 +8137,7 @@ func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 				t.Fatalf("invalid IOPS update: %v", body)
 			}
 			value := body["iops"]
-			api.volumes[id].Iops = &value
+			api.volumes[id].Iops = value
 			writeJSON(t, w, api.volumes[id])
 		case strings.HasPrefix(req.URL.Path, "/v2/block-storage/volumes/"):
 			id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/v2/block-storage/volumes/"), "/")
@@ -7972,7 +8175,7 @@ func newDataVolumeTestAPI(t *testing.T) *dataVolumeTestAPI {
 }
 
 func (api *dataVolumeTestAPI) server() *serversdk.ServerDetailSchema {
-	server := &serversdk.ServerDetailSchema{Id: testServerID, Name: api.name, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive, Flavor: serversdk.NestedFlavorSchema{Vcpus: 2, Ram: 4}, Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}, Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}}
+	server := &serversdk.ServerDetailSchema{Id: testServerID, Name: api.name, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive, Flavor: serversdk.NestedFlavorSchema{Vcpus: 2, Ram: 4}, Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}}
 	for _, id := range slices.Sorted(maps.Keys(api.attached)) {
 		if api.attached[id] {
 			volume := api.volumes[id]
@@ -8327,7 +8530,7 @@ func TestServerBootAndDataVolumesUseTypedSelectors(t *testing.T) {
 	resolveType := func(_ context.Context, req blockstoragelookup.VolumeTypeResolveRequest) (blockstoragesdk.VolumeTypeSchema, error) {
 		typeCalls++
 		f := req.Filter
-		if f.Name != nil || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || string(*f.Speed) != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.ZoneID == nil || *req.ZoneID != testZoneID || req.RequestedSize != 30 {
+		if f.Name != nil || *f.DiskType != blockstoragesdk.VolumeTypeDiskTypeSsd || *f.Speed != "10k" || f.Multiattach == nil || *f.Multiattach || *f.EncryptionKeySize != blockstoragesdk.VolumeTypeEncryptKeySizeN0 || req.ZoneID == nil || *req.ZoneID != testZoneID || req.RequestedSize != 30 {
 			t.Fatalf("wrong volume type criteria: %#v", req)
 		}
 		return blockstoragesdk.VolumeTypeSchema{Id: testVolumeTypeID}, nil
@@ -8343,7 +8546,7 @@ func TestServerBootAndDataVolumesUseTypedSelectors(t *testing.T) {
 	}
 	bootObject := bootConfig(t, map[string]attr.Value{"boot_type": types.StringValue("image"), "image": image, "volume_type": volumeType, "volume_size": types.Int64Value(30)})
 	rebuilt, id, diags := buildServerRebuildBody(ctx, bootObject, core.UUID{12}, resolveImage)
-	if diags.HasError() || id != testImageID || rebuilt.ImageId == nil || *rebuilt.ImageId != testImageID {
+	if diags.HasError() || id != testImageID || !nullableEquals(rebuilt.ImageId, testImageID) {
 		t.Fatalf("wrong rebuild: %#v, %v", rebuilt, diags)
 	}
 	var create serversdk.ServerCreateSchema
@@ -8513,9 +8716,9 @@ func TestServerUpdateResolvedCurrentImageSkipsRebuild(t *testing.T) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/images/":
 			catalogCalls++
-			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: testImageID, Name: "ubuntu", Type: new(serversdk.ImageTypeServer)}}})
+			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: testImageID, Name: "ubuntu", Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}}})
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/servers/"+testServerID.String()+"/":
-			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Name: "server", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}, Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive})
+			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Name: "server", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive})
 		default:
 			t.Errorf("unexpected catalog request or mutation: %s %s", req.Method, req.URL)
 			http.NotFound(w, req)
@@ -8559,7 +8762,7 @@ func TestServerSelectorFallbackUsesConfiguredDataVolumeID(t *testing.T) {
 		case "/v2/server/servers/" + testServerID.String() + "/":
 			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Volumes: []serversdk.NestedServerVolumeSchema{{MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: secondID}}, {MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: firstID}}}})
 		case "/v2/block-storage/volumes/" + firstID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: firstID, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: firstID, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}})
 		default:
 			t.Errorf("wrong volume or catalog requested during identity fallback: %s", req.URL)
 			http.NotFound(w, req)
@@ -8606,7 +8809,7 @@ func TestServerPlanKeepsUnidentifiedImageFromEarlierState(t *testing.T) {
 				case "/v2/server/servers/" + testServerID.String() + "/":
 					writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Volumes: tc.volumes})
 				case "/v2/block-storage/volumes/" + rootID.String() + "/":
-					writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: rootID})
+					writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: rootID})
 				default:
 					t.Errorf("unexpected request during identity fallback: %s", req.URL)
 					http.NotFound(w, req)
@@ -8661,7 +8864,7 @@ func TestServerSelectorFallbackReportsDataVolumeWithoutVolumeType(t *testing.T) 
 		case "/v2/server/servers/" + testServerID.String() + "/":
 			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Volumes: []serversdk.NestedServerVolumeSchema{{MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: volumeID}}}})
 		case "/v2/block-storage/volumes/" + volumeID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: volumeID})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: volumeID})
 		default:
 			t.Errorf("unexpected request during identity fallback: %s", req.URL)
 			http.NotFound(w, req)
@@ -8693,13 +8896,13 @@ func TestServerFailedPatchDoesNotLosePendingRebuild(t *testing.T) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/images/":
 			catalogCalls++
-			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: targetID, Name: "target", Type: new(serversdk.ImageTypeServer)}}})
+			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: targetID, Name: "target", Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}}})
 		case req.Method == http.MethodPatch:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"detail":"patch failed"}`))
 		case req.Method == http.MethodGet && req.URL.Path == "/v2/server/servers/"+testServerID.String()+"/":
-			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Name: "before", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}, Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive})
+			writeJSON(t, w, &serversdk.ServerDetailSchema{Id: testServerID, Name: "before", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive})
 		default:
 			t.Errorf("unexpected request before successful patch: %s %s", req.Method, req.URL)
 			http.NotFound(w, req)
@@ -8751,7 +8954,7 @@ func TestServerCreateReadAndKnownIdentityUpdateDoNotRefreshCatalog(t *testing.T)
 	rootID, dataID := core.UUID{9}, core.UUID{10}
 	created := false
 	catalogCalls := 0
-	detail := &serversdk.ServerDetailSchema{Id: testServerID, Name: "server", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: &serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu", Os: "Different metadata"}, Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive, Volumes: []serversdk.NestedServerVolumeSchema{{MountAs: "root", Volume: serversdk.NestedVolumeSchema{Id: rootID, Size: 30, Status: serversdk.VolumeStatusInUse}}, {MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: dataID, Size: 50, Status: serversdk.VolumeStatusInUse}}}}
+	detail := &serversdk.ServerDetailSchema{Id: testServerID, Name: "server", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu", Os: "Different metadata"}), Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive, Volumes: []serversdk.NestedServerVolumeSchema{{MountAs: "root", Volume: serversdk.NestedVolumeSchema{Id: rootID, Size: 30, Status: serversdk.VolumeStatusInUse}}, {MountAs: "data", Volume: serversdk.NestedVolumeSchema{Id: dataID, Size: 50, Status: serversdk.VolumeStatusInUse}}}}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		catalog := strings.Contains(req.URL.Path, "images") || strings.Contains(req.URL.Path, "volume-types")
 		if catalog {
@@ -8762,7 +8965,7 @@ func TestServerCreateReadAndKnownIdentityUpdateDoNotRefreshCatalog(t *testing.T)
 		}
 		switch req.URL.Path {
 		case "/v2/server/images/":
-			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: testImageID, Name: "ubuntu", Type: new(serversdk.ImageTypeServer)}}})
+			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: testImageID, Name: "ubuntu", Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}}})
 		case "/v2/block-storage/volume-types/":
 			writeJSON(t, w, map[string]any{"count": 1, "results": []blockstoragesdk.VolumeTypeSchema{{Id: testVolumeTypeID, Name: "ssd", EncryptionKeySize: blockstoragesdk.LabeledVolumeTypeEncryptKeySize{Value: blockstoragesdk.VolumeTypeEncryptKeySizeN0}, Status: blockstoragesdk.LabeledVolumeTypeStatus{Value: blockstoragesdk.VolumeTypeStatusEnabled}, State: blockstoragesdk.LabeledVolumeTypeState{Value: blockstoragesdk.VolumeTypeStateUp}, MaxVolumeSize: 100}}})
 		case "/v2/server/servers/":
@@ -8778,9 +8981,9 @@ func TestServerCreateReadAndKnownIdentityUpdateDoNotRefreshCatalog(t *testing.T)
 			}
 			writeJSON(t, w, detail)
 		case "/v2/block-storage/volumes/" + rootID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: rootID, Size: 30, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{Image: &blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}, VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd", DiskType: blockstoragesdk.VolumeTypeDiskTypeHdd}}})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: rootID, Size: 30, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{Image: core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd", DiskType: blockstoragesdk.VolumeTypeDiskTypeHdd})}})
 		case "/v2/block-storage/volumes/" + dataID.String() + "/":
-			writeJSON(t, w, &blockstoragesdk.VolumeDetailSchema{Id: dataID, Size: 50, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: &blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"}}})
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: dataID, Size: 50, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}})
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
 			http.NotFound(w, req)
@@ -8845,5 +9048,149 @@ func TestServerCreateReadAndKnownIdentityUpdateDoNotRefreshCatalog(t *testing.T)
 	}
 	if len(volumes) != 1 || !volumes[0].VolumeType.Equal(selector.WithID(volumeType, types.StringValue(testVolumeTypeID.String()))) {
 		t.Fatal("data selector lost resolved ID or criteria")
+	}
+}
+
+// The API trims outer whitespace from description, so the provider sends the
+// trimmed value. State after create and read keeps the configured spelling of
+// description and power_state.
+func TestServerCreateTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	rootID := core.UUID{9}
+	var sentDescription *string
+	var sentReferences struct {
+		KeyPairID        string `json:"key_pair_id"`
+		PlacementGroupID string `json:"placement_group_id"`
+		SecurityGroups   []struct {
+			ID string `json:"id"`
+		} `json:"security_groups"`
+	}
+	securityGroupID := core.UUID{13}
+	detail := &serversdk.ServerDetailSchema{Id: testServerID, Name: "server", Description: "web", Flavor: serversdk.NestedFlavorSchema{Id: testFlavorID, Name: "custom", Vcpus: 2, Ram: 4}, Image: core.NullableFromPtr(&serversdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), Zone: serversdk.NestedZoneSchema{Id: testZoneID, Name: "zone-a"}, PowerState: serversdk.ServerPowerStateRunning, Status: serversdk.ServerStatusActive, Volumes: []serversdk.NestedServerVolumeSchema{{MountAs: "root", Volume: serversdk.NestedVolumeSchema{Id: rootID, Size: 30, Status: serversdk.VolumeStatusInUse}}}}
+	detail.KeyPair = core.NullableFromPtr(&serversdk.NestedKeyPairSchema{Id: testKeyPairID, Name: "key"})
+	detail.PlacementGroup = core.NullableFromPtr(&serversdk.NestedPlacementGroupSchema{Id: testPlacementGroupID, Name: "group"})
+	detail.SecurityGroups = []serversdk.NestedSecurityGroupSchema{{Id: securityGroupID}}
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/v2/server/images/":
+			writeJSON(t, w, map[string]any{"count": 1, "results": []serversdk.ImageSchema{{Id: testImageID, Name: "ubuntu", Type: core.NullableFromPtr(new(serversdk.ImageTypeServer))}}})
+		case "/v2/block-storage/volume-types/":
+			writeJSON(t, w, map[string]any{"count": 1, "results": []blockstoragesdk.VolumeTypeSchema{{Id: testVolumeTypeID, Name: "ssd", EncryptionKeySize: blockstoragesdk.LabeledVolumeTypeEncryptKeySize{Value: blockstoragesdk.VolumeTypeEncryptKeySizeN0}, Status: blockstoragesdk.LabeledVolumeTypeStatus{Value: blockstoragesdk.VolumeTypeStatusEnabled}, State: blockstoragesdk.LabeledVolumeTypeState{Value: blockstoragesdk.VolumeTypeStateUp}, MaxVolumeSize: 100}}})
+		case "/v2/server/servers/":
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Errorf("read create body: %v", err)
+			}
+			var body serversdk.ServerCreateSchema
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			if err := json.Unmarshal(raw, &sentReferences); err != nil {
+				t.Errorf("decode create references: %v", err)
+			}
+			sentDescription = body.Description
+			w.WriteHeader(http.StatusCreated)
+			writeJSON(t, w, map[string]any{"server_ids": []core.UUID{testServerID}})
+		case "/v2/server/servers/" + testServerID.String() + "/":
+			if req.Method != http.MethodGet {
+				t.Errorf("unexpected mutation: %s", req.Method)
+			}
+			writeJSON(t, w, detail)
+		case "/v2/block-storage/volumes/" + rootID.String() + "/":
+			writeJSON(t, w, &blockstoragesdk.VolumeSchema{Id: rootID, Size: 30, CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{Image: core.NullableFromPtr(&blockstoragesdk.NestedImageSchema{Id: testImageID, Name: "ubuntu"}), VolumeType: core.NullableFromPtr(&blockstoragesdk.NestedVolumeTypeSchema{Id: testVolumeTypeID, Name: "ssd"})}})
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
+			http.NotFound(w, req)
+		}
+	}))
+	defer api.Close()
+	serverClient, err := serversdk.NewClient(api.URL, serversdk.WithRetry(core.NoRetry()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockClient, err := blockstoragesdk.NewClient(api.URL, blockstoragesdk.WithRetry(core.NoRetry()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &ServerResource{client: serverClient, blockStorageClient: blockClient, projectID: core.UUID{12}}
+	image := selectorTestCriteria(serverselector.ImageAttributeTypes(), map[string]attr.Value{"type": types.StringValue("server"), "id": types.StringUnknown()})
+	volumeType := selectorTestCriteria(blockstorageselector.VolumeTypeAttributeTypes(), map[string]attr.Value{"name": types.StringValue("ssd"), "id": types.StringUnknown()})
+	plan := emptyServerResourceModel()
+	plan.Name = types.StringValue("server")
+	plan.Description = types.StringValue(" web ")
+	plan.PowerState = types.StringValue(" running ")
+	keyPair := idReference(types.StringValue("  " + strings.ToUpper(testKeyPairID.String()) + " "))
+	placementGroup := idReference(types.StringValue("  " + testPlacementGroupID.String() + "\n"))
+	securityGroups := reference.Set(reference.ID, []string{"  " + securityGroupID.String() + " "})
+	plan.KeyPair, plan.PlacementGroup, plan.SecurityGroups = keyPair, placementGroup, securityGroups
+	plan.Flavor = customFlavorValue(t, 2, 4)
+	plan.Boot = bootConfig(t, map[string]attr.Value{"boot_type": types.StringValue("image"), "image": image, "volume_type": volumeType, "volume_size": types.Int64Value(30)})
+	schema := serverSchema(t)
+	assertState := func(stage string, state tfsdk.State) {
+		t.Helper()
+		var got ServerResourceModel
+		if diags := state.Get(ctx, &got); diags.HasError() {
+			t.Fatal(diags)
+		}
+		if got.Description.ValueString() != " web " || got.PowerState.ValueString() != " running " {
+			t.Fatalf("state after %s: description=%q power_state=%q", stage, got.Description.ValueString(), got.PowerState.ValueString())
+		}
+		if !got.KeyPair.Equal(keyPair) || !got.PlacementGroup.Equal(placementGroup) || !got.SecurityGroups.Equal(securityGroups) {
+			t.Fatalf("state after %s: key_pair=%s placement_group=%s security_groups=%s, want the configured spelling", stage, got.KeyPair, got.PlacementGroup, got.SecurityGroups)
+		}
+	}
+
+	create := resource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: planFor(t, schema, plan)}, &create)
+	if create.Diagnostics.HasError() {
+		t.Fatal(create.Diagnostics)
+	}
+	if sentDescription == nil || *sentDescription != "web" {
+		t.Fatalf("create request carried description %v, want %q", sentDescription, "web")
+	}
+	if sentReferences.KeyPairID != testKeyPairID.String() || sentReferences.PlacementGroupID != testPlacementGroupID.String() ||
+		len(sentReferences.SecurityGroups) != 1 || sentReferences.SecurityGroups[0].ID != securityGroupID.String() {
+		t.Fatalf("create request carried references %+v, want trimmed UUIDs", sentReferences)
+	}
+	assertState("create", create.State)
+
+	read := resource.ReadResponse{State: create.State}
+	r.Read(ctx, resource.ReadRequest{State: create.State}, &read)
+	if read.Diagnostics.HasError() {
+		t.Fatal(read.Diagnostics)
+	}
+	assertState("read", read.State)
+}
+
+// The backend sends JSON null for a nullable field that has no value, and a
+// decoded null is a non-nil Nullable, so these readers must treat it as absent.
+func TestServerReadersTreatExplicitNullAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	server := &serversdk.ServerDetailSchema{
+		Id: testServerID, Bandwidth: nullNullable[int](), Image: nullNullable[serversdk.NestedImageSchema](),
+		KeyPair: nullNullable[serversdk.NestedKeyPairSchema](), PlacementGroup: nullNullable[serversdk.NestedPlacementGroupSchema](),
+	}
+	var state ServerModel
+	populateServerModel(server, &state)
+	if !state.Bandwidth.IsNull() || !state.KeyPairName.IsNull() || !state.PlacementGroupName.IsNull() ||
+		!reference.Get(state.KeyPair, reference.ID).IsNull() || !reference.Get(state.PlacementGroup, reference.ID).IsNull() {
+		t.Fatalf("expected null bandwidth, key pair and placement group, got %+v", state)
+	}
+
+	if got := inferServerBootType(server, nil); got != "" {
+		t.Fatalf("expected no boot type for a server without image or root volume, got %q", got)
+	}
+	rootVolume := &blockstoragesdk.VolumeSchema{CreateFrom: blockstoragesdk.NestedVolumeOriginSchema{
+		Image: nullNullable[blockstoragesdk.NestedImageSchema](), CustomImage: nullNullable[blockstoragesdk.NestedCustomImageSchema](),
+	}}
+	if got := inferServerBootType(server, rootVolume); got != "volume" {
+		t.Fatalf("expected boot type volume for a root volume without image, got %q", got)
+	}
+
+	unassigned := []serversdk.NestedElasticIPSchema{{Id: testElasticIPID, IpAddress: nullNullable[string](), Ipv6Address: nullNullable[string]()}}
+	if elasticIPAddressesAssigned(unassigned) {
+		t.Fatal("expected an elastic IP with null addresses to be unassigned")
 	}
 }

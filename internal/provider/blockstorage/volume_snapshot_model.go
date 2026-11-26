@@ -54,12 +54,12 @@ func populateVolumeSnapshotModel(snapshot *blockstoragesdk.VolumeSnapshotSchema,
 		state.Description = types.StringValue(*snapshot.Description)
 	}
 	state.Size = types.Int64Null()
-	if snapshot.Size != nil {
-		state.Size = types.Int64Value(int64(*snapshot.Size))
+	if size := core.NullableToPtr(snapshot.Size); size != nil {
+		state.Size = types.Int64Value(int64(*size))
 	}
 	state.Status = types.StringNull()
-	if snapshot.Status != nil {
-		state.Status = types.StringValue(string(*snapshot.Status))
+	if status := core.NullableToPtr(snapshot.Status); status != nil {
+		state.Status = types.StringValue(string(*status))
 	}
 }
 
@@ -69,7 +69,7 @@ func populateVolumeSnapshotResourceState(snapshot *blockstoragesdk.VolumeSnapsho
 	prior := *state
 	populateVolumeSnapshotModel(snapshot, &state.VolumeSnapshotModel)
 	preserveVolumeSnapshotInputs(snapshot, &prior.VolumeSnapshotModel, &state.VolumeSnapshotModel)
-	state.Volume = reference.Value(reference.ID, preservedUUID(reference.Get(prior.Volume, reference.ID), snapshot.Volume.Id))
+	state.Volume = reference.Value(reference.ID, compare.PreservedUUID(reference.Get(prior.Volume, reference.ID), snapshot.Volume.Id))
 }
 
 func populateVolumeSnapshotDataSourceState(snapshot *blockstoragesdk.VolumeSnapshotSchema, state *VolumeSnapshotDataSourceModel) {
@@ -97,7 +97,7 @@ func preserveVolumeSnapshotInputs(snapshot *blockstoragesdk.VolumeSnapshotSchema
 	if !prior.Name.IsNull() && !prior.Name.IsUnknown() && strings.TrimSpace(prior.Name.ValueString()) == snapshot.Name {
 		state.Name = prior.Name
 	}
-	if !prior.Description.IsNull() && !prior.Description.IsUnknown() && snapshot.Description != nil && prior.Description.ValueString() == *snapshot.Description {
+	if snapshot.Description != nil && compare.SameTrimmed(prior.Description, *snapshot.Description) {
 		state.Description = prior.Description
 	}
 }
@@ -106,12 +106,12 @@ func preserveVolumeSnapshotFilters(snapshot *blockstoragesdk.VolumeSnapshotSchem
 	if compare.SameUUID(config.ID, snapshot.Id) {
 		state.ID = config.ID
 	}
-	if !config.Status.IsNull() && !config.Status.IsUnknown() && snapshot.Status != nil && strings.TrimSpace(config.Status.ValueString()) == string(*snapshot.Status) {
+	if status := core.NullableToPtr(snapshot.Status); !config.Status.IsNull() && !config.Status.IsUnknown() && status != nil && strings.TrimSpace(config.Status.ValueString()) == string(*status) {
 		state.Status = config.Status
 	}
 	if !config.Zone.IsNull() && !config.Zone.IsUnknown() && strings.TrimSpace(config.Zone.ValueString()) == snapshot.Zone.Name {
 		state.Zone = config.Zone
 	}
-	state.VolumeID = preservedUUID(config.VolumeID, snapshot.Volume.Id)
+	state.VolumeID = compare.PreservedUUID(config.VolumeID, snapshot.Volume.Id)
 	preserveVolumeSnapshotInputs(snapshot, &config.VolumeSnapshotModel, &state.VolumeSnapshotModel)
 }

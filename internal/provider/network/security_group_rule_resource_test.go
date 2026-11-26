@@ -62,10 +62,10 @@ func mockRule(description string) *networksdk.SecurityGroupRuleSchema {
 	return &networksdk.SecurityGroupRuleSchema{
 		Id:             ruleTestID,
 		Direction:      networksdk.SGRDirectionIngress,
-		Protocol:       new(networksdk.SGRProtocolTcp),
-		Ethertype:      new(networksdk.SGREtherTypeIpv4),
-		PortRangeMin:   new(22),
-		PortRangeMax:   new(22),
+		Protocol:       core.NullableFromPtr(new(networksdk.SGRProtocolTcp)),
+		Ethertype:      core.NullableFromPtr(new(networksdk.SGREtherTypeIpv4)),
+		PortRangeMin:   core.NullableFromPtr(new(22)),
+		PortRangeMax:   core.NullableFromPtr(new(22)),
 		RemoteIpPrefix: "0.0.0.0/0",
 		Description:    new(description),
 		SecurityGroup: networksdk.NestedSecurityGroupSchema{
@@ -342,28 +342,26 @@ func TestSecurityGroupRuleReplacementAttributes(t *testing.T) {
 	t.Parallel()
 
 	ruleSchemaValue := ruleSchema(t)
-	state, plan := ruleModifierStateAndPlan(t, ruleSchemaValue)
-
-	for _, name := range []string{"direction", "protocol"} {
-		attribute, ok := ruleSchemaValue.Attributes[name].(resourceschema.StringAttribute)
-		if !ok {
-			t.Fatalf("%s is not a string attribute", name)
-		}
-		if len(attribute.PlanModifiers) != 1 {
-			t.Fatalf("expected one plan modifier for %s, got %d", name, len(attribute.PlanModifiers))
-		}
-
-		request := planmodifier.StringRequest{
-			State:      state,
-			Plan:       plan,
-			StateValue: types.StringValue("before"),
-			PlanValue:  types.StringValue("after"),
-		}
-		var response planmodifier.StringResponse
-		attribute.PlanModifiers[0].PlanModifyString(context.Background(), request, &response)
-		if !response.RequiresReplace {
-			t.Errorf("expected changing %s to require replacement", name)
-		}
+	tests := map[string]struct {
+		attribute   string
+		state, plan types.String
+		want        bool
+	}{
+		"direction/same":         {attribute: "direction", state: types.StringValue("ingress"), plan: types.StringValue("ingress")},
+		"direction/padded":       {attribute: "direction", state: types.StringValue("ingress"), plan: types.StringValue(" INGRESS ")},
+		"direction/padded state": {attribute: "direction", state: types.StringValue(" Ingress "), plan: types.StringValue("ingress")},
+		"direction/another":      {attribute: "direction", state: types.StringValue("ingress"), plan: types.StringValue("egress"), want: true},
+		"direction/unknown":      {attribute: "direction", state: types.StringValue("ingress"), plan: types.StringUnknown(), want: true},
+		"protocol/padded":        {attribute: "protocol", state: types.StringValue("tcp"), plan: types.StringValue(" TCP ")},
+		"protocol/another":       {attribute: "protocol", state: types.StringValue("tcp"), plan: types.StringValue("udp"), want: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := stringRequiresReplace(t, ruleSchemaValue, test.attribute, test.state, test.plan, test.plan); got != test.want {
+				t.Fatalf("RequiresReplace = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -377,9 +375,10 @@ func TestSecurityGroupRuleSecurityGroupReferenceSchemaAndReplacement(t *testing.
 		plan types.Object
 		want bool
 	}{
-		"same id updates in place": {plan: before},
-		"another id replaces":      {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x77}.String())), want: true},
-		"unknown id replaces":      {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
+		"same id updates in place":   {plan: before},
+		"padded id updates in place": {plan: reference.Value(reference.ID, types.StringValue("  "+ruleTestSGID.String()+" "))},
+		"another id replaces":        {plan: reference.Value(reference.ID, types.StringValue(core.UUID{0x77}.String())), want: true},
+		"unknown id replaces":        {plan: reference.Value(reference.ID, types.StringUnknown()), want: true},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -413,6 +412,11 @@ func TestSecurityGroupRuleRequiresReplaceIfConfiguredAttributes(t *testing.T) {
 	}, &respChange)
 	if !respChange.RequiresReplace {
 		t.Error("expected changing configured remote_ip_prefix to require replacement")
+	}
+
+	padded := types.StringValue(" 0.0.0.0/0 ")
+	if stringRequiresReplace(t, ruleSchemaValue, "remote_ip_prefix", types.StringValue("0.0.0.0/0"), padded, padded) {
+		t.Error("expected padding remote_ip_prefix not to require replacement")
 	}
 
 	var respOmitted planmodifier.StringResponse
@@ -532,7 +536,7 @@ func TestSecurityGroupRuleResourceCreateSuccess(t *testing.T) {
 		if body.Direction != networksdk.SGRDirectionIngress {
 			t.Errorf("expected direction 'ingress', got %q", body.Direction)
 		}
-		if body.Protocol == nil || *body.Protocol != networksdk.SGRProtocolTcp {
+		if core.NullableToPtr(body.Protocol) == nil || *core.NullableToPtr(body.Protocol) != networksdk.SGRProtocolTcp {
 			t.Errorf("expected protocol 'tcp', got %v", body.Protocol)
 		}
 
@@ -581,6 +585,70 @@ func TestSecurityGroupRuleResourceCreateSuccess(t *testing.T) {
 	}
 	if state.Region.ValueString() != "vn-central-1" {
 		t.Errorf("expected region 'vn-central-1', got %q", state.Region.ValueString())
+	}
+}
+
+func TestSecurityGroupRuleResourceCreateTrimsStringsAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	rule := mockRule("allow ssh")
+	client := ruleTestClient(t, func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case http.MethodPost:
+			var body networksdk.SecurityGroupRuleCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			if body.Description == nil || *body.Description != "allow ssh" {
+				t.Errorf("create description = %v, want trimmed %q", body.Description, "allow ssh")
+			}
+			if protocol := core.NullableToPtr(body.Protocol); body.SecurityGroupId != ruleTestSGID ||
+				body.Direction != networksdk.SGRDirectionIngress || protocol == nil || *protocol != networksdk.SGRProtocolTcp {
+				t.Errorf("create body = %#v, want the trimmed security group ID, direction, and protocol", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		writeRuleResponse(t, w, rule)
+	})
+
+	r := &SecurityGroupRuleResource{client: client, projectID: ruleTestProjectID}
+	ruleSchemaValue := ruleSchema(t)
+
+	const paddedDescription = "  allow ssh  "
+	planModel := nullSecurityGroupRuleResourceModel()
+	planModel.SecurityGroup = reference.Value(reference.ID, types.StringValue("  "+ruleTestSGID.String()+"  "))
+	planModel.Direction = types.StringValue(" ingress ")
+	planModel.Protocol = types.StringValue(" tcp ")
+	planModel.Description = types.StringValue(paddedDescription)
+
+	plan := tfsdk.Plan{Schema: ruleSchemaValue}
+	if diags := plan.Set(context.Background(), &planModel); diags.HasError() {
+		t.Fatalf("set plan: %v", diags)
+	}
+
+	createResp := resource.CreateResponse{State: tfsdk.State{Schema: ruleSchemaValue}}
+	r.Create(context.Background(), resource.CreateRequest{Plan: plan}, &createResp)
+	if createResp.Diagnostics.HasError() {
+		t.Fatalf("unexpected create diagnostics: %v", createResp.Diagnostics)
+	}
+	readResp := resource.ReadResponse{State: createResp.State}
+	r.Read(context.Background(), resource.ReadRequest{State: createResp.State}, &readResp)
+	if readResp.Diagnostics.HasError() {
+		t.Fatalf("unexpected read diagnostics: %v", readResp.Diagnostics)
+	}
+
+	for step, state := range map[string]tfsdk.State{"create": createResp.State, "read": readResp.State} {
+		var model SecurityGroupRuleResourceModel
+		if diags := state.Get(context.Background(), &model); diags.HasError() {
+			t.Fatalf("get state after %s: %v", step, diags)
+		}
+		if model.Description.ValueString() != paddedDescription || !model.SecurityGroup.Equal(planModel.SecurityGroup) ||
+			!model.Direction.Equal(planModel.Direction) || !model.Protocol.Equal(planModel.Protocol) {
+			t.Fatalf("state after %s = %#v, want the configured spelling", step, model)
+		}
 	}
 }
 
@@ -846,6 +914,31 @@ func TestSecurityGroupRuleResourceUpdateUnchangedDescriptionRefreshes(t *testing
 	runRuleUpdate(t, r, types.StringValue("same description"), types.StringValue("same description"), false)
 }
 
+func TestSecurityGroupRuleResourceUpdateTrimsDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	updatedRule := mockRule("updated description")
+	client := ruleTestClient(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPatch {
+			t.Errorf("expected PATCH, got %s", req.Method)
+		}
+		var body networksdk.SecurityGroupRulePartialUpdateSchema
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatalf("decode patch body: %v", err)
+		}
+		if body.Description == nil || *body.Description != "updated description" {
+			t.Errorf("update description = %v, want trimmed %q", body.Description, "updated description")
+		}
+		writeRuleResponse(t, w, updatedRule)
+	})
+
+	r := &SecurityGroupRuleResource{client: client, projectID: ruleTestProjectID}
+	afterUpdate := runRuleUpdate(t, r, types.StringValue("old description"), types.StringValue("  updated description  "), false)
+	if afterUpdate.Description.ValueString() != "  updated description  " {
+		t.Errorf("description after update = %q, want configured %q", afterUpdate.Description.ValueString(), "  updated description  ")
+	}
+}
+
 func TestSecurityGroupRuleResourceUpdateInvalidID(t *testing.T) {
 	t.Parallel()
 
@@ -1021,13 +1114,13 @@ func TestBuildSecurityGroupRuleCreateBody(t *testing.T) {
 	if body.Direction != networksdk.SGRDirectionIngress {
 		t.Errorf("expected direction 'ingress', got %q", body.Direction)
 	}
-	if body.Protocol == nil || *body.Protocol != networksdk.SGRProtocolTcp {
+	if core.NullableToPtr(body.Protocol) == nil || *core.NullableToPtr(body.Protocol) != networksdk.SGRProtocolTcp {
 		t.Errorf("expected protocol 'tcp', got %v", body.Protocol)
 	}
-	if body.PortRangeMin == nil || *body.PortRangeMin != 22 {
+	if core.NullableToPtr(body.PortRangeMin) == nil || *core.NullableToPtr(body.PortRangeMin) != 22 {
 		t.Errorf("expected port_range_min 22, got %v", body.PortRangeMin)
 	}
-	if body.PortRangeMax == nil || *body.PortRangeMax != 22 {
+	if core.NullableToPtr(body.PortRangeMax) == nil || *core.NullableToPtr(body.PortRangeMax) != 22 {
 		t.Errorf("expected port_range_max 22, got %v", body.PortRangeMax)
 	}
 	if body.RemoteIpPrefix == nil || *body.RemoteIpPrefix != "0.0.0.0/0" {
@@ -1080,10 +1173,10 @@ func TestBuildSecurityGroupRuleCreateBodyOmitsUnsetFields(t *testing.T) {
 			if body.Direction != networksdk.SGRDirectionEgress {
 				t.Errorf("expected direction 'egress', got %q", body.Direction)
 			}
-			if body.Protocol == nil || *body.Protocol != networksdk.SGRProtocolAny {
+			if core.NullableToPtr(body.Protocol) == nil || *core.NullableToPtr(body.Protocol) != networksdk.SGRProtocolAny {
 				t.Errorf("expected protocol 'any', got %v", body.Protocol)
 			}
-			if body.PortRangeMin != nil || body.PortRangeMax != nil {
+			if body.PortRangeMin.IsSpecified() || body.PortRangeMax.IsSpecified() {
 				t.Errorf("expected nil port range, got %v..%v", body.PortRangeMin, body.PortRangeMax)
 			}
 			if body.RemoteIpPrefix != nil {
@@ -1233,6 +1326,16 @@ func TestBuildSecurityGroupRuleUpdateBody(t *testing.T) {
 			planDescription: types.StringValue("old description"),
 		},
 		{
+			name:            "padded unchanged description sends nothing",
+			planDescription: types.StringValue("  old description  "),
+		},
+		{
+			name:            "changed padded description is sent trimmed",
+			planDescription: types.StringValue("  updated description  "),
+			wantChanged:     true,
+			wantDescription: new("updated description"),
+		},
+		{
 			// An unconfigured Optional and Computed description plans the prior
 			// state value, so omission must never reach the request as an empty
 			// string and silently clear the backend value.
@@ -1284,8 +1387,8 @@ func TestPopulateSecurityGroupRuleModel(t *testing.T) {
 		{"security_group.id", reference.Get(m.SecurityGroup, reference.ID).ValueString(), rule.SecurityGroup.Id.String()},
 		{"security_group_name", m.SecurityGroupName.ValueString(), rule.SecurityGroup.Name},
 		{"direction", m.Direction.ValueString(), string(rule.Direction)},
-		{"protocol", m.Protocol.ValueString(), string(*rule.Protocol)},
-		{"ethertype", m.Ethertype.ValueString(), string(*rule.Ethertype)},
+		{"protocol", m.Protocol.ValueString(), string(*core.NullableToPtr(rule.Protocol))},
+		{"ethertype", m.Ethertype.ValueString(), string(*core.NullableToPtr(rule.Ethertype))},
 		{"remote_ip_prefix", m.RemoteIPPrefix.ValueString(), rule.RemoteIpPrefix},
 		{"description", m.Description.ValueString(), *rule.Description},
 		{"region", m.Region.ValueString(), rule.Region.Name},
@@ -1296,11 +1399,11 @@ func TestPopulateSecurityGroupRuleModel(t *testing.T) {
 			t.Errorf("expected %s %q, got %q", field.name, field.want, field.got)
 		}
 	}
-	if m.PortRangeMin.ValueInt64() != int64(*rule.PortRangeMin) {
-		t.Errorf("expected PortRangeMin %d, got %d", *rule.PortRangeMin, m.PortRangeMin.ValueInt64())
+	if m.PortRangeMin.ValueInt64() != int64(*core.NullableToPtr(rule.PortRangeMin)) {
+		t.Errorf("expected PortRangeMin %d, got %d", *core.NullableToPtr(rule.PortRangeMin), m.PortRangeMin.ValueInt64())
 	}
-	if m.PortRangeMax.ValueInt64() != int64(*rule.PortRangeMax) {
-		t.Errorf("expected PortRangeMax %d, got %d", *rule.PortRangeMax, m.PortRangeMax.ValueInt64())
+	if m.PortRangeMax.ValueInt64() != int64(*core.NullableToPtr(rule.PortRangeMax)) {
+		t.Errorf("expected PortRangeMax %d, got %d", *core.NullableToPtr(rule.PortRangeMax), m.PortRangeMax.ValueInt64())
 	}
 }
 
@@ -1398,8 +1501,8 @@ func TestPopulateSecurityGroupRuleResourceStateFillsNullStateAfterImport(t *test
 	if state.Direction.ValueString() != string(rule.Direction) {
 		t.Errorf("expected direction %q, got %q", rule.Direction, state.Direction.ValueString())
 	}
-	if state.Protocol.ValueString() != string(*rule.Protocol) {
-		t.Errorf("expected protocol %q, got %q", *rule.Protocol, state.Protocol.ValueString())
+	if state.Protocol.ValueString() != string(*core.NullableToPtr(rule.Protocol)) {
+		t.Errorf("expected protocol %q, got %q", *core.NullableToPtr(rule.Protocol), state.Protocol.ValueString())
 	}
 	if state.RemoteIPPrefix.ValueString() != rule.RemoteIpPrefix {
 		t.Errorf("expected remote_ip_prefix %q, got %q", rule.RemoteIpPrefix, state.RemoteIPPrefix.ValueString())

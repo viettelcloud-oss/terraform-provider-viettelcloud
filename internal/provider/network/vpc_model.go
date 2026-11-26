@@ -6,7 +6,10 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
+
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 )
 
 type VPCModel struct {
@@ -43,7 +46,7 @@ func populateVPCModel(vpc *networksdk.VPCSchema, m *VPCModel) {
 	m.CreatedAt = types.StringValue(vpc.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(vpc.UpdatedAt.Format(time.RFC3339))
 
-	m.Description = types.StringPointerValue(vpc.Description)
+	m.Description = types.StringPointerValue(core.NullableToPtr(vpc.Description))
 }
 
 func populateVPCResourceState(vpc *networksdk.VPCSchema, state *VPCResourceModel) {
@@ -52,12 +55,16 @@ func populateVPCResourceState(vpc *networksdk.VPCSchema, state *VPCResourceModel
 	}
 
 	configuredName := state.Name
+	configuredDescription := state.Description
+	configuredCIDR := state.CIDR
 	populateVPCModel(vpc, &state.VPCModel)
 	// Keep the configured representation when the backend only trims outer
 	// whitespace, otherwise Terraform reports an inconsistent result.
 	if !configuredName.IsNull() && !configuredName.IsUnknown() && strings.TrimSpace(configuredName.ValueString()) == vpc.Name {
 		state.Name = configuredName
 	}
+	state.Description = preservedNullableString(configuredDescription, state.Description)
+	state.CIDR = compare.PreservedString(configuredCIDR, vpc.Cidr)
 	state.Region = regionReferenceState(state.Region, vpc.Region.Name)
 }
 

@@ -40,9 +40,10 @@ func (f PrivateIPFilter) matches(privateIP *networksdk.PrivateIPSchema) bool {
 	if f.ID != nil && privateIP.Id != *f.ID {
 		return false
 	}
-	if ipAddress := finder.Trim(f.IPAddress); ipAddress != "" &&
-		(privateIP.IpAddress == nil || *privateIP.IpAddress != ipAddress) {
-		return false
+	if ipAddress := finder.Trim(f.IPAddress); ipAddress != "" {
+		if current := core.NullableToPtr(privateIP.IpAddress); current == nil || *current != ipAddress {
+			return false
+		}
 	}
 	if f.SubnetID != nil && privateIP.Subnet.Id != *f.SubnetID {
 		return false
@@ -99,8 +100,8 @@ func (f *PrivateIPFinder) Resolve(ctx context.Context, filter PrivateIPFilter) (
 
 func privateIPSummary(privateIP networksdk.PrivateIPSchema) string {
 	ipAddress := ""
-	if privateIP.IpAddress != nil {
-		ipAddress = *privateIP.IpAddress
+	if value := core.NullableToPtr(privateIP.IpAddress); value != nil {
+		ipAddress = *value
 	}
 	return fmt.Sprintf(
 		"id=%s (ip_address=%q, subnet_name=%q, vpc_name=%q, region=%q)",

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
@@ -49,7 +50,7 @@ func populateSubnetModel(subnet *networksdk.SubnetSchema, m *SubnetModel) {
 	m.CreatedAt = types.StringValue(subnet.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(subnet.UpdatedAt.Format(time.RFC3339))
 
-	m.Description = types.StringPointerValue(subnet.Description)
+	m.Description = types.StringPointerValue(core.NullableToPtr(subnet.Description))
 }
 
 func populateSubnetResourceState(subnet *networksdk.SubnetSchema, state *SubnetResourceModel) {
@@ -58,7 +59,13 @@ func populateSubnetResourceState(subnet *networksdk.SubnetSchema, state *SubnetR
 	}
 
 	originalName := state.Name
+	configuredDescription := state.Description
+	configuredCIDR := state.CIDR
 	populateSubnetModel(subnet, &state.SubnetModel)
+	// The API trims these strings, so keep the configured spelling when only
+	// outer whitespace differs.
+	state.Description = preservedNullableString(configuredDescription, state.Description)
+	state.CIDR = compare.PreservedString(configuredCIDR, subnet.Cidr)
 
 	if !originalName.IsNull() && !originalName.IsUnknown() && strings.TrimSpace(originalName.ValueString()) == subnet.Name {
 		state.Name = originalName

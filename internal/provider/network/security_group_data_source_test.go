@@ -83,6 +83,7 @@ func TestSecurityGroupDataSourceReadDirectID(t *testing.T) {
 	t.Parallel()
 
 	sgID := core.UUID{1, 2, 3}
+	configuredID := "  " + sgID.String() + "  "
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v2/network/security-groups/"+sgID.String()+"/" {
 			w.Header().Set("Content-Type", "application/json")
@@ -123,7 +124,7 @@ func TestSecurityGroupDataSourceReadDirectID(t *testing.T) {
 	configState := tfsdk.State{Schema: schema}
 	diags := configState.Set(context.Background(), &SecurityGroupDataSourceModel{
 		SecurityGroupModel: SecurityGroupModel{
-			ID: types.StringValue(sgID.String()),
+			ID: types.StringValue(configuredID),
 		},
 	})
 	if diags.HasError() {
@@ -147,7 +148,7 @@ func TestSecurityGroupDataSourceReadDirectID(t *testing.T) {
 	if diags := resp.State.Get(context.Background(), &state); diags.HasError() {
 		t.Fatalf("failed to get state: %v", diags)
 	}
-	if state.ID.ValueString() != sgID.String() || state.Name.ValueString() != "direct-sg" || state.Region.ValueString() != "vn-central" || state.Description.ValueString() != "direct description" {
+	if state.ID.ValueString() != configuredID || state.Name.ValueString() != "direct-sg" || state.Region.ValueString() != "vn-central" || state.Description.ValueString() != "direct description" {
 		t.Fatalf("unexpected state: %#v", state)
 	}
 }

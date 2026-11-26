@@ -7,8 +7,10 @@ import (
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	blockstoragesdk "github.com/viettelcloud-oss/sdks/go/blockstorage"
+	"github.com/viettelcloud-oss/sdks/go/core"
 )
 
 type VolumeBackupModel struct {
@@ -33,7 +35,9 @@ type VolumeBackupModel struct {
 // the data source keeps filtering by a plain volume_id.
 type VolumeBackupResourceModel struct {
 	VolumeBackupModel
-	Volume types.Object `tfsdk:"volume"`
+	Volume        types.Object   `tfsdk:"volume"`
+	RestoreVolume types.Object   `tfsdk:"restore_volume"`
+	Timeouts      timeouts.Value `tfsdk:"timeouts"`
 }
 
 type VolumeBackupDataSourceModel struct {
@@ -56,24 +60,24 @@ func populateVolumeBackupModel(backup *blockstoragesdk.VolumeBackupSchema, state
 		state.Description = types.StringValue(*backup.Description)
 	}
 	state.VolumeName = types.StringNull()
-	if backup.Volume != nil {
-		state.VolumeName = types.StringValue(backup.Volume.Name)
+	if volume := core.NullableToPtr(backup.Volume); volume != nil {
+		state.VolumeName = types.StringValue(volume.Name)
 	}
 	state.Status = types.StringNull()
-	if backup.Status != nil {
-		state.Status = types.StringValue(string(*backup.Status))
+	if status := core.NullableToPtr(backup.Status); status != nil {
+		state.Status = types.StringValue(string(*status))
 	}
 	state.Size = types.Int64Null()
-	if backup.Size != nil {
-		state.Size = types.Int64Value(int64(*backup.Size))
+	if size := core.NullableToPtr(backup.Size); size != nil {
+		state.Size = types.Int64Value(int64(*size))
 	}
 	state.DiskType = types.StringNull()
-	if backup.DiskType != nil {
-		state.DiskType = types.StringValue(string(*backup.DiskType))
+	if diskType := core.NullableToPtr(backup.DiskType); diskType != nil {
+		state.DiskType = types.StringValue(string(*diskType))
 	}
 	state.PolicyID = types.StringNull()
-	if backup.Policy != nil {
-		state.PolicyID = types.StringValue(backup.Policy.Id.String())
+	if policy := core.NullableToPtr(backup.Policy); policy != nil {
+		state.PolicyID = types.StringValue(policy.Id.String())
 	}
 }
 
@@ -83,19 +87,19 @@ func populateVolumeBackupResourceState(backup *blockstoragesdk.VolumeBackupSchem
 	if !name.IsNull() && !name.IsUnknown() && strings.TrimSpace(name.ValueString()) == backup.Name {
 		state.Name = name
 	}
-	if backup.Description != nil && !description.IsNull() && !description.IsUnknown() && description.ValueString() == *backup.Description {
+	if backup.Description != nil && compare.SameTrimmed(description, *backup.Description) {
 		state.Description = description
 	}
-	if backup.Volume != nil {
-		state.Volume = reference.Value(reference.ID, preservedUUID(reference.Get(volume, reference.ID), backup.Volume.Id))
+	if backupVolume := core.NullableToPtr(backup.Volume); backupVolume != nil {
+		state.Volume = reference.Value(reference.ID, compare.PreservedUUID(reference.Get(volume, reference.ID), backupVolume.Id))
 	}
 }
 
 func populateVolumeBackupDataSourceState(backup *blockstoragesdk.VolumeBackupSchema, state *VolumeBackupDataSourceModel) {
 	populateVolumeBackupModel(backup, &state.VolumeBackupModel)
 	state.VolumeID = types.StringNull()
-	if backup.Volume != nil {
-		state.VolumeID = types.StringValue(backup.Volume.Id.String())
+	if volume := core.NullableToPtr(backup.Volume); volume != nil {
+		state.VolumeID = types.StringValue(volume.Id.String())
 	}
 }
 
@@ -103,7 +107,7 @@ func preserveVolumeBackupConfiguredValues(backup *blockstoragesdk.VolumeBackupSc
 	if compare.SameUUID(config.ID, backup.Id) {
 		state.ID = config.ID
 	}
-	if backup.Volume != nil && compare.SameUUID(config.VolumeID, backup.Volume.Id) {
+	if volume := core.NullableToPtr(backup.Volume); volume != nil && compare.SameUUID(config.VolumeID, volume.Id) {
 		state.VolumeID = config.VolumeID
 	}
 	if !config.Name.IsNull() && !config.Name.IsUnknown() && strings.TrimSpace(config.Name.ValueString()) == backup.Name {
@@ -112,7 +116,7 @@ func preserveVolumeBackupConfiguredValues(backup *blockstoragesdk.VolumeBackupSc
 	if !config.Region.IsNull() && !config.Region.IsUnknown() && strings.TrimSpace(config.Region.ValueString()) == backup.Region.Name {
 		state.Region = config.Region
 	}
-	if backup.Status != nil && !config.Status.IsNull() && !config.Status.IsUnknown() && strings.TrimSpace(config.Status.ValueString()) == string(*backup.Status) {
+	if status := core.NullableToPtr(backup.Status); status != nil && !config.Status.IsNull() && !config.Status.IsUnknown() && strings.TrimSpace(config.Status.ValueString()) == string(*status) {
 		state.Status = config.Status
 	}
 }

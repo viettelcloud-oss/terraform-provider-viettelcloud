@@ -9,6 +9,8 @@
 #   run "planAgain_untrimmedName_stateStable" {
 #   run "changePublicKey_existingKeyPair_keyPairReplaced" {
 #   run "planAgain_customPublicKey_stateStable" {
+#   run "addTrailingNewline_customPublicKey_publicKeyUpdatedInPlace" {
+#   run "planAgain_publicKeyWithTrailingNewline_stateStable" {
 #   run "omitPublicKey_publicKeySet_publicKeyPreservedInPlace" {
 #   run "planAgain_omittedPublicKey_stateStable" {
 #
@@ -193,6 +195,52 @@ run "planAgain_customPublicKey_stateStable" {
   }
 }
 
+# Adding a trailing newline, as file() does, names the same key and updates state in place.
+run "addTrailingNewline_customPublicKey_publicKeyUpdatedInPlace" {
+  command = apply
+
+  module {
+    source = "./fixtures/key_pair/resource"
+  }
+
+  variables {
+    name       = "tf-test-kp-lifecycle-renamed"
+    public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYaHmUmaUHlt9gl3vklMrdWv0OUerISYy12QvEi0BjujzAm/yQDVdXM3hW+tKz0FvPWWAAz/NNvXlhcNwzKGI5K0BWGqxrYtrx/GrYhpgoJD9Jrh3NEVtEGa8HQWDQeq6KVcaU4x+Bt4GdArV2FqTKpwqU3/Y1Uzas+ZPy4j+9y5oD5+p7rJQEbEwd5eKn/owg6bYsFBJagzd1gG7OC4JFwCKN3YP+TZAlZ8/MZeU6eeu5ilVlY9bWFJxwfSjoN4z+ilMBuPedafzQdbaFdBos2QOPhdOVAlSzFQFWmqcQK0z4idZPRfHQf5KvPGOtcWYKfA433N8t4+iyhucLA+uF test@integration.test\n"
+  }
+
+  assert {
+    condition = (
+      viettelcloud_key_pair.key_pair.id == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_id &&
+      viettelcloud_key_pair.key_pair.public_key == "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYaHmUmaUHlt9gl3vklMrdWv0OUerISYy12QvEi0BjujzAm/yQDVdXM3hW+tKz0FvPWWAAz/NNvXlhcNwzKGI5K0BWGqxrYtrx/GrYhpgoJD9Jrh3NEVtEGa8HQWDQeq6KVcaU4x+Bt4GdArV2FqTKpwqU3/Y1Uzas+ZPy4j+9y5oD5+p7rJQEbEwd5eKn/owg6bYsFBJagzd1gG7OC4JFwCKN3YP+TZAlZ8/MZeU6eeu5ilVlY9bWFJxwfSjoN4z+ilMBuPedafzQdbaFdBos2QOPhdOVAlSzFQFWmqcQK0z4idZPRfHQf5KvPGOtcWYKfA433N8t4+iyhucLA+uF test@integration.test\n" &&
+      viettelcloud_key_pair.key_pair.fingerprint == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_fingerprint &&
+      viettelcloud_key_pair.key_pair.private_key == null
+    )
+    error_message = "Adding a trailing newline to public_key replaced the key pair or changed its fingerprint."
+  }
+}
+
+# Asserts that a subsequent plan detects no drift for the public key with a trailing newline.
+run "planAgain_publicKeyWithTrailingNewline_stateStable" {
+  command = plan
+
+  module {
+    source = "./fixtures/key_pair/resource"
+  }
+
+  variables {
+    name       = "tf-test-kp-lifecycle-renamed"
+    public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYaHmUmaUHlt9gl3vklMrdWv0OUerISYy12QvEi0BjujzAm/yQDVdXM3hW+tKz0FvPWWAAz/NNvXlhcNwzKGI5K0BWGqxrYtrx/GrYhpgoJD9Jrh3NEVtEGa8HQWDQeq6KVcaU4x+Bt4GdArV2FqTKpwqU3/Y1Uzas+ZPy4j+9y5oD5+p7rJQEbEwd5eKn/owg6bYsFBJagzd1gG7OC4JFwCKN3YP+TZAlZ8/MZeU6eeu5ilVlY9bWFJxwfSjoN4z+ilMBuPedafzQdbaFdBos2QOPhdOVAlSzFQFWmqcQK0z4idZPRfHQf5KvPGOtcWYKfA433N8t4+iyhucLA+uF test@integration.test\n"
+  }
+
+  assert {
+    condition = (
+      viettelcloud_key_pair.key_pair.id == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_id &&
+      viettelcloud_key_pair.key_pair.public_key == "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYaHmUmaUHlt9gl3vklMrdWv0OUerISYy12QvEi0BjujzAm/yQDVdXM3hW+tKz0FvPWWAAz/NNvXlhcNwzKGI5K0BWGqxrYtrx/GrYhpgoJD9Jrh3NEVtEGa8HQWDQeq6KVcaU4x+Bt4GdArV2FqTKpwqU3/Y1Uzas+ZPy4j+9y5oD5+p7rJQEbEwd5eKn/owg6bYsFBJagzd1gG7OC4JFwCKN3YP+TZAlZ8/MZeU6eeu5ilVlY9bWFJxwfSjoN4z+ilMBuPedafzQdbaFdBos2QOPhdOVAlSzFQFWmqcQK0z4idZPRfHQf5KvPGOtcWYKfA433N8t4+iyhucLA+uF test@integration.test\n"
+    )
+    error_message = "Subsequent plan detected drift on the public key with a trailing newline."
+  }
+}
+
 # Omitting an already configured public key preserves its backend value without replacement.
 run "omitPublicKey_publicKeySet_publicKeyPreservedInPlace" {
   command = apply
@@ -209,7 +257,7 @@ run "omitPublicKey_publicKeySet_publicKeyPreservedInPlace" {
     condition = (
       viettelcloud_key_pair.key_pair.id == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_id &&
       viettelcloud_key_pair.key_pair.name == "tf-test-kp-lifecycle-renamed" &&
-      viettelcloud_key_pair.key_pair.public_key == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_public_key &&
+      viettelcloud_key_pair.key_pair.public_key == run.addTrailingNewline_customPublicKey_publicKeyUpdatedInPlace.key_pair_public_key &&
       viettelcloud_key_pair.key_pair.fingerprint == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_fingerprint &&
       viettelcloud_key_pair.key_pair.type == "rsa" &&
       viettelcloud_key_pair.key_pair.private_key == null &&
@@ -236,7 +284,7 @@ run "planAgain_omittedPublicKey_stateStable" {
     condition = (
       viettelcloud_key_pair.key_pair.id == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_id &&
       viettelcloud_key_pair.key_pair.name == "tf-test-kp-lifecycle-renamed" &&
-      viettelcloud_key_pair.key_pair.public_key == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_public_key &&
+      viettelcloud_key_pair.key_pair.public_key == run.addTrailingNewline_customPublicKey_publicKeyUpdatedInPlace.key_pair_public_key &&
       viettelcloud_key_pair.key_pair.fingerprint == run.changePublicKey_existingKeyPair_keyPairReplaced.key_pair_fingerprint &&
       viettelcloud_key_pair.key_pair.type == "rsa" &&
       viettelcloud_key_pair.key_pair.private_key == null

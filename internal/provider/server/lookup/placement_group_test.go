@@ -44,7 +44,7 @@ func samplePlacementGroup(
 ) serversdk.PlacementGroupSchema {
 	value := policy
 	pg := placementGroupWithoutPolicy(id, name, regionName)
-	pg.Policy = &value
+	pg.Policy = core.NullableFromPtr(&value)
 	return pg
 }
 

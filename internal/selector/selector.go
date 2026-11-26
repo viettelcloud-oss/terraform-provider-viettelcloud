@@ -267,6 +267,12 @@ func Decide(ctx context.Context, planned, prior types.Object, field string,
 // Refresh tracks catalog identity, not catalog metadata, without API calls.
 // An unknown prior ID is a provider bug because apply must record the resolved ID.
 func Refresh(prior types.Object, attributeTypes map[string]attr.Type, current *core.UUID, name string) (types.Object, diag.Diagnostics) {
+	return RefreshCriterion(prior, attributeTypes, current, "name", name)
+}
+
+// RefreshCriterion is Refresh for a selector whose reported entry is named by
+// criterion rather than by "name", such as the version of a DB version.
+func RefreshCriterion(prior types.Object, attributeTypes map[string]attr.Type, current *core.UUID, criterion, value string) (types.Object, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	if !prior.IsNull() && !prior.IsUnknown() {
 		id := prior.Attributes()["id"]
@@ -291,7 +297,7 @@ func Refresh(prior types.Object, attributeTypes map[string]attr.Type, current *c
 			values[key] = types.StringNull()
 		}
 	}
-	values["name"] = types.StringValue(name)
+	values[criterion] = types.StringValue(value)
 	values["id"] = types.StringValue(current.String())
 	return types.ObjectValueMust(attributeTypes, values), diags
 }

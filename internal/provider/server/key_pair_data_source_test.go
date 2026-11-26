@@ -124,7 +124,7 @@ func TestKeyPairDataSourceRead_ByID_Success(t *testing.T) {
 
 	config := keyPairDataSourceConfig(t, schemaResp.Schema, KeyPairDataSourceModel{
 		KeyPairModel: KeyPairModel{
-			ID: types.StringValue(keyPairTestUUID.String()),
+			ID: types.StringValue("  " + keyPairTestUUID.String() + " "),
 		},
 	})
 
@@ -139,8 +139,8 @@ func TestKeyPairDataSourceRead_ByID_Success(t *testing.T) {
 		t.Fatalf("get state: %v", diags)
 	}
 
-	if state.ID.ValueString() != keyPairTestUUID.String() {
-		t.Errorf("got ID %s, want %s", state.ID.ValueString(), keyPairTestUUID.String())
+	if state.ID.ValueString() != "  "+keyPairTestUUID.String()+" " {
+		t.Errorf("got ID %q, want the configured spelling", state.ID.ValueString())
 	}
 	if state.Name.ValueString() != "test-key" {
 		t.Errorf("got Name %s, want test-key", state.Name.ValueString())
@@ -444,7 +444,7 @@ func TestPreserveConfiguredValues(t *testing.T) {
 
 	config := KeyPairDataSourceModel{
 		KeyPairModel: KeyPairModel{
-			ID:          types.StringValue(strings.ToUpper(testUUID.String())),
+			ID:          types.StringValue("  " + strings.ToUpper(testUUID.String()) + " "),
 			Name:        types.StringValue("  test-key  "),
 			Fingerprint: types.StringValue(" 11:22:AA "),
 		},

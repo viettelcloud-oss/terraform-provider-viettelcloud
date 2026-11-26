@@ -16,6 +16,8 @@ Terraform provider for managing infrastructure resources on the Viettel Cloud pl
 | Server | `viettelcloud_placement_group` | `viettelcloud_placement_group` |
 | Server | `viettelcloud_server` | — |
 | Server | `viettelcloud_key_pair` | `viettelcloud_key_pair` |
+| Load Balancing | `viettelcloud_lb_loadbalancer`, `viettelcloud_lb_server_group`, `viettelcloud_lb_listener`, `viettelcloud_lb_member`, `viettelcloud_lb_l7_policy`, `viettelcloud_lb_l7_rule` | `viettelcloud_lb_loadbalancer`, `viettelcloud_lb_server_group`, `viettelcloud_lb_listener`, `viettelcloud_lb_member`, `viettelcloud_lb_l7_policy`, `viettelcloud_lb_l7_rule` |
+| File Storage | `viettelcloud_fs_filesystem` | `viettelcloud_fs_filesystem` |
 
 See the generated [provider documentation](docs/index.md) and the
 [`examples/`](examples/) directory for configuration details.
@@ -38,7 +40,7 @@ terraform {
   required_providers {
     viettelcloud = {
       source  = "viettelcloud-oss/viettelcloud"
-      version = "~> 0.1.1"
+      version = "~> 0.3.0"
     }
   }
 }

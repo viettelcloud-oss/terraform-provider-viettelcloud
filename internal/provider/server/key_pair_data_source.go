@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverlookup "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server/lookup"
@@ -195,10 +196,8 @@ func preserveConfiguredValues(kp *serversdk.KeyPairSchema, config KeyPairDataSou
 	if kp == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == kp.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, kp.Id) {
+		state.ID = config.ID
 	}
 	configuredName := config.Name
 	if !configuredName.IsNull() && !configuredName.IsUnknown() && strings.TrimSpace(configuredName.ValueString()) == kp.Name {

@@ -11,16 +11,17 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/reference"
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/replace"
 )
 
 var (
@@ -71,7 +72,7 @@ func (r *SecurityGroupRuleResource) Schema(_ context.Context, _ resource.SchemaR
 				Description: "Security group owning the rule.",
 				Attributes:  reference.Attributes(reference.ID, "Security group ID (UUID)."),
 				PlanModifiers: []planmodifier.Object{
-					objectplanmodifier.RequiresReplace(),
+					replace.Reference(reference.ID, compare.SameUUIDString),
 				},
 			},
 			"security_group_name": schema.StringAttribute{
@@ -82,14 +83,14 @@ func (r *SecurityGroupRuleResource) Schema(_ context.Context, _ resource.SchemaR
 				Required:    true,
 				Description: "Direction of the rule: ingress or egress.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					replace.String(sameSGRValueString),
 				},
 			},
 			"protocol": schema.StringAttribute{
 				Required:    true,
 				Description: "Protocol filter. Supported values: " + supportedSecurityGroupRuleProtocols + ".",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					replace.String(sameSGRValueString),
 				},
 			},
 			"ethertype": schema.StringAttribute{
@@ -127,7 +128,7 @@ func (r *SecurityGroupRuleResource) Schema(_ context.Context, _ resource.SchemaR
 				Description: "CIDR allowed to reach the rule. Omitting it keeps whatever the backend assigned.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
-					stringplanmodifier.RequiresReplaceIfConfigured(),
+					replace.StringIfConfigured(compare.SameTrimmedString),
 				},
 			},
 			"description": schema.StringAttribute{
@@ -373,7 +374,7 @@ func buildSecurityGroupRuleCreateBody(plan SecurityGroupRuleResourceModel) (netw
 		)
 		return body, diags
 	}
-	body.Protocol = &protocol
+	body.Protocol.Set(protocol)
 
 	for _, port := range []struct {
 		name  string
@@ -398,7 +399,7 @@ func buildSecurityGroupRuleCreateBody(plan SecurityGroupRuleResourceModel) (netw
 	}
 
 	if !plan.Description.IsNull() && !plan.Description.IsUnknown() {
-		description := plan.Description.ValueString()
+		description := strings.TrimSpace(plan.Description.ValueString())
 		body.Description = &description
 	}
 
@@ -409,12 +410,12 @@ func buildSecurityGroupRuleCreateBody(plan SecurityGroupRuleResourceModel) (netw
 
 	if !plan.PortRangeMin.IsNull() && !plan.PortRangeMin.IsUnknown() {
 		portRangeMin := int(plan.PortRangeMin.ValueInt64())
-		body.PortRangeMin = &portRangeMin
+		body.PortRangeMin.Set(portRangeMin)
 	}
 
 	if !plan.PortRangeMax.IsNull() && !plan.PortRangeMax.IsUnknown() {
 		portRangeMax := int(plan.PortRangeMax.ValueInt64())
-		body.PortRangeMax = &portRangeMax
+		body.PortRangeMax.Set(portRangeMax)
 	}
 
 	return body, diags
@@ -429,12 +430,16 @@ func buildSecurityGroupRuleUpdateBody(
 ) (networksdk.SecurityGroupRulePartialUpdateSchema, bool) {
 	var body networksdk.SecurityGroupRulePartialUpdateSchema
 
-	if !plan.Description.IsNull() && !plan.Description.IsUnknown() && !plan.Description.Equal(state.Description) {
-		description := plan.Description.ValueString()
-		body.Description = &description
-		return body, true
+	if plan.Description.IsNull() || plan.Description.IsUnknown() {
+		return body, false
 	}
-	return body, false
+	// The API trims the description, so compare trimmed values.
+	description := strings.TrimSpace(plan.Description.ValueString())
+	if compare.SameTrimmed(state.Description, description) {
+		return body, false
+	}
+	body.Description = &description
+	return body, true
 }
 
 func validateSecurityGroupRulePortCompatibility(protocol types.String, minPort, maxPort types.Int64) diag.Diagnostics {

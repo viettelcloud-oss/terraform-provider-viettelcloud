@@ -45,8 +45,10 @@ func (f ImageFilter) matches(image *serversdk.ImageSchema) bool {
 	if version := finder.Trim(f.Version); version != "" && (image.Version == nil || *image.Version != version) {
 		return false
 	}
-	if imageType := finder.Trim((*string)(f.Type)); imageType != "" && (image.Type == nil || string(*image.Type) != imageType) {
-		return false
+	if imageType := finder.Trim((*string)(f.Type)); imageType != "" {
+		if candidateType := core.NullableToPtr(image.Type); candidateType == nil || string(*candidateType) != imageType {
+			return false
+		}
 	}
 	return true
 }
@@ -91,5 +93,5 @@ func (f *ImageFinder) Resolve(ctx context.Context, filter ImageFilter) (serversd
 }
 
 func imageSummary(image serversdk.ImageSchema) string {
-	return fmt.Sprintf("id=%s (name=%q, os=%q, version=%q, type=%q)", image.Id, image.Name, finder.Trim(image.Os), finder.Trim(image.Version), finder.Trim((*string)(image.Type)))
+	return fmt.Sprintf("id=%s (name=%q, os=%q, version=%q, type=%q)", image.Id, image.Name, finder.Trim(image.Os), finder.Trim(image.Version), finder.Trim((*string)(core.NullableToPtr(image.Type))))
 }

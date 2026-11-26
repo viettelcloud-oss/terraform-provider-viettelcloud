@@ -288,9 +288,9 @@ func TestPopulateElasticIPState(t *testing.T) {
 		Description: &description,
 		EnableIpv4:  true,
 		EnableIpv6:  true,
-		IpAddress:   &ipv4,
-		Ipv6Address: &ipv6,
-		Status:      &status,
+		IpAddress:   core.NullableFromPtr(&ipv4),
+		Ipv6Address: core.NullableFromPtr(&ipv6),
+		Status:      core.NullableFromPtr(&status),
 		Region: networksdk.NestedRegionSchema{
 			Id:   elasticIPResourceTestUUID,
 			Name: "vn-central",
@@ -605,6 +605,95 @@ func TestElasticIPCreateUsesResolvedRegionAndRefreshesState(t *testing.T) {
 	}
 }
 
+func TestElasticIPCreateTrimsDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	projectID := core.UUID{1}
+	regionID := core.UUID{2}
+	eipID := core.UUID{3}
+	httpClient := &http.Client{Transport: elasticIPResourceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		response := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/v2/projects/"+projectID.String()+"/regions/":
+			response.Body = io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"count":1,"next":null,"previous":null,"results":[{"region":{"id":%q,"name":"vn-central","description":""},"services":[]}]}`,
+				regionID.String(),
+			)))
+		case req.Method == http.MethodPost && req.URL.Path == "/v2/network/elastic-ips/":
+			var body networksdk.ElasticIPCreateSchema
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if body.Description == nil || *body.Description != "Managed by Terraform" {
+				t.Fatalf("create description = %v, want trimmed %q", body.Description, "Managed by Terraform")
+			}
+			response.StatusCode = http.StatusCreated
+			response.Body = io.NopCloser(strings.NewReader(elasticIPResponseJSON(eipID, projectID, regionID)))
+		case req.Method == http.MethodGet && req.URL.Path == "/v2/network/elastic-ips/"+eipID.String()+"/":
+			response.Body = io.NopCloser(strings.NewReader(elasticIPResponseJSON(eipID, projectID, regionID)))
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+		}
+		return response, nil
+	})}
+
+	networkClient, err := networksdk.NewClient("https://network.test", networksdk.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("create network client: %v", err)
+	}
+	projectClient, err := projectsdk.NewClient("https://project.test", projectsdk.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("create project client: %v", err)
+	}
+	resourceUnderTest := &ElasticIPResource{client: networkClient, project: projectClient, projectID: projectID}
+
+	var schemaResponse resource.SchemaResponse
+	resourceUnderTest.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
+	const paddedDescription = " Managed by Terraform "
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	if diags := plan.Set(context.Background(), &ElasticIPResourceModel{
+		ElasticIPModel: ElasticIPModel{
+			ID:          types.StringUnknown(),
+			Description: types.StringValue(paddedDescription),
+			EnableIPv4:  types.BoolValue(true),
+			EnableIPv6:  types.BoolValue(false),
+			IPAddress:   types.StringUnknown(),
+			IPv6Address: types.StringUnknown(),
+			Status:      types.StringUnknown(),
+			CreatedAt:   types.StringUnknown(),
+			UpdatedAt:   types.StringUnknown(),
+		},
+		Region: reference.Value(reference.Name, types.StringValue("vn-central")),
+	}); diags.HasError() {
+		t.Fatalf("set plan: %v", diags)
+	}
+
+	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	resourceUnderTest.Create(context.Background(), resource.CreateRequest{Plan: plan}, &createResponse)
+	if createResponse.Diagnostics.HasError() {
+		t.Fatalf("unexpected create diagnostics: %v", createResponse.Diagnostics)
+	}
+	readResponse := resource.ReadResponse{State: createResponse.State}
+	resourceUnderTest.Read(context.Background(), resource.ReadRequest{State: createResponse.State}, &readResponse)
+	if readResponse.Diagnostics.HasError() {
+		t.Fatalf("unexpected read diagnostics: %v", readResponse.Diagnostics)
+	}
+
+	for step, state := range map[string]tfsdk.State{"create": createResponse.State, "read": readResponse.State} {
+		var model ElasticIPResourceModel
+		if diags := state.Get(context.Background(), &model); diags.HasError() {
+			t.Fatalf("get state after %s: %v", step, diags)
+		}
+		if model.Description.ValueString() != paddedDescription {
+			t.Fatalf("description after %s = %q, want configured %q", step, model.Description.ValueString(), paddedDescription)
+		}
+	}
+}
+
 func TestElasticIPReadDeleteResponses(t *testing.T) {
 	t.Parallel()
 
@@ -689,6 +778,15 @@ func TestBuildElasticIPUpdateBody(t *testing.T) {
 			state:       types.StringValue("kept"),
 			wantChanged: true,
 		},
+		{name: "padded plan of the same description is not sent", plan: types.StringValue(" kept "), state: types.StringValue("kept")},
+		{name: "padded state of the same description is not sent", plan: types.StringValue("kept"), state: types.StringValue(" kept ")},
+		{
+			name:        "changed padded description is sent trimmed",
+			plan:        types.StringValue(" updated "),
+			state:       types.StringValue("kept"),
+			wantChanged: true,
+			want:        "updated",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -747,6 +845,43 @@ func TestElasticIPUpdatePatchesDescription(t *testing.T) {
 	}
 	if newState.Description.ValueString() != "updated" || reference.Get(newState.Region, reference.Name).ValueString() != "vn-central" {
 		t.Fatalf("unexpected state after update: %#v", newState)
+	}
+}
+
+func TestElasticIPUpdateTrimsDescriptionAndKeepsConfiguredSpelling(t *testing.T) {
+	t.Parallel()
+
+	resourceUnderTest, calls := elasticIPStubResource(t, func(req *http.Request, _ int) (int, string) {
+		if req.Method != http.MethodPatch {
+			t.Fatalf("expected a PATCH request, got %s", req.Method)
+		}
+		var body struct {
+			Description *string `json:"description"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatalf("decode update body: %v", err)
+		}
+		if body.Description == nil || *body.Description != "updated" {
+			t.Fatalf("update description = %v, want trimmed %q", body.Description, "updated")
+		}
+		return http.StatusOK, strings.Replace(
+			elasticIPResponseJSON(elasticIPResourceTestUUID, elasticIPResourceTestUUID, elasticIPResourceTestUUID),
+			`"description":"Managed by Terraform"`,
+			`"description":"updated"`,
+			1,
+		)
+	})
+
+	newState, diagnostics := elasticIPUpdate(t, resourceUnderTest,
+		types.StringValue(" updated "), types.StringValue("Managed by Terraform"))
+	if diagnostics.HasError() {
+		t.Fatalf("unexpected update diagnostics: %v", diagnostics)
+	}
+	if calls() != 1 {
+		t.Fatalf("expected a single update request, got %d", calls())
+	}
+	if newState.Description.ValueString() != " updated " {
+		t.Fatalf("description after update = %q, want configured %q", newState.Description.ValueString(), " updated ")
 	}
 }
 
@@ -847,7 +982,7 @@ func TestElasticIPWaitUntilReady(t *testing.T) {
 		if waited := time.Since(start); waited != elasticIPReadyPollInterval {
 			t.Fatalf("expected one poll interval between polls, waited %s", waited)
 		}
-		if eip == nil || eip.Ipv6Address == nil || *eip.Ipv6Address != "2001:db8::10" {
+		if eip == nil || core.NullableToPtr(eip.Ipv6Address) == nil || *core.NullableToPtr(eip.Ipv6Address) != "2001:db8::10" {
 			t.Fatalf("expected the settled Elastic IP to be returned, got %#v", eip)
 		}
 	})

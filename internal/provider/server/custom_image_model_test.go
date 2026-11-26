@@ -18,14 +18,14 @@ func TestPopulateCustomImageModel(t *testing.T) {
 	image.Description = ""
 	image.Os = new("")
 	image.Version = new("v1")
-	image.Size = new(0)
-	image.MinVolumeSize = new(20)
-	image.Metadata = &map[string]any{"key": "value", "backend": float64(1)}
+	image.Size = core.NullableFromPtr(new(0))
+	image.MinVolumeSize = core.NullableFromPtr(new(20))
+	image.Metadata = core.NullableFromPtr(&map[string]any{"key": "value", "backend": float64(1)})
 	image.SharedProjects = &[]serversdk.NestedProjectSchema{{Id: core.UUID{0x91}, Name: "shared"}}
-	image.Owner = &serversdk.NestedUserSchema{Id: core.UUID{0x92}, Username: "image-owner"}
+	image.Owner = core.NullableFromPtr(&serversdk.NestedUserSchema{Id: core.UUID{0x92}, Username: "image-owner"})
 	model := CustomImageDataSourceModel{CustomImageModel: CustomImageModel{Name: types.StringValue(" image-a "), Region: types.StringValue(" region-a ")}, Volume: types.StringValue(" boot-source ")}
 	populateCustomImageDataSourceState(image, &model)
-	if model.Project.ValueString() != image.Project.Name || model.OwnerID.ValueString() != image.Owner.Id.String() || model.Owner.ValueString() != image.Owner.Username {
+	if model.Project.ValueString() != image.Project.Name || model.OwnerID.ValueString() != image.Owner.MustGet().Id.String() || model.Owner.ValueString() != image.Owner.MustGet().Username {
 		t.Fatalf("ownership outputs differ from the API: %#v", model)
 	}
 	if model.ID.ValueString() != image.Id.String() || model.Name.ValueString() != " image-a " || model.Volume.ValueString() != " boot-source " || model.Region.ValueString() != " region-a " || model.OS.IsNull() || model.OS.ValueString() != "" || model.Size.IsNull() || model.Size.ValueInt64() != 0 || model.MinVolumeSize.ValueInt64() != 20 || model.ProjectID.ValueString() != image.Project.Id.String() || model.EncryptKeySize.ValueString() != "0" || len(model.SharedProjectIDs.Elements()) != 1 || model.Metadata.ValueString() != `{"backend":1,"key":"value"}` || model.CreatedAt.ValueString() != "2026-01-02T03:04:05Z" {
@@ -47,7 +47,7 @@ func TestPopulateCustomImageModel(t *testing.T) {
 		t.Fatalf("nil pointers did not map to null: %#v", model)
 	}
 	image.SharedProjects = &[]serversdk.NestedProjectSchema{}
-	image.Metadata = &map[string]any{}
+	image.Metadata = core.NullableFromPtr(&map[string]any{})
 	populateCustomImageDataSourceState(image, &model)
 	if model.SharedProjectIDs.IsNull() || len(model.SharedProjectIDs.Elements()) != 0 || model.Metadata.ValueString() != "{}" {
 		t.Fatal(model)
@@ -57,9 +57,9 @@ func TestPopulateCustomImageModel(t *testing.T) {
 	if !model.SharedProjectIDs.Equal(configured) {
 		t.Fatal(model.SharedProjectIDs)
 	}
-	image.Owner = &serversdk.NestedUserSchema{Id: core.UUID{0x93}, Username: ""}
+	image.Owner = core.NullableFromPtr(&serversdk.NestedUserSchema{Id: core.UUID{0x93}, Username: ""})
 	populateCustomImageDataSourceState(image, &model)
-	if model.Owner.IsNull() || model.Owner.ValueString() != "" || model.OwnerID.ValueString() != image.Owner.Id.String() {
+	if model.Owner.IsNull() || model.Owner.ValueString() != "" || model.OwnerID.ValueString() != image.Owner.MustGet().Id.String() {
 		t.Fatalf("present owner with an empty username must stay known: %#v", model)
 	}
 }
@@ -68,18 +68,20 @@ func TestCustomImageConfiguredRepresentations(t *testing.T) {
 	t.Parallel()
 	image := customImageFixture()
 	image.Id = core.UUID{0xab}
-	image.Volume.Id = core.UUID{0xcd}
+	volume := image.Volume.MustGet()
+	volume.Id = core.UUID{0xcd}
+	image.Volume.Set(volume)
 	image.Os = new("Linux")
 	image.Version = new("1")
-	image.Metadata = &map[string]any{"a": "b"}
+	image.Metadata = core.NullableFromPtr(&map[string]any{"a": "b"})
 	image.SharedProjects = &[]serversdk.NestedProjectSchema{{Id: core.UUID{0xef}}}
 	configuredIDs, _ := types.SetValueFrom(context.Background(), types.StringType, []string{strings.ToUpper(core.UUID{0xef}.String())})
 	state := CustomImageDataSourceModel{CustomImageModel: CustomImageModel{
 		ID: types.StringValue(strings.ToUpper(image.Id.String())),
 		OS: types.StringValue(" Linux "), Version: types.StringValue(" 1 "), Metadata: types.StringValue(`{ "a" : "b" }`),
-	}, VolumeID: types.StringValue(strings.ToUpper(image.Volume.Id.String())), SharedProjectIDs: configuredIDs}
+	}, VolumeID: types.StringValue(strings.ToUpper(image.Volume.MustGet().Id.String())), SharedProjectIDs: configuredIDs}
 	populateCustomImageDataSourceState(image, &state)
-	if state.OS.ValueString() != " Linux " || state.Version.ValueString() != " 1 " || state.Metadata.ValueString() != `{ "a" : "b" }` || state.ID.ValueString() != strings.ToUpper(image.Id.String()) || state.VolumeID.ValueString() != strings.ToUpper(image.Volume.Id.String()) || !state.SharedProjectIDs.Equal(configuredIDs) {
+	if state.OS.ValueString() != " Linux " || state.Version.ValueString() != " 1 " || state.Metadata.ValueString() != `{ "a" : "b" }` || state.ID.ValueString() != strings.ToUpper(image.Id.String()) || state.VolumeID.ValueString() != strings.ToUpper(image.Volume.MustGet().Id.String()) || !state.SharedProjectIDs.Equal(configuredIDs) {
 		t.Fatal(state)
 	}
 	image.Name = "real drift"
@@ -94,7 +96,7 @@ func TestPopulateCustomImageResourceStateReferences(t *testing.T) {
 	t.Parallel()
 	image := customImageFixture()
 	image.SharedProjects = &[]serversdk.NestedProjectSchema{{Id: core.UUID{0xef}, Name: "shared"}}
-	volumeID, projectID := image.Volume.Id.String(), core.UUID{0xef}.String()
+	volumeID, projectID := image.Volume.MustGet().Id.String(), core.UUID{0xef}.String()
 
 	var imported CustomImageResourceModel
 	populateCustomImageResourceState(image, &imported)
@@ -140,5 +142,20 @@ func TestPopulateCustomImageResourceStateReferences(t *testing.T) {
 	populateCustomImageResourceState(image, &importedWithoutSource)
 	if !importedWithoutSource.Volume.IsNull() {
 		t.Fatalf("an import without a source volume must leave volume null: %s", importedWithoutSource.Volume)
+	}
+}
+
+// A removed source volume comes back as JSON null, which must read as absent.
+func TestPopulateCustomImageResourceStateNullSourceVolume(t *testing.T) {
+	t.Parallel()
+	image := customImageFixture()
+	image.Volume = nullNullable[serversdk.NestedVolumeSchema]()
+	m := CustomImageResourceModel{
+		Volume:         types.ObjectNull(reference.AttributeTypes(customImageVolumeCriteria...)),
+		SharedProjects: types.SetNull(reference.ObjectType(reference.ID)),
+	}
+	populateCustomImageResourceState(image, &m)
+	if !m.Volume.IsNull() {
+		t.Fatalf("expected a null source volume, got %s", m.Volume)
 	}
 }

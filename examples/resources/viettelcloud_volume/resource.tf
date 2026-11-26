@@ -1,3 +1,26 @@
+resource "viettelcloud_volume_snapshot_policy" "nightly" {
+  name   = "example-nightly"
+  region = { name = "vn-central-1" }
+  status = "enabled"
+
+  schedule = {
+    days_of_week = ["mon", "tue", "wed", "thu", "fri"]
+    time         = "02:00"
+  }
+}
+
+resource "viettelcloud_volume_backup_policy" "monthly" {
+  name   = "example-monthly"
+  region = { name = "vn-central-1" }
+  status = "enabled"
+
+  schedule = {
+    execution_strategy = "days_of_month"
+    days_of_month      = [1, 15]
+    time               = "02:00"
+  }
+}
+
 resource "viettelcloud_volume" "empty" {
   name        = "example-empty-volume"
   description = "Managed by Terraform"
@@ -8,6 +31,11 @@ resource "viettelcloud_volume" "empty" {
     source_type = "empty"
     volume_type = { name = "Ceph_HDD_1A_10K" }
   }
+
+  # Add these attributes in a later apply, after the volume exists. A plan that
+  # creates or replaces the volume rejects them.
+  # snapshot_policy = { id = viettelcloud_volume_snapshot_policy.nightly.id }
+  # backup_policy   = { id = viettelcloud_volume_backup_policy.monthly.id }
 }
 
 resource "viettelcloud_volume" "image" {

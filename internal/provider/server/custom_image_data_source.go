@@ -235,7 +235,7 @@ func customImageFilter(config CustomImageDataSourceModel) (serverlookup.CustomIm
 	}
 	if !config.State.IsNull() && !config.State.IsUnknown() {
 		count++
-		value := serversdk.ImageState(config.State.ValueString())
+		value := serversdk.ImageState(strings.TrimSpace(config.State.ValueString()))
 		if !value.Valid() {
 			diags.AddError("Invalid image state", "state must be enabled or disabled.")
 		} else {
@@ -244,7 +244,7 @@ func customImageFilter(config CustomImageDataSourceModel) (serverlookup.CustomIm
 	}
 	if !config.Status.IsNull() && !config.Status.IsUnknown() {
 		count++
-		value := serversdk.ImageStatus(config.Status.ValueString())
+		value := serversdk.ImageStatus(strings.TrimSpace(config.Status.ValueString()))
 		if !value.Valid() {
 			diags.AddError("Invalid image status", "status must be a status supported by the API.")
 		} else {

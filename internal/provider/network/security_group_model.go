@@ -59,12 +59,14 @@ func populateSecurityGroupResourceState(sg *networksdk.SecurityGroupSchema, stat
 	}
 
 	configuredName := state.Name
+	configuredDescription := state.Description
 	populateSecurityGroupModel(sg, &state.SecurityGroupModel)
 	// Keep the configured representation when the backend only trims outer
 	// whitespace, otherwise Terraform reports an inconsistent result.
 	if keepConfiguredSecurityGroupValue(configuredName, sg.Name) {
 		state.Name = configuredName
 	}
+	state.Description = preservedNullableString(configuredDescription, state.Description)
 	state.Region = regionReferenceState(state.Region, sg.Region.Name)
 }
 

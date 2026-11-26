@@ -15,12 +15,22 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	blockstoragesdk "github.com/viettelcloud-oss/sdks/go/blockstorage"
 	"github.com/viettelcloud-oss/sdks/go/core"
+	dbaassdk "github.com/viettelcloud-oss/sdks/go/dbaas"
+	dbaasclustersdk "github.com/viettelcloud-oss/sdks/go/dbaascluster"
+	filestoragesdk "github.com/viettelcloud-oss/sdks/go/filestorage"
+	loadbalancersdk "github.com/viettelcloud-oss/sdks/go/loadbalancer"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 	projectsdk "github.com/viettelcloud-oss/sdks/go/project"
 	serversdk "github.com/viettelcloud-oss/sdks/go/server"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/keylock"
 	blockstorageprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/blockstorage"
+	dbaasprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/dbaas"
+	dbaasclusterprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/dbaascluster"
+	filestorageprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/filestorage"
+	loadbalancerprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/loadbalancer"
 	networkprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/network"
+	projectprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/project/lookup"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/providerdata"
 	serverprovider "github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/provider/server"
@@ -99,6 +109,30 @@ func (p *ViettelCloudProvider) Configure(ctx context.Context, req provider.Confi
 		return
 	}
 
+	dbaasClient, err := dbaassdk.NewClient(
+		config.Endpoint.ValueString(),
+		dbaassdk.WithPAT(config.Token.ValueString()),
+		dbaassdk.WithHTTPClient(httpClient),
+		dbaassdk.WithRetry(core.DefaultRetry()),
+		dbaassdk.WithUserAgent("terraform-provider-viettelcloud/"+p.version),
+	)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to create API client", fmt.Sprintf("Unable to create DBaaS client: %s", err))
+		return
+	}
+
+	dbaasClusterClient, err := dbaasclustersdk.NewClient(
+		config.Endpoint.ValueString(),
+		dbaasclustersdk.WithPAT(config.Token.ValueString()),
+		dbaasclustersdk.WithHTTPClient(httpClient),
+		dbaasclustersdk.WithRetry(core.DefaultRetry()),
+		dbaasclustersdk.WithUserAgent("terraform-provider-viettelcloud/"+p.version),
+	)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to create API client", fmt.Sprintf("Unable to create DBaaS cluster client: %s", err))
+		return
+	}
+
 	networkClient, err := networksdk.NewClient(
 		config.Endpoint.ValueString(),
 		networksdk.WithPAT(config.Token.ValueString()),
@@ -141,12 +175,41 @@ func (p *ViettelCloudProvider) Configure(ctx context.Context, req provider.Confi
 		return
 	}
 
+	loadBalancerClient, err := loadbalancersdk.NewClient(
+		config.Endpoint.ValueString(),
+		loadbalancersdk.WithPAT(config.Token.ValueString()),
+		loadbalancersdk.WithHTTPClient(httpClient),
+		loadbalancersdk.WithRetry(core.DefaultRetry()),
+		loadbalancersdk.WithUserAgent("terraform-provider-viettelcloud/"+p.version),
+	)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to create API client", fmt.Sprintf("Unable to create load balancer client: %s", err))
+		return
+	}
+
+	fileStorageClient, err := filestoragesdk.NewClient(
+		config.Endpoint.ValueString(),
+		filestoragesdk.WithPAT(config.Token.ValueString()),
+		filestoragesdk.WithHTTPClient(httpClient),
+		filestoragesdk.WithRetry(core.DefaultRetry()),
+		filestoragesdk.WithUserAgent("terraform-provider-viettelcloud/"+p.version),
+	)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to create API client", fmt.Sprintf("Unable to create file storage client: %s", err))
+		return
+	}
+
 	data := &providerdata.Configured{
 		BlockStorage: blockStorageClient,
+		DBaaS:        dbaasClient,
+		FileStorage:  fileStorageClient,
+		DBaaSCluster: dbaasClusterClient,
+		LoadBalancer: loadBalancerClient,
 		Network:      networkClient,
 		Project:      projectClient,
 		Server:       serverClient,
 		ProjectID:    projectID,
+		Claims:       keylock.New(),
 	}
 	resp.DataSourceData = data
 	resp.ResourceData = data
@@ -185,17 +248,34 @@ func (p *ViettelCloudProvider) Resources(_ context.Context) []func() resource.Re
 	return []func() resource.Resource{
 		blockstorageprovider.NewVolumeResource,
 		blockstorageprovider.NewVolumeBackupResource,
+		blockstorageprovider.NewVolumeBackupPolicyResource,
 		blockstorageprovider.NewVolumeSnapshotResource,
+		blockstorageprovider.NewVolumeSnapshotPolicyResource,
+		dbaasprovider.NewInstanceResource,
+		dbaasprovider.NewBackupResource,
+		filestorageprovider.NewFilesystemSnapshotResource,
+		loadbalancerprovider.NewL7PolicyResource,
+		loadbalancerprovider.NewServerGroupResource,
+		loadbalancerprovider.NewServerGroupMemberResource,
+		filestorageprovider.NewFilesystemSnapshotPolicyResource,
+		dbaasclusterprovider.NewDBClusterResource,
 		networkprovider.NewVPCResource,
 		networkprovider.NewSubnetResource,
 		networkprovider.NewElasticIPResource,
 		networkprovider.NewPrivateIPResource,
 		networkprovider.NewSecurityGroupResource,
 		networkprovider.NewSecurityGroupRuleResource,
+		networkprovider.NewVPCPeeringResource,
 		serverprovider.NewServerResource,
 		serverprovider.NewPlacementGroupResource,
 		serverprovider.NewCustomImageResource,
 		serverprovider.NewKeyPairResource,
+		filestorageprovider.NewFilesystemResource,
+		loadbalancerprovider.NewLoadBalancerResource,
+		projectprovider.NewCustomRoleResource,
+		projectprovider.NewMemberRolesResource,
+		loadbalancerprovider.NewListenerResource,
+		loadbalancerprovider.NewL7RuleResource,
 	}
 }
 
@@ -203,14 +283,32 @@ func (p *ViettelCloudProvider) DataSources(_ context.Context) []func() datasourc
 	return []func() datasource.DataSource{
 		blockstorageprovider.NewVolumeDataSource,
 		blockstorageprovider.NewVolumeBackupDataSource,
+		blockstorageprovider.NewVolumeBackupPolicyDataSource,
 		blockstorageprovider.NewVolumeSnapshotDataSource,
+		blockstorageprovider.NewVolumeSnapshotPolicyDataSource,
+		dbaasprovider.NewInstanceDataSource,
+		dbaasprovider.NewBackupDataSource,
+		filestorageprovider.NewFilesystemSnapshotDataSource,
+		loadbalancerprovider.NewL7PolicyDataSource,
+		loadbalancerprovider.NewServerGroupDataSource,
+		loadbalancerprovider.NewServerGroupMemberDataSource,
+		filestorageprovider.NewFilesystemSnapshotPolicyDataSource,
+		dbaasclusterprovider.NewDBClusterDataSource,
 		networkprovider.NewVPCDataSource,
 		networkprovider.NewSubnetDataSource,
 		networkprovider.NewElasticIPDataSource,
 		networkprovider.NewPrivateIPDataSource,
+		networkprovider.NewVPCPeeringDataSource,
 		serverprovider.NewPlacementGroupDataSource,
 		serverprovider.NewCustomImageDataSource,
 		serverprovider.NewKeyPairDataSource,
+		serverprovider.NewVDCDataSource,
+		filestorageprovider.NewFilesystemDataSource,
 		networkprovider.NewSecurityGroupDataSource,
+		projectprovider.NewCustomRoleDataSource,
+		projectprovider.NewMemberRolesDataSource,
+		loadbalancerprovider.NewLoadBalancerDataSource,
+		loadbalancerprovider.NewListenerDataSource,
+		loadbalancerprovider.NewL7RuleDataSource,
 	}
 }

@@ -6,7 +6,7 @@ GOBIN      := $(shell go env GOPATH)/bin
 GOEXE      := $(shell go env GOEXE)
 MODULE     := github.com/viettelcloud-oss/terraform-provider-viettelcloud
 SDK_MODULE := github.com/viettelcloud-oss/sdks/go
-GO_SOURCES := main.go internal
+GO_SOURCES := main.go internal tools/select-tftest-runs
 TOOLS_DIR  := tools
 DIST_DIR   := dist
 # GOOS/GOARCH pairs that build-all cross-compiles.
@@ -52,6 +52,7 @@ install: build
 .PHONY: test
 test:
 	go test -v -cover -race -timeout 60s ./internal/...
+	cd $(TOOLS_DIR) && go test -v -cover -race -timeout 60s ./select-tftest-runs/...
 
 # Unit-test statement coverage across all provider packages
 .PHONY: coverage
@@ -63,6 +64,7 @@ coverage:
 .PHONY: lint
 lint: $(GOBIN)/golangci-lint lint-file-structure
 	$(GOBIN)/golangci-lint run ./...
+	cd $(TOOLS_DIR) && $(GOBIN)/golangci-lint run ./select-tftest-runs/...
 
 # Framework entry points stay in contract-first order, and any file outside the
 # standard three must document what it owns.
@@ -74,6 +76,7 @@ lint-file-structure:
 .PHONY: fix
 fix:
 	go fix ./...
+	cd $(TOOLS_DIR) && go fix ./select-tftest-runs/...
 
 # Format
 .PHONY: fmt

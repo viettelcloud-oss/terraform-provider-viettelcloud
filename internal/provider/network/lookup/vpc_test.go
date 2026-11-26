@@ -43,7 +43,7 @@ func sampleVPC(id core.UUID, name, cidr string, regionID core.UUID, regionName s
 		Id:          id,
 		Name:        name,
 		DisplayName: name + "-display",
-		Description: &desc,
+		Description: core.NullableFromPtr(&desc),
 		Cidr:        cidr,
 		Region: networksdk.NestedRegionSchema{
 			Id:   regionID,

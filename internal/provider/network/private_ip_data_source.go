@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/compare"
 	"github.com/viettelcloud-oss/terraform-provider-viettelcloud/internal/parse"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -407,22 +408,18 @@ func preserveConfiguredPrivateIPValues(
 	if privateIP == nil {
 		return
 	}
-	if !config.ID.IsNull() && !config.ID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.ID.ValueString()); err == nil && parsedID == privateIP.Id {
-			state.ID = config.ID
-		}
+	if compare.SameUUID(config.ID, privateIP.Id) {
+		state.ID = config.ID
 	}
-	if privateIP.IpAddress != nil && !config.IPAddress.IsNull() && !config.IPAddress.IsUnknown() {
+	if ipAddress := core.NullableToPtr(privateIP.IpAddress); ipAddress != nil && !config.IPAddress.IsNull() && !config.IPAddress.IsUnknown() {
 		configured, configuredErr := netip.ParseAddr(strings.TrimSpace(config.IPAddress.ValueString()))
-		backend, backendErr := netip.ParseAddr(strings.TrimSpace(*privateIP.IpAddress))
+		backend, backendErr := netip.ParseAddr(strings.TrimSpace(*ipAddress))
 		if configuredErr == nil && backendErr == nil && configured == backend {
 			state.IPAddress = config.IPAddress
 		}
 	}
-	if !config.SubnetID.IsNull() && !config.SubnetID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.SubnetID.ValueString()); err == nil && parsedID == privateIP.Subnet.Id {
-			state.SubnetID = config.SubnetID
-		}
+	if compare.SameUUID(config.SubnetID, privateIP.Subnet.Id) {
+		state.SubnetID = config.SubnetID
 	}
 	if !config.SubnetName.IsNull() && !config.SubnetName.IsUnknown() && strings.TrimSpace(config.SubnetName.ValueString()) == privateIP.Subnet.Name {
 		state.SubnetName = config.SubnetName
@@ -430,10 +427,8 @@ func preserveConfiguredPrivateIPValues(
 	if !config.SubnetCIDR.IsNull() && !config.SubnetCIDR.IsUnknown() && strings.TrimSpace(config.SubnetCIDR.ValueString()) == privateIP.Subnet.Cidr {
 		state.SubnetCIDR = config.SubnetCIDR
 	}
-	if !config.VPCID.IsNull() && !config.VPCID.IsUnknown() {
-		if parsedID, err := core.ParseUUID(config.VPCID.ValueString()); err == nil && parsedID == privateIP.Vpc.Id {
-			state.VPCID = config.VPCID
-		}
+	if compare.SameUUID(config.VPCID, privateIP.Vpc.Id) {
+		state.VPCID = config.VPCID
 	}
 	if !config.VPCName.IsNull() && !config.VPCName.IsUnknown() && strings.TrimSpace(config.VPCName.ValueString()) == privateIP.Vpc.Name {
 		state.VPCName = config.VPCName

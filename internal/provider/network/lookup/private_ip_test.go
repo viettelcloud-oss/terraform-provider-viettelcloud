@@ -45,7 +45,7 @@ func samplePrivateIP(
 ) networksdk.PrivateIPSchema {
 	return networksdk.PrivateIPSchema{
 		Id:        id,
-		IpAddress: &ipAddress,
+		IpAddress: core.NullableFromPtr(&ipAddress),
 		Subnet:    networksdk.NestedSubnetSchema{Id: subnetID, Name: subnetName},
 		Vpc:       networksdk.NestedVPCSchema{Id: vpcID, Name: vpcName},
 		Region:    networksdk.NestedRegionSchema{Name: region},

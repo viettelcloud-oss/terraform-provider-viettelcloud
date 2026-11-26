@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/viettelcloud-oss/sdks/go/core"
 	networksdk "github.com/viettelcloud-oss/sdks/go/network"
 )
 
@@ -51,18 +52,18 @@ func populateElasticIPModel(eip *networksdk.ElasticIPDetailSchema, m *ElasticIPM
 	} else {
 		m.Description = types.StringNull()
 	}
-	if eip.IpAddress != nil {
-		m.IPAddress = types.StringValue(*eip.IpAddress)
+	if ipAddress := core.NullableToPtr(eip.IpAddress); ipAddress != nil {
+		m.IPAddress = types.StringValue(*ipAddress)
 	} else {
 		m.IPAddress = types.StringNull()
 	}
-	if eip.Ipv6Address != nil {
-		m.IPv6Address = types.StringValue(*eip.Ipv6Address)
+	if ipv6Address := core.NullableToPtr(eip.Ipv6Address); ipv6Address != nil {
+		m.IPv6Address = types.StringValue(*ipv6Address)
 	} else {
 		m.IPv6Address = types.StringNull()
 	}
-	if eip.Status != nil {
-		m.Status = types.StringValue(fmt.Sprint(*eip.Status))
+	if status := core.NullableToPtr(eip.Status); status != nil {
+		m.Status = types.StringValue(fmt.Sprint(*status))
 	} else {
 		m.Status = types.StringNull()
 	}
@@ -73,7 +74,9 @@ func populateElasticIPResourceState(eip *networksdk.ElasticIPDetailSchema, state
 		return
 	}
 
+	configuredDescription := state.Description
 	populateElasticIPModel(eip, &state.ElasticIPModel)
+	state.Description = preservedNullableString(configuredDescription, state.Description)
 	state.Region = regionReferenceState(state.Region, eip.Region.Name)
 }
 
@@ -82,6 +85,8 @@ func populateElasticIPDataSourceState(eip *networksdk.ElasticIPDetailSchema, sta
 		return
 	}
 
+	configuredDescription := state.Description
 	populateElasticIPModel(eip, &state.ElasticIPModel)
+	state.Description = preservedNullableString(configuredDescription, state.Description)
 	state.Region = types.StringValue(eip.Region.Name)
 }
